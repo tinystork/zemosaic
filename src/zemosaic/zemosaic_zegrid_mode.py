@@ -5942,6 +5942,9 @@ def _select_external_fallback(
     frozen_batch=None,
     fixed_overlap_bytes=0,
     observation_domain=None,
+    equalize_rgb=False,
+    rejection="winsorized_sigma_clip",
+    combine="mean",
 ) -> dict:
     """Choose `stream_external(tile, batch)` or return a typed refusal.
 
@@ -6083,6 +6086,9 @@ def _select_external_fallback(
             tile_size=int(tile),
             halo_px=int(halo_px),
             column_batch=1,
+            equalize_rgb=bool(equalize_rgb),
+            rejection=str(rejection),
+            combine=str(combine),
         )
         host_fixed = int(probe["host"]["fixed_peak_bytes"])
         reduce_fixed = int(probe["host"]["reduce_fixed_bytes"])
@@ -6176,6 +6182,9 @@ def _select_external_fallback(
             tile_size=int(tile),
             halo_px=int(halo_px),
             column_batch=int(batch),
+            equalize_rgb=bool(equalize_rgb),
+            rejection=str(rejection),
+            combine=str(combine),
         )
         host = pricing["host"]
         host_peak = int(host["peak_bytes"])
@@ -6262,6 +6271,9 @@ def _select_external_fallback(
                 "spool_root": str(spool_root),
                 "pricing": pricing,
                 "budget_domain": str(budget_domain),
+                "equalize_rgb": bool(equalize_rgb),
+                "rejection": str(rejection),
+                "combine": str(combine),
                 "phase_budget_bytes": int(effective_phase_budget),
                 "reduction_budget_bytes": int(effective_phase_budget),
                 "residual_batch_budget_bytes": int(residual),
@@ -6524,6 +6536,9 @@ def _build_execution_bundle(
     restored_geometry=None,
     frozen_admission=None,
     force_external=False,
+    equalize_rgb=False,
+    rejection="winsorized_sigma_clip",
+    combine="mean",
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -7003,6 +7018,9 @@ def _build_execution_bundle(
                 ),
                 fixed_overlap_bytes=int(_ext_overlap_bytes),
                 observation_domain=rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
+                equalize_rgb=bool(equalize_rgb),
+                rejection=str(rejection),
+                combine=str(combine),
             )
             if not external_selection.get("refused"):
                 _ext_host_peak = int(external_selection["host_peak_bytes"])
@@ -7287,6 +7305,17 @@ def _build_execution_bundle(
                     external_selection["host_components"]
                 ),
                 "budget_domain": str(external_selection["budget_domain"]),
+                "equalize_rgb": bool(
+                    external_selection.get("equalize_rgb", False)
+                ),
+                "rejection": str(
+                    external_selection.get(
+                        "rejection", "winsorized_sigma_clip"
+                    )
+                ),
+                "combine": str(
+                    external_selection.get("combine", "mean")
+                ),
                 "phase_budget_bytes": int(
                     external_selection["phase_budget_bytes"]
                 ),
@@ -7340,10 +7369,10 @@ def _build_execution_bundle(
         if effective_gpu and gpu_streaming_host_peak_bytes is not None:
             per_cell_footprint = int(gpu_streaming_host_peak_bytes)
         elif chosen_mode == "external":
+            # ONE frozen per-cell bound: the host peak used by the selector,
+            # the task bound, the ACTIVE stack term and the manifest.
             per_cell_footprint = int(
-                external_selection["pricing"]["ram"][
-                    "reduction_workspace_bytes"
-                ]
+                external_selection["host_peak_bytes"]
             )
         else:
             per_cell_footprint = max(
@@ -8575,6 +8604,28 @@ def _r55_external_contract(bundle) -> dict:
     if int(components.get("disk_bytes_in_host_peak", -1)) != 0:
         raise zsched.SchedulerConfigError(
             "external host component model must not contain disk bytes"
+        )
+    if not isinstance(contract.get("equalize_rgb"), bool):
+        raise zsched.SchedulerConfigError(
+            "external contract must carry a boolean equalize_rgb fact"
+        )
+    if str(contract.get("rejection")) not in (
+        zext.EXTERNAL_BATCH_REJECTION_BYTES_PER_POSITION_FRAME
+    ):
+        raise zsched.SchedulerConfigError(
+            "external contract carries an unsupported rejection method: "
+            f"{contract.get('rejection')!r}"
+        )
+    if str(contract.get("combine")) not in (
+        zext.EXTERNAL_BATCH_COMBINE_BYTES_PER_POSITION_FRAME
+    ):
+        raise zsched.SchedulerConfigError(
+            "external contract carries an unsupported combine method: "
+            f"{contract.get('combine')!r}"
+        )
+    if bool(components.get("equalize_rgb")) != bool(contract["equalize_rgb"]):
+        raise zsched.SchedulerConfigError(
+            "external host components disagree with the frozen equalize_rgb fact"
         )
     return contract
 
@@ -13900,6 +13951,11 @@ def _run_single(
         vram_budget_bytes=(gpu_ctx or {}).get("vram_budget_bytes"),
         cache_root=cache_root,
         halo_px=int(halo_px),
+        # Request-aware external HOST pricing: the effective science request
+        # must reach the selector (equalization overlap, batch live-set bound).
+        equalize_rgb=bool(getattr(science_config, "equalize_rgb", False)),
+        rejection=str(getattr(science_config, "rejection", "winsorized_sigma_clip")),
+        combine=str(getattr(science_config, "combine", "mean")),
         emit=_emit_live,
         log_line=_log_line,
     )

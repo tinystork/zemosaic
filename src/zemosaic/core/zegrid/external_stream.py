@@ -89,6 +89,12 @@ __all__ = [
     "COLUMN_BATCH_MIN",
     "REDUCTION_BYTES_PER_POSITION_FRAME",
     "EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME",
+    "EXTERNAL_BATCH_COMMON_BYTES_PER_POSITION_FRAME",
+    "EXTERNAL_BATCH_REJECTION_BYTES_PER_POSITION_FRAME",
+    "EXTERNAL_BATCH_COMBINE_BYTES_PER_POSITION_FRAME",
+    "EXTERNAL_BATCH_WORST_BYTES_PER_POSITION_FRAME",
+    "FINALIZE_WORKING_BYTES_PER_PIXEL",
+    "EQUALIZE_RGB_BYTES_PER_PIXEL",
     "EXTERNAL_HOST_MODEL_SCHEMA",
     "RESULT_PLANE_BYTES_PER_POSITION",
     "RESULT_SUPPORT_BYTES_PER_PIXEL",
@@ -159,18 +165,46 @@ WRITE_TILE_BYTES_PER_PIXEL_CHANNEL = 4 + 8 + 8 + 4 + 4  # 28
 #: frac f32 (4) + np.where f64 (8) + taper output f32 (4) = 31.
 WRITE_TILE_AUX_BYTES_PER_PIXEL = 3 + 4 + 8 + 4 + 8 + 4  # 31
 
-#: Truthful reduction-batch workspace per (position x frame). The executor
-#: allocates, simultaneously:
+#: Common reduction-batch arrays per (position x frame), simultaneously live:
 #:   img f32 4 + weights f64 8 + orig f64 8 + wmap f64 8
 #:   finite/initial/survivor/rejection/eligible/degenerate bools 6
-#: and then EITHER the rejection peak (masked 8 + winsor 8 + in-place sort
-#: copy 8 + interval/equality/keep/new2 4 = 28) OR the mean-combine peak
-#: (masked 8 + weights 8 + product 8 = 24). Rejection and combine are
-#: sequential, so the peak adds max(28, 24) to the common 34-byte terms.
-#: Total = 34 + 28 = 62 bytes per (position x frame).
-EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME = (
-    4 + 8 + 8 + 8 + 6 + max(28, 24)
-)  # 62
+EXTERNAL_BATCH_COMMON_BYTES_PER_POSITION_FRAME = 4 + 8 + 8 + 8 + 6  # 34
+#: Additional live bytes for each rejection/combine variant (rejection and
+#: combine are SEQUENTIAL; the worst variant, not their sum, is added).
+#:   kappa: masked 8 + median sort copy 8 + interval/equality/keep/degenerate/new2
+#:          masks 5 = 21? -> conservative 24
+#:   winsor: masked 8 + winsor 8 + quantile sort copy 8 + interval/equality/keep/
+#:          degenerate/new2 masks 5 = 29 -> conservative 32
+#:   mean: masked 8 + w_contrib 8 + product 8 = 24
+#:   median: masked 8 + median sort copy 8 + output 8 + count/masks 2 = 26
+EXTERNAL_BATCH_REJECTION_BYTES_PER_POSITION_FRAME = {
+    "none": 0,
+    "kappa_sigma": 24,
+    "winsorized_sigma_clip": 32,
+}
+EXTERNAL_BATCH_COMBINE_BYTES_PER_POSITION_FRAME = {
+    "mean": 24,
+    "median": 26,
+}
+EXTERNAL_BATCH_WORST_BYTES_PER_POSITION_FRAME = (
+    EXTERNAL_BATCH_COMMON_BYTES_PER_POSITION_FRAME
+    + max(EXTERNAL_BATCH_REJECTION_BYTES_PER_POSITION_FRAME.values())
+    + max(EXTERNAL_BATCH_COMBINE_BYTES_PER_POSITION_FRAME.values())
+)  # 34 + 32 + 26 = 92
+#: The executable admission coefficient is the worst-case sum plus headroom
+#: for interpreter/allocator aliasing. It is an UPPER bound for every supported
+#: rejection/combine pair (see the direct-shape tests).
+EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME = 96
+
+#: Finalization working set per patch pixel. The bounded
+#: ``_compute_n_eff_bounded`` uses at most: n_eff/w1_sq f64 8 + sqrt f64 8 +
+#: safe f64 8 + overflow/valid/bad/finite/negative bools 5 = 29; 40 leaves
+#: headroom and covers the restore-shape copy for mono.
+FINALIZE_WORKING_BYTES_PER_PIXEL = 40
+#: ``equalize_rgb=True`` peak per patch pixel: out-of-place float32 copy 12
+#: (3 ch x 4) + finite/positive/and bools 9 + valid_rgb 1 + luminance 4 +
+#: mask/where bools 4 + product 12 + astype result 12 = 42; 48 is conservative.
+EQUALIZE_RGB_BYTES_PER_PIXEL = 48
 
 #: Backwards-compatible public name: the truthful column-batch workspace.
 REDUCTION_BYTES_PER_POSITION_FRAME = EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
@@ -1055,6 +1089,33 @@ def batch_positions_for(
     return 1, cols
 
 
+def external_batch_live_bytes_per_position_frame(
+    rejection: str = "winsorized_sigma_clip", combine: str = "mean"
+) -> int:
+    """Conservative worst simultaneous batch bytes per (position x frame).
+
+    The value is the common live set plus the MAX of the rejection and combine
+    variant terms (the two stages are sequential). It is a UPPER bound for every
+    supported pair; the admission coefficient is the global worst case across
+    all pairs (``EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME``).
+    """
+    rej = str(rejection).strip().lower()
+    comb = str(combine).strip().lower()
+    if rej not in EXTERNAL_BATCH_REJECTION_BYTES_PER_POSITION_FRAME:
+        raise ExternalBudgetError(
+            f"unsupported rejection {rejection!r} for the external batch model"
+        )
+    if comb not in EXTERNAL_BATCH_COMBINE_BYTES_PER_POSITION_FRAME:
+        raise ExternalBudgetError(
+            f"unsupported combine {combine!r} for the external batch model"
+        )
+    return int(
+        EXTERNAL_BATCH_COMMON_BYTES_PER_POSITION_FRAME
+        + EXTERNAL_BATCH_REJECTION_BYTES_PER_POSITION_FRAME[rej]
+        + EXTERNAL_BATCH_COMBINE_BYTES_PER_POSITION_FRAME[comb]
+    )
+
+
 def external_cell_host_components(
     *,
     n_frames: int,
@@ -1064,6 +1125,9 @@ def external_cell_host_components(
     channels: int,
     column_batch: int,
     rejection_sink: bool = True,
+    equalize_rgb: bool = False,
+    rejection: str = "winsorized_sigma_clip",
+    combine: str = "mean",
 ) -> dict:
     """Explicit, integer HOST-RAM components of ONE external Cell.
 
@@ -1116,7 +1180,18 @@ def external_cell_host_components(
         0 if sink else n * patch_px * c * REJECTION_MASK_BYTES_PER_POSITION_FRAME
     )
     persistent += dense_rejection
-    n_eff = patch_px * RESULT_N_EFF_BYTES_PER_PIXEL
+    # The finalization is a bounded exact sequence (see
+    # ``_compute_n_eff_bounded``). It still holds the persistent planes, the
+    # n_eff/sqrt/safe working buffers and boolean masks; request-aware
+    # equalization adds its own full-patch overlap.
+    finalize_working = patch_px * FINALIZE_WORKING_BYTES_PER_PIXEL
+    finalize_equalize = (
+        patch_px * EQUALIZE_RGB_BYTES_PER_PIXEL if bool(equalize_rgb) else 0
+    )
+    finalize_restore = 4 * patch_px if int(c) == 1 else 0
+    finalize_total = (
+        int(finalize_working) + int(finalize_equalize) + int(finalize_restore)
+    )
 
     provider_window = patch_px * (4 * c + 1)
     write_tile = tile_px * (
@@ -1135,7 +1210,7 @@ def external_cell_host_components(
     # The previous tile's outputs stay referenced through the next write_tile.
     write_phase = persistent + reduce_tile + provider_window + write_tile
     reduce_phase = persistent + reduce_tile + batch
-    finalize = persistent + n_eff
+    finalize = persistent + finalize_total
     peak = max(first_write, write_phase, reduce_phase, finalize)
 
     return {
@@ -1155,7 +1230,22 @@ def external_cell_host_components(
         ),
         "persistent_result_bytes": int(persistent),
         "dense_rejection_mask_bytes": int(dense_rejection),
-        "finalize_n_eff_bytes": int(n_eff),
+        "finalize_n_eff_output_bytes": int(
+            patch_px * RESULT_N_EFF_BYTES_PER_PIXEL
+        ),
+        "finalize_working_bytes": int(finalize_working),
+        "finalize_equalize_bytes": int(finalize_equalize),
+        "finalize_restore_copy_bytes": int(finalize_restore),
+        "finalize_total_bytes": int(finalize_total),
+        "equalize_rgb": bool(equalize_rgb),
+        "rejection": str(rejection),
+        "combine": str(combine),
+        "batch_live_bound_bytes_per_position_frame": int(
+            external_batch_live_bytes_per_position_frame(rejection, combine)
+        ),
+        "batch_bytes_per_position_frame": int(
+            EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+        ),
         "provider_window_bytes": int(provider_window),
         "write_tile_bytes": int(write_tile),
         "reduce_tile_outputs_bytes": int(reduce_tile),
@@ -1183,10 +1273,15 @@ def estimate_external_working_set(
     tile_size,
     halo_px: int,
     column_batch: int,
+    equalize_rgb: bool = False,
+    rejection: str = "winsorized_sigma_clip",
+    combine: str = "mean",
 ) -> dict:
     """Pure, geometry-derived pricing of the external working set.
 
     Every term is explicit. Unknown terms are NAMED (never returned as zero).
+    ``equalize_rgb`` / ``rejection`` / ``combine`` select the request-aware HOST
+    components (finalization equalization overlap and batch live-set bound).
     """
     n = _require_int(n_frames, "n_frames", minimum=1)
     h = _require_int(height, "height", minimum=1)
@@ -1222,6 +1317,9 @@ def estimate_external_working_set(
         channels=c,
         column_batch=req,
         rejection_sink=True,
+        equalize_rgb=bool(equalize_rgb),
+        rejection=str(rejection),
+        combine=str(combine),
     )
 
     cleanup_margin = max(

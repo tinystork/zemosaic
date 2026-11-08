@@ -519,7 +519,15 @@ def test_external_host_component_formula_matches_real_arrays():
         c * zext.WRITE_TILE_BYTES_PER_PIXEL_CHANNEL
         + zext.WRITE_TILE_AUX_BYTES_PER_PIXEL
     )
-    assert host["finalize_n_eff_bytes"] == 40 * 40 * 8
+    assert host["finalize_n_eff_output_bytes"] == 40 * 40 * 8
+    assert host["finalize_working_bytes"] == (
+        40 * 40 * zext.FINALIZE_WORKING_BYTES_PER_PIXEL
+    )
+    assert host["finalize_equalize_bytes"] == 0
+    assert host["finalize_total_bytes"] == host["finalize_working_bytes"]
+    assert host["phases"]["finalize"] == (
+        host["persistent_result_bytes"] + host["finalize_total_bytes"]
+    )
     assert host["reduction_batch_bytes"] == (
         5 * 6 * zext.EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
     )
@@ -644,6 +652,225 @@ def test_active_external_bundle_admits_at_lp_like_budget(
     assert admitted.envelope.shared_bytes == 0
     assert admitted.envelope.aggregate_bytes == contract["host_peak_bytes"]
     assert contract["host_components"]["disk_bytes_in_host_peak"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 4b. Rework-2 — one frozen peak, bounded finalization, equalization, batch proof.
+# ---------------------------------------------------------------------------
+
+def test_one_frozen_host_peak_across_bundle_task_active_manifest(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(zpar, "_PER_WORKER_BASELINE_BYTES", 0)
+    descs = _corpus(4)
+    bundle = _bundle(
+        tmp_path, monkeypatch, force_external=True, descs=descs,
+    )
+    contract = bundle.external_contract
+    peak = int(contract["host_peak_bytes"])
+    assert bundle.per_cell_footprint == peak
+    ext_tasks = [t for t in bundle.cell_tasks if t[4] == "external"]
+    assert ext_tasks
+    assert all(int(t[5]) == peak for t in ext_tasks)
+    assert bundle.working_set_block["host_peak_bytes"] == peak
+    assert (
+        bundle.working_set_block["host_components"]["peak_bytes"] == peak
+    )
+
+    decision = zz._r55_active_decide(
+        bundle=bundle,
+        cell_ctxs=bundle.cell_ctxs,
+        canvas=zg.build_canvas(descs),
+        halo_px=int(bundle.layout.get("halo_px", 8) or 8),
+        cache_root=str(tmp_path / "cache"),
+        output_dir=str(tmp_path / "out"),
+        frame_ids=_frame_ids(descs),
+    )
+    stack = decision.plan_set.phase_map()[renv.PHASE_CELL_STACK_STREAM]
+    assert stack.estimate.peak_bytes == peak
+
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: 4 * GIB)
+    admitted, _cand, mapping, _outcome, _trail = zz._r55_active_admit(
+        initial_bundle=bundle, decision=decision
+    )
+    assert mapping["cell_task_mode"] == "external"
+    assert admitted.per_cell_footprint == peak
+    assert admitted.envelope.stack_total_bytes == peak
+    assert admitted.envelope.aggregate_bytes == peak
+    assert admitted.envelope.cache_total_bytes == 0
+
+
+def test_bounded_n_eff_is_bit_exact_and_finalize_components_are_priced():
+    from zemosaic.core.canonical_streaming import _compute_n_eff_bounded
+
+    rng = np.random.default_rng(20261108)
+    w1 = rng.uniform(0.0, 1.0e3, (37, 41))
+    w2 = rng.uniform(0.0, 1.0e3, (37, 41))
+    # Deliberate edge cases: zero w2, overflow in w1**2, NaN/inf inputs,
+    # negative and tiny values.
+    w2[0, 0] = 0.0
+    w1[1, 1] = 1.0e200
+    w2[1, 1] = 1.0
+    w1[2, 2] = np.nan
+    w2[3, 3] = np.inf
+    w1[4, 4] = -3.0
+    w2[4, 4] = 2.0
+    w1[5, 5] = 0.0
+    w2[5, 5] = 0.0
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        w1_sq = w1 * w1
+        ref = w1_sq / w2
+        ratio = w1 / np.sqrt(w2)
+        safe = ratio * ratio
+    valid = w2 > 0.0
+    overflowed = ~np.isfinite(w1_sq)
+    ref = np.where(overflowed & valid, safe, ref)
+    ref = np.where(
+        valid & np.isfinite(ref) & (ref >= 0.0), ref, 0.0
+    )
+    got = _compute_n_eff_bounded(w1, w2)
+    np.testing.assert_array_equal(got, ref)
+
+    px = 40 * 40
+    host = zext.external_cell_host_components(
+        n_frames=5,
+        patch_hw=(40, 40),
+        tile_hw=(48, 48),
+        interior_hw=(40, 40),
+        channels=3,
+        column_batch=6,
+        equalize_rgb=False,
+    )
+    assert host["finalize_working_bytes"] == (
+        px * zext.FINALIZE_WORKING_BYTES_PER_PIXEL
+    )
+    assert host["finalize_equalize_bytes"] == 0
+    assert host["finalize_total_bytes"] == host["finalize_working_bytes"]
+    assert host["phases"]["finalize"] == (
+        host["persistent_result_bytes"] + host["finalize_total_bytes"]
+    )
+
+
+def test_equalize_rgb_true_is_priced_in_the_host_peak():
+    common = dict(
+        n_frames=5,
+        patch_hw=(40, 40),
+        tile_hw=(48, 48),
+        interior_hw=(40, 40),
+        channels=3,
+        column_batch=6,
+    )
+    off = zext.external_cell_host_components(**common, equalize_rgb=False)
+    on = zext.external_cell_host_components(**common, equalize_rgb=True)
+    px = 40 * 40
+    assert off["equalize_rgb"] is False
+    assert on["equalize_rgb"] is True
+    assert off["finalize_equalize_bytes"] == 0
+    assert on["finalize_equalize_bytes"] == (
+        px * zext.EQUALIZE_RGB_BYTES_PER_PIXEL
+    )
+    assert on["finalize_total_bytes"] == (
+        off["finalize_total_bytes"] + on["finalize_equalize_bytes"]
+    )
+    assert on["phases"]["finalize"] > off["phases"]["finalize"]
+    assert on["peak_bytes"] >= on["phases"]["finalize"]
+
+
+def test_batch_coefficient_bounds_every_rejection_combine_variant():
+    n, positions = 101, 37
+    common = [
+        np.empty((n, positions), np.float32),   # img
+        np.empty((n, positions), np.float64),   # weights
+        np.empty((n, positions), np.float64),   # orig
+        np.empty((n, positions), np.float64),   # wmap
+    ] + [np.empty((n, positions), bool) for _ in range(6)]
+    coefficient = zext.EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+    for rejection in ("none", "kappa_sigma", "winsorized_sigma_clip"):
+        for combine in ("mean", "median"):
+            extra = []
+            if rejection == "kappa_sigma":
+                extra += [
+                    np.empty((n, positions), np.float64),
+                    np.empty((n, positions), np.float64),
+                ]
+                extra += [np.empty((n, positions), bool) for _ in range(5)]
+            elif rejection == "winsorized_sigma_clip":
+                extra += [
+                    np.empty((n, positions), np.float64)
+                    for _ in range(3)
+                ]
+                extra += [np.empty((n, positions), bool) for _ in range(5)]
+            if combine == "mean":
+                extra += [
+                    np.empty((n, positions), np.float64)
+                    for _ in range(3)
+                ]
+            else:
+                extra += [
+                    np.empty((n, positions), np.float64)
+                    for _ in range(3)
+                ]
+                extra += [np.empty((n, positions), bool)]
+            live = sum(a.nbytes for a in common + extra)
+            assert live <= coefficient * n * positions, (
+                rejection, combine, live, coefficient * n * positions
+            )
+            bound = zext.external_batch_live_bytes_per_position_frame(
+                rejection, combine
+            )
+            assert live <= bound * n * positions
+            assert bound <= coefficient
+
+
+@pytest.mark.slow
+def test_external_end_to_end_equalize_rgb_parity(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    real_science = zz.ExecutorConfig.science_config
+
+    def _equalized_science(self):
+        return replace(real_science(self), equalize_rgb=True)
+
+    monkeypatch.setattr(
+        zz.ExecutorConfig, "science_config", _equalized_science
+    )
+    inp = _write_e2e_corpus(tmp_path)
+    ref_out = tmp_path / "ref"
+    ext_out = tmp_path / "ext"
+
+    zz.run_zegrid_mode(
+        str(inp),
+        str(ref_out),
+        zconfig=_stored_e2e_config(tmp_path / "ref-store"),
+        storage_profile="bounded",
+        cell_gauge_mode="per_cell",
+    )
+    with monkeypatch.context() as m:
+        m.setattr(zz, "available_memory_bytes", lambda: 1536 * MIB)
+        m.setattr(zz, "_estimate_streaming_bytes", lambda *a, **k: 6 * GIB)
+        zz.run_zegrid_mode(
+            str(inp),
+            str(ext_out),
+            zconfig=_stored_e2e_config(tmp_path / "ext-store"),
+            storage_profile="bounded",
+            cell_gauge_mode="per_cell",
+        )
+
+    ext_manifest = json.loads(
+        (ext_out / "zegrid_manifest.json").read_text()
+    )
+    assert ext_manifest["stack_working_set"] == zz.WORKING_SET_EXTERNAL
+    ws = ext_manifest["working_set"]
+    assert ws["host_components"]["equalize_rgb"] is True
+    assert ws["host_components"]["finalize_equalize_bytes"] > 0
+    from astropy.io import fits
+
+    for name in ("mosaic_grid.fits", "mosaic_grid_coverage.fits"):
+        np.testing.assert_array_equal(
+            _fits_array(ref_out / name),
+            _fits_array(ext_out / name),
+            err_msg=name,
+        )
 
 
 # ---------------------------------------------------------------------------

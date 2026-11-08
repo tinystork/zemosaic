@@ -1747,6 +1747,56 @@ def _phase2(provider, p1: _Phase1, request: CanonicalStackRequest, tile_size, ba
     )
 
 
+def _compute_n_eff_bounded(support_w1, support_w2):
+    """Exact ``n_eff = W1**2 / W2`` with a genuinely bounded live set.
+
+    Reference semantics (preserved bit-for-bit)::
+
+        w1_sq = w1 * w1
+        n_eff = w1_sq / w2
+        ratio = w1 / sqrt(w2)
+        safe  = ratio * ratio
+        n_eff = where((~isfinite(w1_sq)) & (w2 > 0), safe, n_eff)
+        n_eff = where((w2 > 0) & isfinite(n_eff) & (n_eff >= 0), n_eff, 0)
+
+    The historical expression simultaneously held ``w1_sq``, ``n_eff``,
+    ``sqrt(w2)``, ``ratio``, ``safe`` plus boolean/``where`` outputs (~62 B per
+    patch pixel). This version reuses the ``n_eff`` buffer for ``w1_sq`` and
+    computes the overflow-safe branch only when it is actually needed, using at
+    most two additional patch-sized float64 arrays. The arithmetic operations
+    (multiply, divide, sqrt, multiply) and their order are unchanged, so every
+    output bit — including NaN/zero/overflow handling — is identical.
+    """
+    w1 = np.asarray(support_w1)
+    w2 = np.asarray(support_w2)
+    if w1.shape != w2.shape or w1.ndim != 2:
+        raise CanonicalStackValidationError(
+            "n_eff requires equal 2-D support arrays, got "
+            f"{w1.shape} and {w2.shape}"
+        )
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        # n_eff is reused as the w1_sq buffer (one patch-sized float64 array).
+        n_eff = np.multiply(w1, w1, dtype=np.float64)
+        overflowed = ~np.isfinite(n_eff)
+        np.divide(n_eff, w2, out=n_eff)
+        valid_sup = w2 > 0.0
+        overflow_valid = overflowed & valid_sup
+        if np.any(overflow_valid):
+            # Bounded overflow-safe branch: sqrt + ratio/safe (two transient
+            # patch-sized arrays), only for a real overflow.
+            sqrt_w2 = np.sqrt(w2)
+            safe = np.divide(w1, sqrt_w2, dtype=np.float64)
+            np.multiply(safe, safe, out=safe)
+            np.copyto(n_eff, safe, where=overflow_valid)
+            del sqrt_w2, safe
+        # Exact final zeroing for invalid/non-finite/negative cells.
+        bad = ~valid_sup
+        bad |= ~np.isfinite(n_eff)
+        bad |= n_eff < 0.0
+        np.copyto(n_eff, 0.0, where=bad)
+    return n_eff
+
+
 def _finalize_phase2_outputs(
     p1: _Phase1,
     *,
@@ -1773,16 +1823,8 @@ def _finalize_phase2_outputs(
     # --- restore shapes + n_eff + diagnostics ---
     rejected_fraction = (rejected_count / initial_count) if initial_count > 0 else 0.0
 
-    # n_eff_support = W1**2 / W2 (exact-first + overflow-resistant fallback).
-    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-        w1_sq = support_w1 * support_w1
-        n_eff = w1_sq / support_w2
-        ratio = support_w1 / np.sqrt(support_w2)
-        safe = ratio * ratio
-    valid_sup = support_w2 > 0.0
-    overflowed = ~np.isfinite(w1_sq)
-    n_eff = np.where(overflowed & valid_sup, safe, n_eff)
-    n_eff = np.where(valid_sup & np.isfinite(n_eff) & (n_eff >= 0.0), n_eff, 0.0)
+    # n_eff_support = W1**2 / W2 (exact, bounded live set; see helper).
+    n_eff = _compute_n_eff_bounded(support_w1, support_w2)
 
     science = _restore_shape(science_c, p1.original_mono)
     weight_sum = _restore_shape(weight_sum_c, p1.original_mono)
