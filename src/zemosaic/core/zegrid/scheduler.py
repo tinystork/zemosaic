@@ -2170,10 +2170,13 @@ def _stack_envelope(context: PlanContext, candidate: Candidate) -> ResourceEnvel
             disk_bytes=int(candidate.disk_bytes),
             transfer_bytes=0,
         ),
-        # D1: the active stack phase is simultaneous with assembly (retained
-        # cores + halo). Exactly one stack phase exists, so the pair is declared
-        # symmetrically with the assembly PhaseRequest and never both stacks.
-        overlaps_with=(PHASE_ASSEMBLY,),
+        # D1: a RAM/tile stack is simultaneous with assembly (retained cores +
+        # halo). The EXTERNAL spool class is the documented exception: every
+        # payload is durably committed and released BEFORE final assembly, which
+        # is admitted separately at assembly time (anonymous first, then the
+        # scratch-backed canvas). Its assembly phase is therefore SEQUENTIAL and
+        # must not be summed into the reduction phase.
+        overlaps_with=_stack_overlap_phases(context),
         identity=IdentityEnvelope(run_id=context.run_id, plan_hash="", pinned=bool(context.pinned)),
         reason_code=candidate.reason_code,
     )
@@ -2263,11 +2266,15 @@ def build_plan_set(
     # The stack envelope declares assembly in turn; validate_envelope_set then
     # proves the pair. Only one stack phase exists in a plan.
     assembly_req = next(r for r in requests if r.phase == PHASE_ASSEMBLY)
-    if tuple(assembly_req.overlaps_with) != (context.phase,):
+    expected_assembly_overlap = _assembly_overlap_phases(context)
+    if tuple(assembly_req.overlaps_with) != expected_assembly_overlap:
         raise SchedulerConfigError(
             "the assembly PhaseRequest must declare overlaps_with="
-            f"({context.phase!r},) so simultaneous retained cores + active stack "
-            f"are summed, got {tuple(assembly_req.overlaps_with)!r}"
+            f"{expected_assembly_overlap!r} for working_set_class="
+            f"{getattr(context, 'working_set_class', '')!r} (simultaneous "
+            "retained cores + active stack are summed; the external spool "
+            "class assembles SEQUENTIALLY), got "
+            f"{tuple(assembly_req.overlaps_with)!r}"
         )
 
     envelopes = [_request_envelope(context, r) for r in requests]
@@ -2394,8 +2401,31 @@ def plan(
     raise last
 
 
+def _sequential_external_assembly(context: "PlanContext") -> bool:
+    """True iff this context's final assembly is a SEPARATE later phase.
+
+    Only the external spool class qualifies: the external executor commits each
+    cell result durably and releases its payload, and the final assembly runs
+    later with its own fresh RAM admission. Every RAM/tile pipeline keeps the
+    D1 simultaneous overlap (retained cores + halo remain live while stacking).
+    """
+    return str(getattr(context, "working_set_class", "")) == (
+        WORKING_SET_CLASS_EXTERNAL_SPOOL
+    )
+
+
+def _stack_overlap_phases(context: "PlanContext") -> tuple[str, ...]:
+    """The stack envelope's symmetric overlap for ``context``."""
+    return () if _sequential_external_assembly(context) else (PHASE_ASSEMBLY,)
+
+
+def _assembly_overlap_phases(context: "PlanContext") -> tuple[str, ...]:
+    """The assembly PhaseRequest's symmetric overlap for ``context``."""
+    return () if _sequential_external_assembly(context) else (context.phase,)
+
+
 def _joint_phase_requests(
-    requests: Sequence[PhaseRequest], phase: str
+    requests: Sequence[PhaseRequest], phase: str, *, assembly_overlap=None
 ) -> tuple[PhaseRequest, ...]:
     """Rewrite the assembly overlap to the CHOSEN stack phase.
 
@@ -2418,8 +2448,11 @@ def _joint_phase_requests(
                         "cell_stack_* phases or be empty, got "
                         f"{request.overlaps_with!r}"
                     )
-            if tuple(request.overlaps_with) != (phase,):
-                request = replace(request, overlaps_with=(phase,))
+            expected = (
+                (phase,) if assembly_overlap is None else tuple(assembly_overlap)
+            )
+            if tuple(request.overlaps_with) != expected:
+                request = replace(request, overlaps_with=expected)
         out.append(request)
     return tuple(out)
 
@@ -2554,7 +2587,9 @@ def build_joint_plan_set(
             stack_context,
             candidate=match,
             phase_requests=_joint_phase_requests(
-                phase_requests, stack_context.phase
+                phase_requests,
+                stack_context.phase,
+                assembly_overlap=_assembly_overlap_phases(stack_context),
             ),
             mode=mode,
         )

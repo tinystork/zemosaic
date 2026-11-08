@@ -2604,6 +2604,12 @@ def _run_cell_external(
     )
     if int(required_free_bytes or 0) > 0:
         try:
+            # The spool root is the run's OWN cache subdirectory. Post-commit
+            # cleanup prunes it when it becomes empty, so a LATER cell must
+            # recreate the empty root before observing the same volume's free
+            # space (mkdir never deletes content). A real full/unwritable disk
+            # still raises here and fails closed as ExternalDiskShortfall.
+            Path(spool_root).mkdir(parents=True, exist_ok=True)
             _free = int(shutil.disk_usage(str(spool_root)).free)
         except Exception as exc:  # noqa: BLE001
             raise zext.ExternalDiskShortfall(
@@ -5738,7 +5744,13 @@ def _r55_margin_raw_ceiling(
         raise ValueError(
             f"invalid margin {num}/{den}: expected 0 <= num <= den, den >= 1"
         )
-    return (int(budget_bytes) * den) // (den + num)
+    # Single-sourced integer math (and the NET-available incremental contract)
+    # with :mod:`ram_contract`; this wrapper keeps its historical ValueError.
+    return int(
+        rcontract.incremental_phase_budget_bytes(
+            int(budget_bytes), margin_num=num, margin_den=den
+        )
+    )
 
 
 def _r55_coherent_worker_count(
@@ -5938,28 +5950,38 @@ def _select_external_fallback(
         )
     )
     result_unit = _external_result_unit_bytes(worst_patch_px, channels)
-    # ZM-ACTIVE-EXTERNAL-WIRING: the reduction workspace is bounded by the
-    # MARGIN-AWARE PLAN budget minus the shared process baseline. Sizing it to the
-    # raw B_plan made the external stack term fill the budget and then fail the
-    # ACTIVE 15/100 joint margin that every admitted phase must satisfy. The
-    # margin is the SAME one the ACTIVE envelope validation applies (never a
-    # new/relaxed floor).
-    reduction_budget = max(
-        1,
-        int(
-            _r55_margin_raw_ceiling(
-                int(budget_bytes),
-                margin_num=int(renv.DEFAULT_MARGIN_NUM),
-                margin_den=int(renv.DEFAULT_MARGIN_DEN),
-            )
-        )
-        - int(zpar._PER_WORKER_BASELINE_BYTES)
-        # The assembly phase OVERLAPS the stack (retained cores + halo bands),
-        # so it is part of the same margin-applied aggregate. Reserve it here so
-        # a selection that satisfies the disk envelope is also admissible by the
-        # ACTIVE joint margin. Gauge/cache/export are max phases and never add.
-        - int(fixed_overlap_bytes),
+    # ZM-EXTERNAL-PHASE-BUDGET: the external reduction is a PHASE-LOCAL
+    # admission. ``budget_bytes`` is derived from the CURRENT NET
+    # ``psutil.virtual_memory().available`` observation, which already excludes
+    # the resident process baseline; subtracting PROCESS_BASELINE here charged
+    # the same shared residency a SECOND time. Final assembly is a LATER,
+    # SEPARATE phase: external payloads are durably committed and released
+    # before it, and assembly performs its own fresh RAM admission (anonymous
+    # first, then scratch-backed). Its retained cores/halo are therefore NOT
+    # live during the reduction and must not be reserved here. The margin is
+    # the SAME one the ACTIVE envelope validation applies (never relaxed).
+    # ``_r55_margin_raw_ceiling`` is the established integer-margin seam; it
+    # delegates to ``ram_contract.incremental_phase_budget_bytes`` (single
+    # source). It is applied to the NET budget and then NOT reduced by either
+    # the resident baseline or the later assembly reserve (see above).
+    phase_budget = _r55_margin_raw_ceiling(
+        int(budget_bytes),
+        margin_num=int(renv.DEFAULT_MARGIN_NUM),
+        margin_den=int(renv.DEFAULT_MARGIN_DEN),
     )
+    reduction_budget = max(1, int(phase_budget))
+    phase_budgets = {
+        "phase": "external_reduction",
+        "source": "current_net_available_plan_budget",
+        "plan_budget_bytes": int(budget_bytes),
+        "margin_num": int(renv.DEFAULT_MARGIN_NUM),
+        "margin_den": int(renv.DEFAULT_MARGIN_DEN),
+        "reduction_budget_bytes": int(reduction_budget),
+        "process_baseline_charged_bytes": 0,
+        "process_baseline_already_in_available": True,
+        "assembly_reserve_excluded_bytes": int(fixed_overlap_bytes),
+        "assembly_admission": "separate_at_assembly_time",
+    }
     trials = []
     best = None
     priced_any = False
@@ -5981,6 +6003,7 @@ def _select_external_fallback(
                     ),
                     "trials": [],
                     "free_bytes": int(free),
+                    "phase_budgets": dict(phase_budgets),
                 }
             required = (
                 int(max_n_frames) * batch
@@ -5991,15 +6014,18 @@ def _select_external_fallback(
                     "refused": True, "reason": "frozen_batch_ram",
                     "detail": (
                         f"frozen column_batch {batch} requires {required} B of "
-                        "reduction workspace but only "
-                        f"{int(reduction_budget)} B remain after the process "
-                        "baseline and the overlapping assembly reserve; refusing "
-                        "to shrink the frozen identity silently (HOST RAM)"
+                        "incremental reduction workspace but only "
+                        f"{int(reduction_budget)} B remain in the phase-local "
+                        "budget (the process baseline is already excluded from "
+                        "current available and the later assembly is separately "
+                        "admitted); refusing to shrink the frozen identity "
+                        "silently (HOST RAM)"
                     ),
                     "trials": [],
                     "free_bytes": int(free),
                     "required_reduction_bytes": int(required),
                     "reduction_budget_bytes": int(reduction_budget),
+                    "phase_budgets": dict(phase_budgets),
                 }
         else:
             try:
@@ -6056,6 +6082,8 @@ def _select_external_fallback(
                 "result_unit_bytes": int(result_unit),
                 "disk_envelope_bytes": int(envelope),
                 "free_bytes": int(free),
+                "reduction_budget_bytes": int(reduction_budget),
+                "phase_budgets": dict(phase_budgets),
                 "trials": trials,
             }
         if best is None or envelope < best["disk_envelope_bytes"]:
@@ -6077,17 +6105,19 @@ def _select_external_fallback(
             "reason": "reduction_workspace_floor",
             "detail": (
                 "no external column batch can be priced: even the minimum "
-                "reduction workspace does not fit the margin-aware reduction "
-                f"budget {int(reduction_budget)} B after the process baseline "
-                f"and the overlapping assembly reserve "
-                f"({int(fixed_overlap_bytes)} B); this is a HOST-RAM floor, not "
-                "a disk shortfall. Remedy: increase the PLAN budget or use a "
-                "smaller frame/patch geometry."
+                "incremental reduction workspace does not fit the phase-local "
+                f"reduction budget {int(reduction_budget)} B (from the current "
+                "net available PLAN budget; the resident process baseline is "
+                "already excluded and the later assembly is separately "
+                "admitted); this is a HOST-RAM floor, not a disk shortfall. "
+                "Remedy: increase the PLAN budget or use a smaller "
+                "frame/patch geometry."
             ),
             "trials": trials,
             "free_bytes": int(free),
             "reduction_budget_bytes": int(reduction_budget),
             "fixed_overlap_bytes": int(fixed_overlap_bytes),
+            "phase_budgets": dict(phase_budgets),
             "best_envelope_bytes": None,
         }
     return {
@@ -6108,6 +6138,8 @@ def _select_external_fallback(
         ),
         "trials": trials,
         "free_bytes": int(free),
+        "reduction_budget_bytes": int(reduction_budget),
+        "phase_budgets": dict(phase_budgets),
         "best_envelope_bytes": (
             None if best is None else int(best["disk_envelope_bytes"])
         ),
@@ -6159,6 +6191,17 @@ def _working_set_block(
         "column_batch": (None if column_batch is None else int(column_batch)),
         "ram_budget_bytes": int(budget_bytes),
         "raw_available_bytes": int(raw_available_bytes),
+        # ZM-EXTERNAL-PHASE-BUDGET: the PHASE-LOCAL admission that actually
+        # governed the reduction (never the later assembly canvas). Absent for
+        # non-external classes.
+        "reduction_budget_bytes": (
+            None if external is None
+            else int(external.get("reduction_budget_bytes") or 0)
+        ),
+        "phase_budgets": (
+            None if external is None
+            else dict(external.get("phase_budgets") or {})
+        ),
         "layout": [int(layout[0]), int(layout[1])],
         "refinement_rank": int(layout[0]) * int(layout[1]),
         "cpu_ladder_trials": [dict(t) for t in (tile_trials or ())],
@@ -6973,6 +7016,18 @@ def _build_execution_bundle(
                 ),
                 "free_bytes_observed": int(
                     external_selection.get("free_bytes") or 0
+                ),
+                # PHASE-LOCAL reduction admission (never the later assembly):
+                # recorded so the ACTIVE plan/manifest can prove that the
+                # baseline was charged once and assembly was not reserved here.
+                "reduction_budget_bytes": int(
+                    external_selection.get("reduction_budget_bytes")
+                    or external_selection["pricing"]["ram"][
+                        "reduction_workspace_bytes"
+                    ]
+                ),
+                "phase_budgets": dict(
+                    external_selection.get("phase_budgets") or {}
                 ),
                 "owner_token": _owner_token,
                 "owner_record": dict(_owner_record),
@@ -8079,6 +8134,7 @@ def _r55_active_context(
     working_set_class="",
     disk_fraction_num=1,
     disk_fraction_den=2,
+    shared_bytes=None,
 ) -> object:
     env = bundle.envelope
     workers_ladder = tuple(int(w) for w in zsched.WORKERS_LADDER)
@@ -8094,7 +8150,15 @@ def _r55_active_context(
         factor_den=int(env.factor_den),
         cpu_logical=int(os.cpu_count() or 1),
         units_total=int(facts["units_total"]),
-        shared_bytes=int(bundle.shared_bytes),
+        # ZM-EXTERNAL-PHASE-BUDGET: ``budget_bytes`` is derived from the
+        # CURRENT NET ``available`` observation, which already excludes the
+        # resident process baseline. A caller pricing an INCREMENTAL phase may
+        # therefore pass ``shared_bytes=0`` (charge the baseline exactly once,
+        # inside the observation). ``None`` keeps the historical RAM/tile value.
+        shared_bytes=(
+            int(bundle.shared_bytes) if shared_bytes is None
+            else int(shared_bytes)
+        ),
         per_unit_stack_bytes=int(per_unit_stack),
         per_unit_cache_bytes=int(per_unit_cache),
         per_unit_prefetch_bytes=int(per_unit_prefetch),
@@ -8237,6 +8301,12 @@ def _r55_active_external_context(facts, bundle, cache_workers_cap):
         # fraction, nor a looser one.
         disk_fraction_num=1,
         disk_fraction_den=1,
+        # ZM-EXTERNAL-PHASE-BUDGET: the external stack term is a NEW,
+        # incremental allocation. B_plan is derived from the CURRENT NET
+        # ``available`` observation, so the resident baseline is already
+        # excluded and must not be charged again here (the selector and this
+        # ACTIVE envelope share the same phase-local reduction budget).
+        shared_bytes=0,
     )
 
 
@@ -9762,13 +9832,38 @@ def _r55_active_apply(
         workers,
         int(bundle.cache_worker_footprint_bytes),
     ))
-    stack_total = int(rcontract.stack_phase_total_bytes(
-        int(bundle.shared_bytes), units, int(per_cell_footprint)
-    ))
-    cache_total = int(rcontract.cache_phase_total_bytes(
-        int(bundle.shared_bytes), units, cache_per_cell
-    ))
-    aggregate = int(rcontract.aggregate_phase_bytes(stack_total, cache_total))
+    if external_class:
+        # ZM-EXTERNAL-PHASE-BUDGET: the external envelope is a NET/incremental
+        # accounting. Its budget derives from the CURRENT NET ``available``
+        # observation, which already excludes resident process memory; the
+        # reduction workspace is the only NEW stack allocation. Charging
+        # ``bundle.shared_bytes`` again here doubled the baseline and made a
+        # phase-local plan that the scheduler had just admitted fail its own
+        # B_plan re-check.
+        envelope_shared = 0
+        stack_total = int(rcontract.stack_phase_total_bytes(
+            0, units, int(per_cell_footprint)
+        ))
+        cache_incremental = max(
+            0, int(cache_per_cell) - int(rcontract.PROCESS_BASELINE_BYTES)
+        )
+        cache_total = int(rcontract.cache_phase_total_bytes(
+            0, units, cache_incremental
+        ))
+        aggregate = int(
+            rcontract.aggregate_phase_bytes(stack_total, cache_total)
+        )
+    else:
+        envelope_shared = int(bundle.shared_bytes)
+        stack_total = int(rcontract.stack_phase_total_bytes(
+            int(bundle.shared_bytes), units, int(per_cell_footprint)
+        ))
+        cache_total = int(rcontract.cache_phase_total_bytes(
+            int(bundle.shared_bytes), units, cache_per_cell
+        ))
+        aggregate = int(
+            rcontract.aggregate_phase_bytes(stack_total, cache_total)
+        )
     reason = (
         "R55-D2 active CPU mapping: "
         f"phase={mapping['phase']} tile={tile!r} units_in_flight={units} "
@@ -9787,7 +9882,7 @@ def _r55_active_apply(
         backend=rcontract.BACKEND_CPU,
         cells_in_flight=int(units),
         cache_workers_per_cell=int(workers),
-        shared_bytes=int(bundle.shared_bytes),
+        shared_bytes=int(envelope_shared),
         stack_total_bytes=int(stack_total),
         cache_total_bytes=int(cache_total),
         aggregate_bytes=int(aggregate),

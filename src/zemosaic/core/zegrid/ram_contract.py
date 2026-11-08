@@ -65,6 +65,7 @@ __all__ = [
     "AdmissionController",
     "plan_budget_bytes",
     "admit_budget_bytes",
+    "incremental_phase_budget_bytes",
     "requires_tolerance",
     "require_nonneg_int",
     "validate_envelope",
@@ -227,6 +228,42 @@ def admit_budget_bytes(available_bytes: int) -> int:
     """``B_admit = (9 * available) // 10`` — exact integer arithmetic."""
     a = _require_positive_observation(available_bytes)
     return (ADMIT_FACTOR_NUM * a) // ADMIT_FACTOR_DEN
+
+
+def incremental_phase_budget_bytes(
+    budget_bytes: int, *, margin_num: int, margin_den: int
+) -> int:
+    """Largest RAW peak of an INCREMENTAL phase that fits ``budget_bytes``.
+
+    Phase separation contract (ZM-EXTERNAL-PHASE-BUDGET)
+    ----------------------------------------------------
+    ``budget_bytes`` is a PLAN/admission budget derived from a CURRENT NET
+    ``available`` observation (``plan_budget_bytes`` / ``admit_budget_bytes``).
+    ``psutil.virtual_memory().available`` already excludes the resident process
+    footprint: the same shared process baseline must therefore never be
+    subtracted from that budget a second time when pricing a phase that
+    allocates NEW anonymous bytes.
+
+    Conversely, a budget derived from a GROSS/TOTAL observation would still
+    contain the baseline and would have to charge it explicitly. This helper is
+    only for the NET-observation contract; the caller proves which observation
+    it used (see the external selector's ``phase_budgets`` diagnostics).
+
+    The returned value is the inverse of the ONE margin the envelope validator
+    applies: ``ceil(raw * (den+num)/den) <= budget`` iff
+    ``raw <= (budget*den)//(den+num)``. It is deliberately a pure integer
+    ceiling: no floating factor, no second margin.
+    """
+    budget = _require_nonneg_int(budget_bytes, "budget_bytes")
+    num = _require_nonneg_int(margin_num, "margin_num")
+    den = _require_nonneg_int(margin_den, "margin_den")
+    if den < 1:
+        raise RamContractError(f"margin_den must be >= 1, got {den}")
+    if num > den:
+        raise RamContractError(
+            f"invalid margin {num}/{den}: expected 0 <= num <= den"
+        )
+    return (int(budget) * int(den)) // (int(den) + int(num))
 
 
 def requires_tolerance(aggregate_bytes: int, available_bytes: int) -> bool:
