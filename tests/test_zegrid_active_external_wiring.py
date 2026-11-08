@@ -451,7 +451,7 @@ def test_frozen_external_resumes_external_even_when_ram_would_fit(
 # 3. Real hermetic ACTIVE run_zegrid_mode END-TO-END on the external class.
 # ---------------------------------------------------------------------------
 
-def _write_e2e_corpus(root, *, frames=6, hw=96, halo=32):
+def _write_e2e_corpus(root, *, frames=6, hw=96, halo=32, step_px=48.0):
     from astropy.io import fits
     from astropy.wcs import WCS
 
@@ -459,7 +459,7 @@ def _write_e2e_corpus(root, *, frames=6, hw=96, halo=32):
     inp = root / "in"
     inp.mkdir()
     h = w = int(hw)
-    step = 48.0
+    step = float(step_px)
     names = []
     for i in range(frames):
         col, row = i % 2, i // 2
@@ -576,6 +576,13 @@ def test_run_zegrid_mode_active_external_end_to_end(tmp_path, monkeypatch):
     assert ext_manifest["stack_working_set"] == zz.WORKING_SET_EXTERNAL
     assert ext_manifest["working_set"]["class"] == zz.WORKING_SET_EXTERNAL
     assert ext_manifest["r55_scheduler"]["mode"] == "active"
+    # Truthful requested/effective backend provenance: a qualified GPU was
+    # requested and DECLINED on VRAM; the run really executed on CPU.
+    gpu = ext_manifest["gpu"]
+    assert gpu["requested"] is True
+    assert gpu["effective"] is False
+    assert gpu["actually_used"] is False
+    assert gpu["final_backend"] == "cpu"
     ext_cells = [c for c in ext_manifest.get("cells", []) if c.get("storage")]
     assert ext_cells
     for cell in ext_cells:
@@ -645,3 +652,275 @@ def test_run_zegrid_mode_external_disk_shortfall_refuses_before_gauge(
     assert gauge_calls == []
     assert not (out / "mosaic_grid.fits").exists()
     assert not (out / "zegrid_manifest.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# 2b. Refusal typing: reduction RAM floor vs disk vs malformed frozen identity.
+# ---------------------------------------------------------------------------
+
+def test_selector_reports_host_ram_when_minimum_batch_does_not_fit(
+    tmp_path, monkeypatch
+):
+    """Junior probe: ample disk, budget too small for the minimum batch.
+
+    The disk WAS observed and is not the cause; the classification must be a
+    HOST-RAM reduction floor, never ``disk_envelope_unavailable``.
+    """
+    _free(monkeypatch, 77 * GIB)
+    decision = zz._select_external_fallback(
+        permitted_tiles=(16,),
+        worst_patch_hw=(40, 40),
+        max_n_frames=100,
+        channels=3,
+        budget_bytes=1,
+        halo_px=8,
+        cache_root=str(tmp_path / "cache"),
+        storage_profile="bounded",
+    )
+    assert decision["refused"] is True
+    assert decision["reason"] == "reduction_workspace_floor"
+    assert decision["free_bytes"] == 77 * GIB
+    assert decision["trials"]
+    assert all(
+        t["reason_code"] == "column_batch_floor" for t in decision["trials"]
+    )
+    assert "HOST-RAM floor" in decision["detail"]
+
+
+def test_selector_distinguishes_frozen_batch_ram_from_invalid(
+    tmp_path, monkeypatch
+):
+    _free(monkeypatch, 77 * GIB)
+    kwargs = dict(
+        permitted_tiles=(16,),
+        worst_patch_hw=(40, 40),
+        max_n_frames=100,
+        channels=3,
+        budget_bytes=512 * MIB,
+        halo_px=8,
+        cache_root=str(tmp_path / "cache"),
+        storage_profile="bounded",
+    )
+    ram = zz._select_external_fallback(
+        **kwargs, frozen_tile=16, frozen_batch=10 ** 7
+    )
+    assert ram["refused"] is True
+    assert ram["reason"] == "frozen_batch_ram"
+    assert ram["free_bytes"] == 77 * GIB
+    assert "HOST RAM" in ram["detail"]
+
+    invalid = zz._select_external_fallback(
+        **kwargs, frozen_tile=16, frozen_batch=0
+    )
+    assert invalid["refused"] is True
+    assert invalid["reason"] == "frozen_batch_invalid"
+    assert invalid["free_bytes"] == 77 * GIB
+
+
+def test_builder_maps_external_ram_floor_to_host_ram(tmp_path, monkeypatch):
+    monkeypatch.setattr(zz, "_r55_margin_raw_ceiling", lambda *a, **k: 1)
+    with pytest.raises(zsched.PlanRefused) as exc:
+        _bundle(tmp_path, monkeypatch, stream_table=None, force_external=True)
+    assert exc.value.reason_code == renv.REASON_REFUSE_HOST_RAM
+    assert exc.value.reason_code != renv.REASON_REFUSE_DISK
+    assert "reduction" in str(exc.value).lower()
+
+
+def test_builder_maps_valid_frozen_batch_ram_to_host_ram(
+    tmp_path, monkeypatch
+):
+    frozen = zres.build_admission(
+        backend="cpu",
+        tile_px=16,
+        parity_qualified=True,
+        working_set={
+            "class": zz.WORKING_SET_EXTERNAL,
+            "tile_px": 16,
+            "column_batch": 10 ** 9,
+        },
+    )
+    with pytest.raises(zsched.PlanRefused) as exc:
+        _bundle(
+            tmp_path, monkeypatch, stream_table=None,
+            frozen_admission=frozen,
+        )
+    assert exc.value.reason_code == renv.REASON_REFUSE_HOST_RAM
+    assert exc.value.reason_code != renv.REASON_REFUSE_DISK
+    assert "frozen" in str(exc.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# 2c. NATURAL public M33 transition: RAM bundle accepted -> REAL ACTIVE RAM
+#     decision refuses on the joint margin -> the PRODUCTION catch rebuilds and
+#     admits the external class at the same pin.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_run_zegrid_mode_ram_then_real_active_margin_selects_external(
+    tmp_path, monkeypatch
+):
+    # ~3.1k x 3.1k canvas: a real assembly footprint from the pinned 2x2
+    # geometry. The preliminary bundle fits B_plan exactly; the 15/100 ACTIVE
+    # joint margin needs the assembly overlap and therefore refuses.
+    inp = _write_e2e_corpus(
+        tmp_path, frames=4, hw=96, step_px=3000.0
+    )
+    ref_out = tmp_path / "ref"
+    ext_out = tmp_path / "ext"
+    table = {int(t): 1298 * MIB for t in zz.CPU_STREAMING_TILE_LADDER}
+
+    # Reference: SAME corpus/layout/halo/config on the RAM class under a larger
+    # deterministic raw observation and the same deterministic stream facts.
+    with monkeypatch.context() as m:
+        # Real process baseline: the autouse fixture zeroes it for the small
+        # unit witnesses, but the natural margin case must count the SAME
+        # baseline the production envelope does.
+        m.setattr(
+            zpar, "_PER_WORKER_BASELINE_BYTES",
+            zz.rcontract.PROCESS_BASELINE_BYTES,
+        )
+        m.setattr(zz, "available_memory_bytes", lambda: 8 * GIB)
+        _patch_stream(m, table)
+        zz.run_zegrid_mode(
+            str(inp), str(ref_out), zconfig=_e2e_config(),
+            storage_profile="bounded", cell_gauge_mode="per_cell",
+        )
+    ref_manifest = __import__("json").loads(
+        (ref_out / "zegrid_manifest.json").read_text()
+    )
+    assert ref_manifest["stack_working_set"] == zz.WORKING_SET_RAM_TILE
+    assert (ref_out / "mosaic_grid.fits").exists()
+
+    builds = []
+    decisions = []
+    calls = []
+    real_build = zz._build_execution_bundle
+    real_decide = zz._r55_active_decide
+    real_external = zz.zext.run_cell_streaming_external
+
+    def _build_spy(*args, **kwargs):
+        bundle = real_build(*args, **kwargs)
+        builds.append(
+            {
+                "force_external": bool(kwargs.get("force_external")),
+                "mode": bundle.chosen_mode,
+                "working_set": bundle.stack_working_set,
+            }
+        )
+        return bundle
+
+    def _decide_spy(*args, **kwargs):
+        decision = real_decide(*args, **kwargs)
+        decisions.append(
+            {
+                "mapping_mode": str(
+                    dict(decision.mapping).get("cell_task_mode")
+                ),
+                "working_set_class": str(decision.working_set_class),
+            }
+        )
+        return decision
+
+    def _external_spy(*args, **kwargs):
+        calls.append(kwargs.get("cell_id"))
+        return real_external(*args, **kwargs)
+
+    def _decline_gpu(**_kwargs):
+        raise zz._R55GpuRefused(
+            zz.zgr.REASON_REFUSE_VRAM,
+            "synthetic qualified VRAM decline (no physical GPU claim)",
+        )
+
+    with monkeypatch.context() as m:
+        # A SMALLER raw observation than the reference: the preliminary bundle
+        # still fits, but the real 15/100 ACTIVE joint margin does not.
+        m.setattr(
+            zpar, "_PER_WORKER_BASELINE_BYTES",
+            zz.rcontract.PROCESS_BASELINE_BYTES,
+        )
+        m.setattr(zz, "available_memory_bytes", lambda: 2 * GIB)
+        _patch_stream(m, table)
+        m.setattr(
+            zz, "_r55_resolve_gpu_probe",
+            lambda *_a, **_k: (
+                True,
+                "synthetic",
+                {
+                    "available": True,
+                    "device": "synthetic-gpu",
+                    "cupy_version": "n/a",
+                    "vram_total_bytes": 2 * GIB,
+                    "vram_free_bytes": 2 * GIB,
+                    "reason": None,
+                },
+                1 * MIB,
+            ),
+        )
+        m.setattr(zz, "_r55_active_gpu_decide", _decline_gpu)
+        m.setattr(zz, "_build_execution_bundle", _build_spy)
+        m.setattr(zz, "_r55_active_decide", _decide_spy)
+        m.setattr(zz.zext, "run_cell_streaming_external", _external_spy)
+        zz.run_zegrid_mode(
+            str(inp), str(ext_out), zconfig=_e2e_config(),
+            storage_profile="bounded", use_gpu=True,
+            cell_gauge_mode="per_cell",
+        )
+
+    # The test itself never asked for external: the PRODUCTION catch owns the
+    # transition. The bundle trail proves an initial RAM bundle was accepted and
+    # a later rebuild forced the external class.
+    assert any(
+        b["force_external"] is False and b["mode"] == "stream"
+        for b in builds
+    ), builds
+    assert any(
+        b["force_external"] is True
+        and b["working_set"] == zz.WORKING_SET_EXTERNAL
+        for b in builds
+    ), builds
+    # A real ACTIVE decision ran and the admitted one is external.
+    assert decisions
+    assert decisions[-1]["mapping_mode"] == "external"
+    assert decisions[-1]["working_set_class"] == zz.WORKING_SET_EXTERNAL
+
+    ext_manifest = __import__("json").loads(
+        (ext_out / "zegrid_manifest.json").read_text()
+    )
+    assert ext_manifest["storage"]["effective"] == "bounded"
+    assert ext_manifest["r55_scheduler"]["mode"] == "active"
+    assert ext_manifest["stack_working_set"] == zz.WORKING_SET_EXTERNAL
+    assert ext_manifest["working_set"]["class"] == zz.WORKING_SET_EXTERNAL
+    gpu = ext_manifest["gpu"]
+    assert gpu["requested"] is True
+    assert gpu["effective"] is False
+    assert gpu["actually_used"] is False
+    assert gpu["final_backend"] == "cpu"
+
+    ext_cells = [c for c in ext_manifest.get("cells", []) if c.get("storage")]
+    assert ext_cells
+    for cell in ext_cells:
+        storage = cell["storage"]
+        assert storage["working_set"] == zz.WORKING_SET_EXTERNAL
+        assert storage["provider"] == "WindowedCanonicalProvider"
+        assert storage["external"]["tile_size"] > 0
+        assert storage["external"]["column_batch"] > 0
+        assert int(storage.get("aligned_cache_bytes_written", 0)) == 0
+    assert calls and len(calls) == len(ext_cells)
+
+    # SAME corpus/layout/config: stable identity and bit-identical science.
+    for name in ("mosaic_grid.fits", "mosaic_grid_coverage.fits"):
+        np.testing.assert_array_equal(
+            _fits_array(ref_out / name), _fits_array(ext_out / name),
+            err_msg=name,
+        )
+    ref_cells = [
+        (c["row"], c["col"], c["n_contributors"])
+        for c in ref_manifest.get("cells", [])
+    ]
+    ext_cells_ids = [
+        (c["row"], c["col"], c["n_contributors"])
+        for c in ext_manifest.get("cells", [])
+    ]
+    assert ext_cells_ids == ref_cells
+    assert ext_manifest["layout"]["nx"] == ref_manifest["layout"]["nx"]
+    assert ext_manifest["layout"]["ny"] == ref_manifest["layout"]["ny"]

@@ -273,7 +273,10 @@ def test_frozen_tile_and_batch_are_reused_or_refused(tmp_path, monkeypatch):
         storage_profile="bounded", frozen_tile=16, frozen_batch=10 ** 9,
     )
     assert bad["refused"] is True
-    assert bad["reason"] == "frozen_batch_budget"
+    # A VALID frozen batch that no longer fits the fresh reduction RAM budget
+    # is a HOST-RAM refusal, never a disk shortfall and never a silent shrink.
+    assert bad["reason"] == "frozen_batch_ram"
+    assert bad["free_bytes"] == 10 ** 12
 
 
 # ---------------------------------------------------------------------------

@@ -5962,28 +5962,44 @@ def _select_external_fallback(
     )
     trials = []
     best = None
+    priced_any = False
     for tile in permitted_tiles:
         if frozen_batch is not None:
             # A resumed external run reuses its FROZEN column-batch policy.
+            # A MALFORMED frozen value is a configuration/identity failure, not
+            # a resource shortfall; a VALID frozen batch that no longer fits the
+            # fresh reduction RAM budget is an honest HOST-RAM refusal. The two
+            # must never be conflated (and neither is a disk shortfall).
             batch = int(frozen_batch)
             if batch < 1:
                 return {
-                    "refused": True, "reason": "frozen_batch_budget",
-                    "detail": f"frozen column_batch {batch} is invalid",
-                    "trials": [],
-                }
-            if (
-                int(max_n_frames) * batch
-                * int(zext.REDUCTION_BYTES_PER_POSITION_FRAME)
-                > int(reduction_budget)
-            ):
-                return {
-                    "refused": True, "reason": "frozen_batch_budget",
+                    "refused": True, "reason": "frozen_batch_invalid",
                     "detail": (
-                        f"frozen column_batch {batch} does not fit the admitted "
-                        "reduction budget; refusing to shrink it silently"
+                        f"frozen column_batch {batch} is invalid (must be >= 1); "
+                        "the run identity/config is malformed, not short of RAM "
+                        "or disk"
                     ),
                     "trials": [],
+                    "free_bytes": int(free),
+                }
+            required = (
+                int(max_n_frames) * batch
+                * int(zext.REDUCTION_BYTES_PER_POSITION_FRAME)
+            )
+            if required > int(reduction_budget):
+                return {
+                    "refused": True, "reason": "frozen_batch_ram",
+                    "detail": (
+                        f"frozen column_batch {batch} requires {required} B of "
+                        "reduction workspace but only "
+                        f"{int(reduction_budget)} B remain after the process "
+                        "baseline and the overlapping assembly reserve; refusing "
+                        "to shrink the frozen identity silently (HOST RAM)"
+                    ),
+                    "trials": [],
+                    "free_bytes": int(free),
+                    "required_reduction_bytes": int(required),
+                    "reduction_budget_bytes": int(reduction_budget),
                 }
         else:
             try:
@@ -5999,6 +6015,7 @@ def _select_external_fallback(
                     "reason_code": "column_batch_floor", "detail": str(exc),
                 })
                 continue
+        priced_any = True
         pricing = zext.estimate_external_working_set(
             n_frames=int(max_n_frames),
             height=int(worst_patch_hw[0]),
@@ -6043,6 +6060,36 @@ def _select_external_fallback(
             }
         if best is None or envelope < best["disk_envelope_bytes"]:
             best = entry
+    if (
+        best is None
+        and not priced_any
+        and trials
+        and all(
+            str(entry.get("reason_code")) == "column_batch_floor"
+            for entry in trials
+        )
+    ):
+        # The disk was OBSERVED and is not the cause: even the minimum
+        # reduction workspace (one pixel x channels x n_frames x 31 B) cannot
+        # fit the margin-aware reduction budget. This is a HOST-RAM floor.
+        return {
+            "refused": True,
+            "reason": "reduction_workspace_floor",
+            "detail": (
+                "no external column batch can be priced: even the minimum "
+                "reduction workspace does not fit the margin-aware reduction "
+                f"budget {int(reduction_budget)} B after the process baseline "
+                f"and the overlapping assembly reserve "
+                f"({int(fixed_overlap_bytes)} B); this is a HOST-RAM floor, not "
+                "a disk shortfall. Remedy: increase the PLAN budget or use a "
+                "smaller frame/patch geometry."
+            ),
+            "trials": trials,
+            "free_bytes": int(free),
+            "reduction_budget_bytes": int(reduction_budget),
+            "fixed_overlap_bytes": int(fixed_overlap_bytes),
+            "best_envelope_bytes": None,
+        }
     return {
         "refused": True,
         "reason": "disk_envelope_unavailable",
@@ -6368,6 +6415,18 @@ def _build_execution_bundle(
             gpu_tile_size = None
             gpu_device_workspace_bytes = None
             gpu_stream_by_idx = None
+            if bool(gpu_used):
+                # Truthful backend provenance: the product REQUESTED a GPU, but
+                # this execution class is CPU-only. Record the pre-execution
+                # decline so the science config, the per-cell records and the
+                # manifest cannot claim a GPU execution that never happened.
+                gpu_pre_execution_fallback = {
+                    "reason": "external_working_set_cpu_only",
+                    "detail": (
+                        "the external_spool working set executes on CPU; the "
+                        "requested GPU is not used"
+                    ),
+                }
         if effective_gpu:
             max_n = max(
                 (len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids),
@@ -6692,11 +6751,23 @@ def _build_execution_bundle(
                         f"{_ext_reason}): {_ext_detail}",
                         candidates=(),
                     )
-                if _ext_reason == "frozen_batch_budget":
+                if _ext_reason in (
+                    "reduction_workspace_floor", "frozen_batch_ram",
+                ):
+                    # HOST RAM, never disk: the disk was observed and is ample;
+                    # the minimum reduction workspace (or the frozen batch)
+                    # does not fit the margin-aware reduction budget.
                     raise zsched.PlanRefused(
                         renv.REASON_REFUSE_HOST_RAM,
-                        "no RAM streaming tile fits and the FROZEN external "
-                        f"column batch does not fit the reduction budget: "
+                        "no RAM streaming tile fits and the external reduction "
+                        f"workspace does not fit ({_ext_reason}): {_ext_detail}",
+                        candidates=(),
+                    )
+                if _ext_reason == "frozen_batch_invalid":
+                    # Malformed frozen identity/config, not a capacity miss.
+                    raise zsched.PlanRefused(
+                        renv.REASON_INTERNAL_ERROR,
+                        "the FROZEN external column-batch identity is malformed: "
                         f"{_ext_detail}",
                         candidates=(),
                     )
