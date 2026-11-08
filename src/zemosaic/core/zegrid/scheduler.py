@@ -101,6 +101,9 @@ __all__ = [
     "ACTIVE_MAPPING_SCHEMA",
     "ACTIVE_FINAL_PLAN_SCHEMA",
     "ACTIVE_EXECUTABLE_PHASES",
+    "WORKING_SET_CLASS_NONE",
+    "WORKING_SET_CLASS_EXTERNAL_SPOOL",
+    "WORKING_SET_CLASSES",
     "E2_GPU_MAPPING_SCHEMA",
     "active_gpu_phase",
     "active_gpu_mapping_for_candidate",
@@ -177,6 +180,22 @@ MODE_LEGACY = "legacy"
 MODE_OBSERVE = "observe"
 MODE_ACTIVE = "active"
 MODES = (MODE_LEGACY, MODE_OBSERVE, MODE_ACTIVE)
+
+#: ZM-ACTIVE-EXTERNAL-WIRING: additive WORKING-SET CLASS marker.
+#:
+#: The empty string is the historical RAM working set and keeps every existing
+#: plan/hash byte-identical. ``external_spool`` marks the disk-spool class: its
+#: candidates are single-owner (K == 1), prefetch-free, use the real per-unit
+#: spool envelope as their ON-DISK residency, and map to the existing external
+#: executor instead of the RAM stream executor. The class is a property of the
+#: PlanContext and travels on every Candidate so a shrink can never silently
+#: change it.
+WORKING_SET_CLASS_NONE = ""
+WORKING_SET_CLASS_EXTERNAL_SPOOL = "external_spool"
+WORKING_SET_CLASSES = (
+    WORKING_SET_CLASS_NONE,
+    WORKING_SET_CLASS_EXTERNAL_SPOOL,
+)
 # ZM-ZEGRID-R56: "no explicit choice" means the qualified active path
 # (5,000-image bounded Windows/GPU run, no fallback). An explicit
 # ``legacy``/``observe`` token still wins everywhere.
@@ -445,6 +464,14 @@ class PlanContext:
     # removes only the terms the bounded provider/sink eliminate. The profile is
     # selected BEFORE layout filtering and carried unchanged through the run.
     storage_profile: str = STORAGE_PROFILE_DENSE
+    # ZM-ACTIVE-EXTERNAL-WIRING: additive working-set class (see the module
+    # constants). ``""`` is the historical RAM class; ``external_spool`` marks
+    # the disk-spool execution class and is carried to every Candidate.
+    working_set_class: str = WORKING_SET_CLASS_NONE
+    # The external spool executor is a single-owner primitive (one spooled Cell
+    # at a time, one reduction workspace); ``None`` keeps the historical CPU
+    # concurrency search unchanged.
+    max_units_in_flight: int | None = None
 
     @property
     def prefetch_disk_bytes(self) -> int:
@@ -509,6 +536,10 @@ class Candidate:
     estimate_method: str = "static_bound"
     calibration_id: str | None = None
     storage_profile: str = STORAGE_PROFILE_DENSE
+    # ZM-ACTIVE-EXTERNAL-WIRING: the working-set class this candidate executes
+    # in. ``""`` is the historical RAM class (kept out of ``to_dict`` so every
+    # existing manifest/hash stays byte-identical).
+    working_set_class: str = WORKING_SET_CLASS_NONE
 
     def ordering_key(self) -> tuple:
         """The documented lexicographic ENUMERATION key.
@@ -546,6 +577,11 @@ class Candidate:
                 {}
                 if self.storage_profile == STORAGE_PROFILE_DENSE
                 else {"storage_profile": self.storage_profile}
+            ),
+            **(
+                {}
+                if self.working_set_class == WORKING_SET_CLASS_NONE
+                else {"working_set_class": self.working_set_class}
             ),
         }
 
@@ -695,6 +731,37 @@ def _validate_context(context: PlanContext, *, allow_gpu: bool = False) -> None:
         normalize_storage_profile(context.storage_profile)
     except ValueError as exc:
         raise SchedulerConfigError(str(exc))
+    # ZM-ACTIVE-EXTERNAL-WIRING: the working-set class is a CLOSED vocabulary.
+    if context.working_set_class not in WORKING_SET_CLASSES:
+        raise SchedulerConfigError(
+            f"unknown working_set_class {context.working_set_class!r}; "
+            f"expected one of {WORKING_SET_CLASSES}"
+        )
+    if context.max_units_in_flight is not None:
+        require_int(
+            context.max_units_in_flight,
+            "max_units_in_flight",
+            minimum=1,
+        )
+    if context.working_set_class == WORKING_SET_CLASS_EXTERNAL_SPOOL:
+        # The disk-spool executor is single-owner and prefetch-free. Those are
+        # execution-contract facts, not tunables: refuse a contradictory context
+        # instead of silently pricing a shape the executor cannot run.
+        if context.phase != PHASE_CELL_STACK_STREAM:
+            raise SchedulerConfigError(
+                "working_set_class='external_spool' requires the streaming stack "
+                f"phase, got {context.phase!r}"
+            )
+        if context.max_units_in_flight != 1:
+            raise SchedulerConfigError(
+                "working_set_class='external_spool' is single-owner; "
+                "max_units_in_flight must be 1"
+            )
+        if tuple(context.prefetch_ladder) != (0,):
+            raise SchedulerConfigError(
+                "working_set_class='external_spool' is prefetch-free; "
+                f"prefetch_ladder must be (0,), got {context.prefetch_ladder!r}"
+            )
     if context.phase != PHASE_CELL_STACK_STREAM and context.profile is not None:
         raise SchedulerConfigError(
             "a calibrated profile is only modelled for cell_stack_stream in R55-B"
@@ -935,6 +1002,10 @@ def enumerate_candidates(context: PlanContext) -> tuple[Candidate, ...]:
     _validate_context(context)
     cpu_slots = max(0, int(context.cpu_logical) - CPU_OS_RESERVE)
     k_max = min(cpu_slots, int(context.units_total))
+    if context.max_units_in_flight is not None:
+        # ZM-ACTIVE-EXTERNAL-WIRING: an execution class may cap concurrency below
+        # the generic CPU search (the external spool is single-owner).
+        k_max = min(k_max, int(context.max_units_in_flight))
     disk_cap = (
         int(context.disk_free_bytes) * int(context.disk_fraction_num)
     ) // int(context.disk_fraction_den)
@@ -1062,6 +1133,7 @@ def enumerate_candidates(context: PlanContext) -> tuple[Candidate, ...]:
                             estimate_method=method,
                             calibration_id=cal_id,
                             storage_profile=context.storage_profile,
+                            working_set_class=context.working_set_class,
                         )
                     )
 
@@ -1472,6 +1544,12 @@ def _validate_joint_consistency(
     reference: PlanContext, other: PlanContext
 ) -> None:
     problems: list[str] = []
+    if reference.working_set_class != other.working_set_class:
+        problems.append(
+            "working_set_class differs "
+            f"({reference.working_set_class!r} != {other.working_set_class!r}); "
+            "one joint plan cannot mix execution classes"
+        )
     for name in (
         "raw_available_bytes",
         "factor_num",
@@ -3239,6 +3317,13 @@ def _validate_active_candidate_fields(
         raise SchedulerConfigError(
             f"expected Candidate, got {type(candidate).__name__}"
         )
+    if candidate.working_set_class not in WORKING_SET_CLASSES:
+        raise ActivePlanRejected(
+            REASON_INTERNAL_ERROR,
+            f"unknown candidate working_set_class "
+            f"{candidate.working_set_class!r}",
+            candidate=candidate,
+        )
     if candidate.backend != BACKEND_CPU and not (
         allow_gpu and candidate.backend == BACKEND_GPU
     ):
@@ -3536,6 +3621,35 @@ def active_mapping_for_candidate(
         mapped_tile = int(candidate.tile_px)
     else:
         mapped_tile = None
+    external_class = (
+        candidate.working_set_class == WORKING_SET_CLASS_EXTERNAL_SPOOL
+    )
+    if external_class:
+        # ZM-ACTIVE-EXTERNAL-WIRING: the disk-spool executor is single-owner and
+        # has no prefetch pipeline. The tile is the spool tile; the mapping mode
+        # is EXTERNAL so no downstream consumer can silently execute the RAM
+        # streaming path for an external plan.
+        if phase != PHASE_CELL_STACK_STREAM or mapped_tile is None:
+            raise ActivePlanRejected(
+                REASON_SHRINK_TILE,
+                "external_spool mapping requires a streaming spool tile, got "
+                f"tile_px={candidate.tile_px!r}",
+                candidate=candidate,
+            )
+        if int(candidate.units_in_flight) != 1:
+            raise ActivePlanRejected(
+                REASON_REFUSE_HOST_RAM,
+                "external_spool is a single-owner execution class (K == 1), got "
+                f"units_in_flight={candidate.units_in_flight}",
+                candidate=candidate,
+            )
+        if int(candidate.prefetch_units) != 0:
+            raise ActivePlanRejected(
+                REASON_SHRINK_PREFETCH,
+                "external_spool has no prefetch pipeline; got "
+                f"prefetch_units={candidate.prefetch_units}",
+                candidate=candidate,
+            )
     units = int(candidate.units_in_flight)
     if units < 1:
         raise ActivePlanRejected(
@@ -3557,13 +3671,18 @@ def active_mapping_for_candidate(
         "backend": BACKEND_CPU,
         "phase": phase,
         "cell_task_mode": (
-            "inmem" if phase == PHASE_CELL_STACK_INMEM else "stream"
+            "external"
+            if external_class
+            else ("inmem" if phase == PHASE_CELL_STACK_INMEM else "stream")
         ),
         "cpu_streaming_tile": mapped_tile,
         "units_in_flight": units,
         "workers_per_unit": workers,
         "prefetch_units": 0,
     }
+    if external_class:
+        mapping["working_set_class"] = WORKING_SET_CLASS_EXTERNAL_SPOOL
+        mapping["external_single_owner"] = True
     if candidate.storage_profile != STORAGE_PROFILE_DENSE:
         mapping["storage"] = {
             "profile": candidate.storage_profile,
@@ -4012,6 +4131,7 @@ def _replace_candidate(candidate: Candidate, **changes) -> Candidate:
         "estimate_method": candidate.estimate_method,
         "calibration_id": candidate.calibration_id,
         "storage_profile": candidate.storage_profile,
+        "working_set_class": candidate.working_set_class,
     }
     data.update(changes)
     return Candidate(**data)
@@ -4037,6 +4157,14 @@ def assert_shrink_only(previous: Candidate, candidate: Candidate) -> None:
     if not isinstance(previous, Candidate) or not isinstance(candidate, Candidate):
         raise SchedulerConfigError("shrink comparison requires two Candidates")
     problems: list[str] = []
+    # A working-set class is part of the execution contract: a shrink must never
+    # silently move a plan between the RAM and external classes.
+    if candidate.working_set_class != previous.working_set_class:
+        problems.append(
+            "working_set_class changed "
+            f"{previous.working_set_class!r} -> "
+            f"{candidate.working_set_class!r}"
+        )
     if previous.backend not in BACKENDS or candidate.backend not in BACKENDS:
         problems.append(
             f"unknown backend transition {previous.backend!r} -> {candidate.backend!r}"
@@ -4199,6 +4327,13 @@ def assert_grow_only(previous: Candidate, candidate: Candidate) -> None:
     if not isinstance(previous, Candidate) or not isinstance(candidate, Candidate):
         raise SchedulerConfigError("growth comparison requires two Candidates")
     problems: list[str] = []
+    if candidate.working_set_class != previous.working_set_class:
+        problems.append(
+            "working_set_class changed "
+            f"{previous.working_set_class!r} -> "
+            f"{candidate.working_set_class!r} "
+            "(a grow step never changes the working-set class)"
+        )
     if previous.backend != candidate.backend:
         problems.append(
             f"backend changed {previous.backend!r} -> {candidate.backend!r} "

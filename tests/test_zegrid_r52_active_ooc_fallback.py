@@ -867,7 +867,15 @@ def test_bounded_cell_closes_and_removes_its_cache(tmp_path):
 
 
 def test_public_auto_double_refusal_is_loud(tmp_path, monkeypatch):
-    """AUTO dense fails AND bounded fails -> ONE loud error naming both."""
+    """dense RAM fails, bounded RAM fails AND external disk is unavailable.
+
+    ZM-ACTIVE-EXTERNAL-WIRING: an already-bounded refusal is no longer the end
+    of the search — the external working-set CLASS is the next candidate. A
+    genuine loud refusal therefore requires the THIRD class to be unavailable
+    too. The witness keeps every RAM rung infeasible and makes the external
+    disk envelope unavailable, so the refusal stays loud, typed and honest
+    (never relabelled as a RAM miss).
+    """
     inp, out = _write_corpus(tmp_path)
     monkeypatch.setattr(zz, "available_memory_bytes", lambda: _DENSE_OK_RAW)
     monkeypatch.setattr(zal, "ScientificFloors", _tiny_floors)
@@ -881,13 +889,25 @@ def test_public_auto_double_refusal_is_loud(tmp_path, monkeypatch):
         lambda n, hw, tile_size=zz.STREAM_TILE_SIZE, channels=3,
         storage_profile=None: 1_000_000 * MIB,
     )
-    with pytest.raises(zz.zpar.ModeInfeasible) as ei:
+    import shutil as _shutil
+
+    real_du = _shutil.disk_usage
+    tiny = SimpleNamespace(total=1 * MIB, used=0, free=1 * MIB)
+
+    def _disk_usage(path):
+        if "external-spool" in str(path):
+            return tiny
+        return real_du(path)
+
+    monkeypatch.setattr(zz.shutil, "disk_usage", _disk_usage)
+    with pytest.raises(zz.zsched.PlanRefused) as ei:
         zz.run_zegrid_mode(
             str(inp), str(out), zconfig=_active_zconfig("active"), zegrid_halo_px=8,
         )
     text = str(ei.value)
-    assert "in either storage profile" in text
-    assert "dense:" in text and "bounded:" in text
+    assert "external" in text.lower()
+    assert "disk" in text.lower()
+    assert ei.value.reason_code == zz.renv.REASON_REFUSE_DISK
     assert zz._STORAGE_EFFECTIVE == "bounded"
     assert zz._STORAGE_FALLBACK_COUNT == 1
     assert not (out / "zegrid_manifest.json").exists()

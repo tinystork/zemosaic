@@ -5,7 +5,27 @@ Programme : `ZM-ZEGRID-ADAPTIVE-RESOURCES-20261107`
 État : **REWORK F1–F10 appliqué — qualification produit encore PARTIELLE (runs réels restants)**
 Contrat : [plan v2, sections 10–14](ZEGRID_ADAPTIVE_RESOURCE_ENGINE_PLAN_20261107.md)
 
-## Verdict courant après audit transversal (2026-11-07)
+## Réouverture ciblée M33 — 2026-11-08 (prioritaire sur les statuts historiques)
+
+- Défaut confirmé sur beta `c73e6d3`, moteur Windows identique : ACTIVE ne sélectionne ni ne matérialise le working-set external après refus RAM/GPU. Le run M33 passe le layout puis refuse avant jauge/stack.
+- Reproduction Junior : bundle external accepté, puis `_r55_active_decide` refuse RAM sans appeler le sélecteur external. Les tests F4 s'arrêtent au bundle ; Q60 utilise legacy. Qualification produit toujours PARTIELLE.
+- Tristan autorise la correction et la délégation si substantielle. Mission bornée `ZM-ACTIVE-EXTERNAL-WIRING-20261108`, branche `feat/zegrid-adaptive-resources`, baseline `c73e6d37d3bf1d23a217dbffb03fb551b39db12d` propre avant cette note.
+- Coco réinitialisé (nouvelle mission indépendante, tokens=0), délégation préparée. Brief : `/home/tristan/.openclaw/workspace/.a2a-reports/ZM-ACTIVE-EXTERNAL-WIRING-20261108.brief.md`.
+- Rapport attendu : `/home/tristan/.openclaw/workspace/.a2a-reports/ZM-ACTIVE-EXTERNAL-WIRING-20261108.coco.r0.md`. Après callback : vérification Junior puis revue Nono ; ne pas clôturer sur le seul rapport worker.
+- Baseline ciblée Junior : deux tests de sélection external (CPU/GPU détecté) passent, `2 passed in 38.78s`; cela ne valide pas la jonction ACTIVE.
+- Aucun push/install/runtime Windows/full M33 lancé pour ce correctif. A1d et F14 restent hors périmètre.
+
+## Implémentation worker ZM-ACTIVE-EXTERNAL-WIRING — 2026-11-08
+
+- Classe de working-set `external_spool` portée par `PlanContext`/`Candidate` (champ additif ; vide = classe RAM historique) : K=1, prefetch=0, résidence disque = enveloppe spool réelle.
+- `_r55_active_decide` route un bundle external vers `_r55_active_external_decide` (même `plan_joint`, mêmes phases, même marge 15/100) ; `_r55_active_apply`/`_r55_active_admit` matérialisent les tâches external et refusent tout changement de classe (shrink/grow inclus).
+- Sélection pré-gauge : un refus RAM bounded sélectionne la classe external au MÊME pin (géométrie/halo/frames), sans seconde transition de profil ; un refus disque reste typé `R55_REFUSE_DISK` AVANT jauge/stack.
+- Pricing external aligné sur la marge (espace de réduction + overlap assembly réservés), aucun cache aligné fantôme ; la taille de lot ne remplit plus le budget brut.
+- Reprise : une admission gelée `external_spool` reconstruit toujours la classe external (tile/lot gelés), jamais RAM, même si la RAM fraîche suffirait.
+- Preuves : `tests/test_zegrid_active_external_wiring.py` (7 tests, dont E2E ACTIVE réel avec refus GPU injecté et exécuteur external spy call-through) ; suites ciblées M3/R55D2/resume/run_store/r52/F5/E8/A1 vertes. Deux échecs `test_zegrid_m0m1_dry_plan_cpu_ladder` reproduits à l'identique sur baseline `c73e6d3` (pré-existants, hors périmètre).
+- Run M33 production : **NON EXÉCUTÉ**. Qualification Windows toujours requise ; ce rapport worker n'est pas une acceptation produit.
+
+## Verdict historique après audit transversal (2026-11-07)
 
 **Les défauts matériels F1–F13 de l'audit sont corrigés et vérifiés indépendamment** (commits
 locaux sur `feat/zegrid-adaptive-resources`) : F2/F3 (admission véridique + sous-ligne) `b251643`,

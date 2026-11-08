@@ -5711,6 +5711,11 @@ class ExecutionBundle:
     # decision fields byte-identical; these two fields are explicitly additive.
     stack_working_set: str = WORKING_SET_INMEM
     working_set_block: dict | None = None
+    # ZM-ACTIVE-EXTERNAL-WIRING: the exact frozen external execution contract
+    # (tile, column batch, spool root, disk envelope, reduction workspace, owner)
+    # that ACTIVE materialization and every external task must reuse unchanged.
+    # ``None`` for RAM bundles.
+    external_contract: dict | None = None
 
 
 def _r55_margin_raw_ceiling(
@@ -5870,6 +5875,7 @@ def _select_external_fallback(
     storage_profile,
     frozen_tile=None,
     frozen_batch=None,
+    fixed_overlap_bytes=0,
 ) -> dict:
     """Choose `stream_external(tile, batch)` or return a typed refusal.
 
@@ -5932,10 +5938,27 @@ def _select_external_fallback(
         )
     )
     result_unit = _external_result_unit_bytes(worst_patch_px, channels)
-    # The reduction workspace is bounded by the PLAN budget MINUS the shared
-    # process baseline (counted once by the project envelope).
+    # ZM-ACTIVE-EXTERNAL-WIRING: the reduction workspace is bounded by the
+    # MARGIN-AWARE PLAN budget minus the shared process baseline. Sizing it to the
+    # raw B_plan made the external stack term fill the budget and then fail the
+    # ACTIVE 15/100 joint margin that every admitted phase must satisfy. The
+    # margin is the SAME one the ACTIVE envelope validation applies (never a
+    # new/relaxed floor).
     reduction_budget = max(
-        1, int(budget_bytes) - int(zpar._PER_WORKER_BASELINE_BYTES)
+        1,
+        int(
+            _r55_margin_raw_ceiling(
+                int(budget_bytes),
+                margin_num=int(renv.DEFAULT_MARGIN_NUM),
+                margin_den=int(renv.DEFAULT_MARGIN_DEN),
+            )
+        )
+        - int(zpar._PER_WORKER_BASELINE_BYTES)
+        # The assembly phase OVERLAPS the stack (retained cores + halo bands),
+        # so it is part of the same margin-applied aggregate. Reserve it here so
+        # a selection that satisfies the disk envelope is also admissible by the
+        # ACTIVE joint margin. Gauge/cache/export are max phases and never add.
+        - int(fixed_overlap_bytes),
     )
     trials = []
     best = None
@@ -6146,6 +6169,7 @@ def _build_execution_bundle(
     halo_px=None,
     restored_geometry=None,
     frozen_admission=None,
+    force_external=False,
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -6189,6 +6213,20 @@ def _build_execution_bundle(
         if frozen_admission is None
         else zres.validate_admission(frozen_admission)
     )
+    # ZM-ACTIVE-EXTERNAL-WIRING: the frozen working-set class is authoritative.
+    # A resumed external run ALWAYS rebuilds the external class, even if fresh
+    # RAM would now admit a RAM plan: silently changing the class on resume is
+    # forbidden. Callers may also force the external class at a pinned geometry
+    # (pre-gauge ACTIVE admission fallback).
+    _frozen_ws_policy = (
+        None if _frozen_admission is None
+        else _frozen_admission.get("working_set")
+    )
+    _frozen_external = bool(
+        _frozen_ws_policy
+        and str(_frozen_ws_policy.get("class")) == WORKING_SET_EXTERNAL
+    )
+    _force_external = bool(force_external) or _frozen_external
     # SINGLE-SOURCED enforcement (both directions). The bundle can never plan a
     # backend that the run's frozen identity does not own.
     gpu_used = _frozen_planning_gpu(_frozen_admission, gpu_used=bool(gpu_used))
@@ -6323,6 +6361,13 @@ def _build_execution_bundle(
         gpu_tile_trials: list = []
         gpu_pre_execution_fallback = None
         _cache_root = None if cache_root is None else Path(cache_root)
+        if _force_external:
+            # ZM-ACTIVE-EXTERNAL-WIRING: the external working set is CPU-only and
+            # explicit. No GPU rung is considered for a forced external class.
+            effective_gpu = False
+            gpu_tile_size = None
+            gpu_device_workspace_bytes = None
+            gpu_stream_by_idx = None
         if effective_gpu:
             max_n = max(
                 (len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids),
@@ -6499,7 +6544,7 @@ def _build_execution_bundle(
                 gpu_device_workspace_bytes = None
                 gpu_stream_by_idx = None
 
-        if plan is None:
+        if plan is None and not _force_external:
             # CPU: walk the PERMITTED ladder (largest first) and keep the first
             # jointly feasible tile. Never a numeric clamp, never a stale report.
             for t in permitted_tiles:
@@ -6526,7 +6571,7 @@ def _build_execution_bundle(
                 plan = candidate
                 chosen_tile = int(t)
                 break
-        else:
+        elif plan is not None:
             # GPU plan accepted: still plan the CPU fallback bundle across the
             # ladder, but NEVER abort the (feasible) GPU plan when no CPU mode
             # fits (R36 F-M2 D: a GPU success is allowed with no CPU fallback).
@@ -6551,18 +6596,26 @@ def _build_execution_bundle(
                 chosen_tile = int(t)
                 break
 
-        _frozen_ws_policy = (
-            None if _frozen_admission is None
-            else _frozen_admission.get("working_set")
-        )
-        _frozen_external = bool(
-            _frozen_ws_policy
-            and str(_frozen_ws_policy.get("class")) == WORKING_SET_EXTERNAL
-        )
         if plan is None and _bounded:
             # M3/M4: no in-memory plan and no RAM tile fits. The next class is
             # the external working set (disk spool), priced BEFORE any work. A
             # resumed external run reuses its FROZEN tile and column batch.
+            _ext_patch_area = 0
+            _ext_core_area = 0
+            for _row, _col, _cell, _patch, _mem in cell_ctxs:
+                if not _mem.patch_ids:
+                    continue
+                _ext_patch_area += int(_patch.patch.width) * int(
+                    _patch.patch.height
+                )
+                _core = _cell.core
+                _ext_core_area += max(
+                    0, int(_core.x1) - int(_core.x0)
+                ) * max(0, int(_core.y1) - int(_core.y0))
+            _ext_overlap_bytes = (
+                max(0, _ext_patch_area - _ext_core_area) * 4 * 4
+                + int(canvas.width) * int(canvas.height) * 4 * 4
+            )
             external_selection = _select_external_fallback(
                 permitted_tiles=permitted_tiles,
                 worst_patch_hw=worst_patch_hw,
@@ -6582,6 +6635,7 @@ def _build_execution_bundle(
                     and _frozen_ws_policy.get("column_batch") is not None
                     else None
                 ),
+                fixed_overlap_bytes=int(_ext_overlap_bytes),
             )
             if not external_selection.get("refused"):
                 _ext_ws = int(
@@ -6618,6 +6672,47 @@ def _build_execution_bundle(
                 gpu_tile_size = None
                 gpu_device_workspace_bytes = None
                 gpu_stream_by_idx = None
+            else:
+                # The RAM class is exhausted and the NEXT (external) class was
+                # priced at this geometry. Its disk/observation refusal must be
+                # surfaced with its OWN type — never relabelled as a RAM miss,
+                # never retried silently, and never replaced by the RAM class.
+                _ext_reason = str(external_selection.get("reason") or "")
+                _ext_detail = str(external_selection.get("detail") or "")
+                if _ext_reason == "disk_envelope_unavailable":
+                    _ext_code = (
+                        renv.REASON_INTERNAL_ERROR
+                        if external_selection.get("free_bytes") is None
+                        else renv.REASON_REFUSE_DISK
+                    )
+                    raise zsched.PlanRefused(
+                        _ext_code,
+                        "no RAM streaming tile fits AND the external working set "
+                        "cannot be executed at this geometry ("
+                        f"{_ext_reason}): {_ext_detail}",
+                        candidates=(),
+                    )
+                if _ext_reason == "frozen_batch_budget":
+                    raise zsched.PlanRefused(
+                        renv.REASON_REFUSE_HOST_RAM,
+                        "no RAM streaming tile fits and the FROZEN external "
+                        f"column batch does not fit the reduction budget: "
+                        f"{_ext_detail}",
+                        candidates=(),
+                    )
+                if _force_external:
+                    raise zsched.PlanRefused(
+                        renv.REASON_INTERNAL_ERROR,
+                        "the external working set cannot be executed at the "
+                        f"frozen geometry ({_ext_reason}): {_ext_detail}",
+                        candidates=(),
+                    )
+        if plan is None and _force_external and not _bounded:
+            raise zpar.ModeInfeasible(
+                "the external_spool working set requires the bounded storage "
+                "profile, but storage_profile=dense is explicitly requested. "
+                "Remedy: use AUTO/bounded or start a new run/output folder."
+            )
         if plan is None:
             if _frozen_external and not _bounded:
                 raise zpar.ModeInfeasible(
@@ -6790,6 +6885,23 @@ def _build_execution_bundle(
                 "spool_root": str(external_selection["spool_root"]),
                 "disk_envelope_bytes": int(
                     external_selection["disk_envelope_bytes"]
+                ),
+                # The REAL resident reduction workspace this class needs. It is
+                # the ACTIVE admission stack term; it is never a patch-area
+                # aligned-cache estimate.
+                "reduction_workspace_bytes": int(
+                    external_selection["pricing"]["ram"][
+                        "reduction_workspace_bytes"
+                    ]
+                ),
+                "resident_unit_bytes": int(
+                    external_selection.get("resident_unit_bytes") or 0
+                ),
+                "result_unit_bytes": int(
+                    external_selection.get("result_unit_bytes") or 0
+                ),
+                "free_bytes_observed": int(
+                    external_selection.get("free_bytes") or 0
                 ),
                 "owner_token": _owner_token,
                 "owner_record": dict(_owner_record),
@@ -6991,6 +7103,10 @@ def _build_execution_bundle(
             storage_profile=_profile,
             stack_working_set=stack_working_set,
             working_set_block=dict(working_set_block),
+            external_contract=(
+                None if _external_task_info is None
+                else dict(_external_task_info)
+            ),
         )
 
 
@@ -7365,6 +7481,11 @@ class _R55ActiveDecision:
     cache_workers: int = 0
     worker_trail: tuple = ()
     storage_profile: str = zsp.STORAGE_PROFILE_DENSE
+    # ZM-ACTIVE-EXTERNAL-WIRING: the execution working-set class of this decision
+    # ("" for the historical RAM class, "external_spool" for the disk-spool
+    # class). Admission/materialization/apply branch on it; it is never inferred
+    # from prose or re-derived at launch.
+    working_set_class: str = ""
 
 
 
@@ -7881,6 +8002,12 @@ def _r55_active_context(
     bundle,
     per_tile_stack_bytes=None,
     cache_workers_cap=None,
+    tile_ladder=None,
+    prefetch_ladder=(0,),
+    max_units_in_flight=None,
+    working_set_class="",
+    disk_fraction_num=1,
+    disk_fraction_den=2,
 ) -> object:
     env = bundle.envelope
     workers_ladder = tuple(int(w) for w in zsched.WORKERS_LADDER)
@@ -7901,20 +8028,28 @@ def _r55_active_context(
         per_unit_cache_bytes=int(per_unit_cache),
         per_unit_prefetch_bytes=int(per_unit_prefetch),
         disk_free_bytes=int(facts["disk_free"]),
+        disk_fraction_num=int(disk_fraction_num),
+        disk_fraction_den=int(disk_fraction_den),
         layout=tuple(facts["layout"]),
         refinement_rank=int(facts["refinement_rank"]),
         patch_hw=tuple(facts["worst_patch_hw"]),
         halo_px=int(facts["halo_px"]),
         channels=int(facts["channels"]),
         n_frames=int(facts["max_n_frames"]),
-        tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+        tile_ladder=(
+            tuple(int(t) for t in CPU_STREAMING_TILE_LADDER)
+            if tile_ladder is None
+            else tuple(int(t) for t in tile_ladder)
+        ),
         # D2 executable prefetch is EXACTLY zero; R55-E owns prefetch.
-        prefetch_ladder=(0,),
+        prefetch_ladder=tuple(int(p) for p in prefetch_ladder),
         workers_ladder=workers_ladder,
         # R55-E8: when a per-tile host map is supplied, every streaming
         # candidate uses its OWN exact bound (E7 contract), never the static
         # ladder maximum. The in-memory phase keeps its own bound.
         per_tile_stack_bytes=per_tile_stack_bytes,
+        max_units_in_flight=max_units_in_flight,
+        working_set_class=str(working_set_class),
         margin_num=int(renv.DEFAULT_MARGIN_NUM),
         margin_den=int(renv.DEFAULT_MARGIN_DEN),
         cell_ids=tuple(facts["cell_ids"]),
@@ -7971,6 +8106,205 @@ def _r55_worker_adaptation_detail(facts, trail):
     }
 
 
+def _r55_external_contract(bundle) -> dict:
+    """Return the bundle's FROZEN external execution contract (validated)."""
+    contract = getattr(bundle, "external_contract", None)
+    if not isinstance(contract, dict) or not contract:
+        raise zsched.SchedulerConfigError(
+            "an external working-set bundle must carry its frozen external "
+            "contract (tile, column batch, spool root, disk envelope)"
+        )
+    if str(contract.get("class")) != WORKING_SET_EXTERNAL:
+        raise zsched.SchedulerConfigError(
+            "external contract has the wrong working-set class "
+            f"{contract.get('class')!r}"
+        )
+    tile = int(contract.get("tile_size") or 0)
+    batch = int(contract.get("column_batch") or 0)
+    envelope = int(contract.get("disk_envelope_bytes") or 0)
+    workspace = int(contract.get("reduction_workspace_bytes") or 0)
+    if tile < 1 or batch < 1 or envelope < 1 or workspace < 1:
+        raise zsched.SchedulerConfigError(
+            "external contract carries a non-positive execution fact: "
+            f"tile={tile}, column_batch={batch}, disk_envelope={envelope}, "
+            f"reduction_workspace={workspace}"
+        )
+    return contract
+
+
+def _r55_active_external_context(facts, bundle, cache_workers_cap):
+    """Build the SINGLE external working-set context for ACTIVE admission.
+
+    The context prices exactly the real external execution:
+    * the stack term is the column-reduction workspace (never a patch-area
+      aligned cache);
+    * the ON-DISK residency per in-flight Cell is the complete spool envelope
+      already priced and checked against fresh free space by
+      :func:`_select_external_fallback`;
+    * the class is single-owner (K == 1) and prefetch-free;
+    * the spool tile is the FROZEN tile (one declared rung, never re-derived).
+    """
+    contract = _r55_external_contract(bundle)
+    tile = int(contract["tile_size"])
+    workspace = int(contract["reduction_workspace_bytes"])
+    envelope = int(contract["disk_envelope_bytes"])
+    return _r55_active_context(
+        facts,
+        phase=renv.PHASE_CELL_STACK_STREAM,
+        per_unit_stack=workspace,
+        per_unit_cache=envelope,
+        per_unit_prefetch=0,
+        bundle=bundle,
+        per_tile_stack_bytes={tile: workspace},
+        cache_workers_cap=int(cache_workers_cap),
+        tile_ladder=(tile,),
+        prefetch_ladder=(0,),
+        max_units_in_flight=1,
+        working_set_class=zsched.WORKING_SET_CLASS_EXTERNAL_SPOOL,
+        # The spool envelope was already compared to the FULL fresh free space
+        # by the selector; the scheduler must not apply a second, stricter
+        # fraction, nor a looser one.
+        disk_fraction_num=1,
+        disk_fraction_den=1,
+    )
+
+
+def _r55_active_external_decide(
+    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
+) -> _R55ActiveDecision:
+    """ACTIVE decision for the external working-set class (single-owner).
+
+    Uses the SAME accepted ACTIVE joint planner, phase requests, 15 % global
+    margin and gauge/cache worker ladders as the RAM path. Only the stack
+    context differs: the external class prices the real reduction workspace and
+    the real spool envelope. Selection is deterministic (largest coherent
+    gauge/cache pair that fits B_plan under the one margin).
+    """
+    _r55_external_contract(bundle)
+    facts = _r55_active_facts(
+        bundle=bundle,
+        cell_ctxs=cell_ctxs,
+        canvas=canvas,
+        halo_px=halo_px,
+        cache_root=cache_root,
+        output_dir=output_dir,
+        frame_ids=frame_ids,
+    )
+    trail: list[dict] = []
+    last_exc = None
+    plan_set = None
+    external_context = None
+    for gauge in _r55_worker_ladder(int(facts["gauge_workers"])):
+        for cache in _r55_worker_ladder(int(facts["cache_workers"])):
+            trial = dict(facts)
+            trial["gauge_workers"] = int(gauge)
+            trial["cache_workers"] = int(cache)
+            requests = _r55_active_phase_requests(trial)
+            external_context = _r55_active_external_context(
+                trial, bundle, int(cache)
+            )
+            joint = zsched.JointPlanInput(contexts=(external_context,))
+            try:
+                candidate_plan = zsched.plan_joint(
+                    joint,
+                    phase_requests=requests,
+                    mode=zsched.MODE_ACTIVE,
+                )
+            except zsched.PlanRefused as exc:
+                last_exc = exc
+                trail.append(
+                    {
+                        "at": "external_worker_selection",
+                        "gauge_workers": int(gauge),
+                        "cache_workers": int(cache),
+                        "accepted": False,
+                        "reason_code": exc.reason_code,
+                        "detail": exc.detail,
+                    }
+                )
+                continue
+            plan_set = candidate_plan
+            facts = trial
+            trail.append(
+                {
+                    "at": "external_worker_selection",
+                    "gauge_workers": int(gauge),
+                    "cache_workers": int(cache),
+                    "accepted": True,
+                    "reason_code": "R55_OK",
+                    "aggregate_host_peak_bytes": int(
+                        plan_set.aggregate_host_peak_bytes
+                    ),
+                }
+            )
+            break
+        if plan_set is not None:
+            break
+    if plan_set is None:
+        reason = (
+            zsched.REASON_REFUSE_HOST_RAM
+            if last_exc is None
+            else last_exc.reason_code
+        )
+        detail = (
+            "the external working set does not fit B_plan with the "
+            f"{facts['margin_num']}/{facts['margin_den']} global margin after the "
+            f"full bounded gauge/cache ladders (gauge "
+            f"{list(_r55_worker_ladder(int(facts['gauge_workers'])))} x cache "
+            f"{list(_r55_worker_ladder(int(facts['cache_workers'])))}): "
+            + ("" if last_exc is None else str(last_exc.detail))
+        )
+        raise zsched.PlanRefused(
+            reason,
+            detail,
+            candidates=() if last_exc is None else last_exc.candidates,
+        )
+    contract = _r55_external_contract(bundle)
+    mapping = zsched.active_mapping_for_candidate(
+        plan_set.chosen,
+        tile_ladder=(int(contract["tile_size"]),),
+        workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+    )
+    expected_identity = zsched.FrozenIdentity(
+        layout=tuple(facts["layout"]),
+        cell_ids=tuple(sorted(facts["cell_ids"])),
+        frame_ids=tuple(sorted(facts["frame_ids"])),
+        halo_px=int(facts["halo_px"]),
+        refinement_rank=int(facts["refinement_rank"]),
+    )
+    zsched.assert_same_identity(expected_identity, plan_set.identity)
+    candidate = plan_set.chosen
+    if int(mapping["units_in_flight"]) != 1:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_REFUSE_HOST_RAM,
+            "external_spool mapping must be single-owner",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    if mapping["cpu_streaming_tile"] != int(contract["tile_size"]):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_SHRINK_TILE,
+            "external_spool mapping does not reuse the frozen spool tile",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    return _R55ActiveDecision(
+        plan_set=plan_set,
+        mapping=mapping,
+        facts=facts,
+        inmem_context=None,
+        stream_context=external_context,
+        phase=zsched.PHASE_CELL_STACK_STREAM,
+        gauge_workers=int(facts["gauge_workers"]),
+        cache_workers=int(facts["cache_workers"]),
+        worker_trail=tuple(dict(entry) for entry in trail),
+        storage_profile=str(
+            facts.get("storage_profile", _STACK_STORAGE_PROFILE)
+        ),
+        working_set_class=WORKING_SET_EXTERNAL,
+    )
+
+
 def _r55_active_decide(
     *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
 ) -> _R55ActiveDecision:
@@ -7980,7 +8314,22 @@ def _r55_active_decide(
     pair is selected from bounded deterministic descending ladders down to 1
     under the SAME B_plan and 15 % margin that :func:`build_plan_set` will apply,
     so a larger pair can never be frozen and then refused by the validator.
+
+    ZM-ACTIVE-EXTERNAL-WIRING: a bundle whose FROZEN working-set class is
+    external_spool is decided by the external class path. The initial external
+    selection is therefore PRESERVED by ACTIVE planning instead of being
+    re-refused as a RAM candidate.
     """
+    if str(getattr(bundle, "stack_working_set", "")) == WORKING_SET_EXTERNAL:
+        return _r55_active_external_decide(
+            bundle=bundle,
+            cell_ctxs=cell_ctxs,
+            canvas=canvas,
+            halo_px=halo_px,
+            cache_root=cache_root,
+            output_dir=output_dir,
+            frame_ids=frame_ids,
+        )
     facts = _r55_active_facts(
         bundle=bundle,
         cell_ctxs=cell_ctxs,
@@ -9229,12 +9578,30 @@ def _r55_active_apply(
             "active execution refuses prefetch_units != 0",
             mapping=mapping,
         )
-    if mode not in ("inmem", "stream"):
+    if mode not in ("inmem", "stream", "external"):
         raise zsched.ActivePlanRejected(
             renv.REASON_UNKNOWN_BACKEND,
             f"unknown cell task mode {mode!r}",
             mapping=mapping,
         )
+    external_class = mode == "external"
+    external_contract = None
+    if external_class:
+        external_contract = _r55_external_contract(bundle)
+        if tile is None or int(tile) != int(external_contract["tile_size"]):
+            raise zsched.ActivePlanRejected(
+                renv.REASON_SHRINK_TILE,
+                "external application must reuse the frozen spool tile "
+                f"{external_contract['tile_size']}, got {tile!r}",
+                mapping=mapping,
+            )
+        if units != 1:
+            raise zsched.ActivePlanRejected(
+                renv.REASON_REFUSE_HOST_RAM,
+                "external application is single-owner (K == 1), got "
+                f"units_in_flight={units}",
+                mapping=mapping,
+            )
     if mode == "inmem" and tile is not None:
         raise zsched.ActivePlanRejected(
             renv.REASON_SHRINK_TILE,
@@ -9278,6 +9645,12 @@ def _r55_active_apply(
             cell_tasks.append(_cell_task(
                 cell, patch, mem, cache_dir, "inmem", inmem_b,
                 getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
+        elif external_class:
+            cell_tasks.append(_cell_task(
+                cell, patch, mem, cache_dir, "external",
+                int(external_contract["reduction_workspace_bytes"]),
+                getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE),
+                external_contract))
         else:
             cell_tasks.append(_cell_task(
                 cell, patch, mem, cache_dir, "stream", stream_b,
@@ -9368,6 +9741,11 @@ def _r55_active_apply(
             facts.get("inmem_worst_actual", facts["inmem_worst"])
         )
         cpu_streaming["stream_bound_bytes"] = 0
+    elif external_class:
+        # The external stack peak is the REAL reduction workspace, not a RAM
+        # streaming estimate. Never publish a fabricated stream bound.
+        cpu_streaming["predicted_peak_bytes"] = int(per_cell_footprint)
+        cpu_streaming["stream_bound_bytes"] = int(per_cell_footprint)
     plan = {
         "mode": mode,
         "cells_in_flight": int(units),
@@ -9402,12 +9780,27 @@ def _r55_active_apply(
         "raw_available_bytes": int(bound_raw),
         "plan_budget_bytes": int(bound_budget),
     }
+    working_set_block = (
+        None if bundle.working_set_block is None
+        else dict(bundle.working_set_block)
+    )
+    if working_set_block is not None:
+        working_set_block["ram_budget_bytes"] = int(bound_budget)
+        if external_class:
+            working_set_block["class"] = WORKING_SET_EXTERNAL
+            working_set_block["tile_size"] = int(tile)
+            working_set_block["column_batch"] = int(
+                external_contract["column_batch"]
+            )
     attempts = list(bundle.attempts)
     attempts.append(
         {
             "active_mapping": True,
             "stage": str(stage),
             "phase": mapping["phase"],
+            "working_set_class": str(
+                dict(mapping).get("working_set_class", "")
+            ),
             "cpu_streaming_tile": (None if tile is None else int(tile)),
             "units_in_flight": int(units),
             "workers_per_unit": int(workers),
@@ -9449,6 +9842,14 @@ def _r55_active_apply(
         # bundle values).
         gauge_workers=int(facts["gauge_workers"]),
         cache_build_workers=int(facts["cache_workers"]),
+        stack_working_set=(
+            WORKING_SET_EXTERNAL if external_class
+            else getattr(bundle, "stack_working_set", WORKING_SET_INMEM)
+        ),
+        working_set_block=working_set_block,
+        external_contract=(
+            None if external_contract is None else dict(external_contract)
+        ),
     )
 
 
@@ -9597,6 +9998,144 @@ def _r55_active_growth_allowed(decision) -> bool:
     )
 
 
+def _r55_active_admit_external(*, initial_bundle, decision):
+    """Margin-aware ACTIVE admission for the external working-set class.
+
+    The external class is already the minimal execution shape (one spooled Cell,
+    one frozen spool tile, prefetch-free). A fresh pressure miss therefore cannot
+    be "repaired" by pretending a smaller spool fits: the only legal step is a
+    same-class worker shrink on the SAME identity. If none fits, the refusal is
+    honest (``AdmissionExhausted`` / ``R55_REFUSE_HOST_RAM``), never a silent RAM
+    or legacy fallback.
+    """
+    candidate = decision.plan_set.chosen
+    mapping = decision.mapping
+    expected = zsched.active_mapping_for_candidate(
+        candidate,
+        tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+        workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+    )
+    if dict(mapping) != expected:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_INTERNAL_ERROR,
+            "external active mapping does not exactly match the scheduler "
+            f"winner (mapping={mapping!r}, expected={expected!r})",
+            candidate=candidate,
+            mapping=mapping,
+        )
+    candidate = zsched.materialize_active_candidate(
+        decision.stream_context, candidate
+    )
+    mapping = zsched.active_mapping_for_candidate(
+        candidate,
+        tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+        workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+    )
+    bundle = _r55_active_apply(
+        initial_bundle,
+        mapping=mapping,
+        facts=decision.facts,
+        stage="preflight",
+    )
+    if bundle.envelope.aggregate_bytes > bundle.envelope.budget_bytes:
+        raise rcontract.AdmissionExhausted(
+            "external ACTIVE plan cannot fit its own B_plan and has no legal "
+            "shrink step left (aggregate "
+            f"{bundle.envelope.aggregate_bytes} > "
+            f"B_plan {bundle.envelope.budget_bytes})"
+        )
+
+    def _measure():
+        raw = int(available_memory_bytes())
+        if raw <= 0:
+            raise rcontract.InvalidObservation(
+                "R55-D2 external admission requires a strictly positive raw "
+                f"observation, got {raw}"
+            )
+        return raw
+
+    observations = []
+    history = [bundle.envelope]
+    trail = []
+    replans = 0
+    while True:
+        admit_obs = rcontract.Observation.admit(_measure())
+        observations.append(admit_obs)
+        if bundle.envelope.aggregate_bytes <= admit_obs.budget_bytes:
+            launch_obs = rcontract.Observation.launch(_measure())
+            observations.append(launch_obs)
+            if bundle.envelope.aggregate_bytes <= launch_obs.budget_bytes:
+                outcome = rcontract.AdmissionOutcome(
+                    plan=bundle.envelope,
+                    observations=tuple(observations),
+                    history=tuple(history),
+                    replans=int(replans),
+                    tolerance=rcontract.requires_tolerance(
+                        bundle.envelope.aggregate_bytes,
+                        launch_obs.raw_available_bytes,
+                    ),
+                    final_observation=launch_obs,
+                )
+                return bundle, candidate, mapping, outcome, trail
+            miss_obs = launch_obs
+        else:
+            miss_obs = admit_obs
+        if replans >= R41_ADMISSION_MAX_REPLANS:
+            raise rcontract.AdmissionExhausted(
+                "external ACTIVE plan still exceeds the fresh admission ceiling "
+                f"after {R41_ADMISSION_MAX_REPLANS} shrink(s): aggregate "
+                f"{bundle.envelope.aggregate_bytes / 2**20:.1f} MiB > B_admit "
+                f"{miss_obs.budget_bytes / 2**20:.1f} MiB",
+                attempts=tuple(observations),
+            )
+        plan_obs = rcontract.Observation.plan(miss_obs.raw_available_bytes)
+        observations.append(plan_obs)
+        name, nxt, examined = _r55_next_materialized_shrink(
+            decision=decision, candidate=candidate, plan_obs=plan_obs
+        )
+        for entry in examined:
+            trail.append(
+                {
+                    **entry,
+                    "at": "admission_pressure",
+                    "stage": "preflight",
+                    "working_set_class": WORKING_SET_EXTERNAL,
+                    "admit_raw_bytes": int(miss_obs.raw_available_bytes),
+                    "b_admit_bytes": int(miss_obs.budget_bytes),
+                    "b_plan_bytes": int(plan_obs.budget_bytes),
+                    "aggregate_bytes_before": int(
+                        bundle.envelope.aggregate_bytes
+                    ),
+                }
+            )
+        if name is None or nxt is None:
+            raise rcontract.AdmissionExhausted(
+                "external ACTIVE admission miss and no legal same-class shrink "
+                f"remains (aggregate {bundle.envelope.aggregate_bytes} > "
+                f"B_admit {miss_obs.budget_bytes}); the spool class is already "
+                "single-owner/frozen and is never silently swapped for RAM",
+                attempts=tuple(observations),
+            )
+        candidate = nxt
+        mapping = zsched.active_mapping_for_candidate(
+            candidate,
+            tile_ladder=tuple(int(t) for t in CPU_STREAMING_TILE_LADDER),
+            workers_ladder=tuple(int(w) for w in zsched.WORKERS_LADDER),
+        )
+        bundle = _r55_active_apply(
+            initial_bundle,
+            mapping=mapping,
+            facts=decision.facts,
+            plan_raw_available_bytes=plan_obs.raw_available_bytes,
+            plan_factor_num=rcontract.PLAN_FACTOR_NUM,
+            plan_factor_den=rcontract.PLAN_FACTOR_DEN,
+            plan_budget_bytes=plan_obs.budget_bytes,
+            stage="preflight",
+        )
+        replans += 1
+        history.append(bundle.envelope)
+
+
 def _r55_active_admit(
     *, initial_bundle, decision
 ):
@@ -9606,6 +10145,10 @@ def _r55_active_admit(
     on the SAME frozen identity; growth is refused. Returns
     ``(bundle, mapping, admission_outcome, trail)``.
     """
+    if getattr(decision, "working_set_class", "") == WORKING_SET_EXTERNAL:
+        return _r55_active_admit_external(
+            initial_bundle=initial_bundle, decision=decision
+        )
     candidate = decision.plan_set.chosen
     mapping = decision.mapping
     # Defensive exactness: the decision object cannot be tampered into an
@@ -13278,13 +13821,31 @@ def _run_single(
             except (zsched.SchedulerError, rcontract.RamContractError) as _r55_exc:
                 # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-1 (MEDIUM): only a TYPED
                 # capacity refusal is eligible. Nothing has started yet (no
-                # gauge/stack), so a qualified host-RAM miss switches the run
-                # ONCE to bounded on the SAME pinned geometry/halo/science.
+                # gauge/stack), so a qualified host-RAM miss may (1) switch the
+                # run ONCE to the bounded storage PROFILE and/or (2) select the
+                # external working-set CLASS at the SAME pinned geometry. These
+                # are two DIFFERENT decisions: an already-bounded run is never
+                # denied the external class merely because the profile
+                # transition was already spent.
                 _adm_mem, _adm_code, _adm_detail = _storage_admission_refusal(
                     _r55_exc
                 )
-                if not (
+                _initial_is_external = (
+                    str(getattr(_initial_bundle, "stack_working_set", ""))
+                    == WORKING_SET_EXTERNAL
+                )
+                _pinned_layout = tuple(
+                    int(v) for v in _initial_bundle.envelope.layout
+                )
+                _pinned_rank = int(
+                    _initial_bundle.envelope.refinement_rank
+                )
+                _admitted = False
+                _profile_exc = _r55_exc
+                if (
                     _adm_mem
+                    and not _initial_is_external
+                    and not zsp.is_bounded(_STACK_STORAGE_PROFILE)
                     and _activate_bounded_storage(
                         phase="admission_preflight",
                         reason_code=_adm_code,
@@ -13292,64 +13853,137 @@ def _run_single(
                     )
                 ):
                     _emit(
+                        "ZeGrid: dense ACTIVE admission refused for RAM — retrying "
+                        "ONCE with the bounded storage profile on the SAME "
+                        f"{int(nx)}x{int(ny)} geometry: {_r55_exc}",
+                        lvl="WARN", callback=progress_callback,
+                    )
+                    try:
+                        _initial_bundle = _build_execution_bundle(
+                            canvas, descs, footprints,
+                            raw_available_bytes=plan_raw_bytes,
+                            budget_bytes=plan_budget_bytes,
+                            pinned_layout=_pinned_layout,
+                            min_refinement_rank=_pinned_rank,
+                            max_refinement_rank=_pinned_rank,
+                            layout_substep=None,
+                            **_bundle_common,
+                        )
+                        (
+                            _r55_active_decision,
+                            (
+                                _r55_active_bundle,
+                                _r55_active_candidate,
+                                _r55_active_mapping,
+                                _r55_active_adm,
+                                _r55_active_trail,
+                            ),
+                        ) = _r55_cpu_preflight(_initial_bundle)
+                        _admitted = True
+                    except (
+                        zal.LayoutInfeasible, zpar.ModeInfeasible,
+                        zsched.SchedulerError, rcontract.RamContractError,
+                    ) as _r55_exc2:
+                        # The bounded RAM attempt refused. The external
+                        # working-set class is the NEXT candidate, at the SAME
+                        # pin, and only when the refusal is still a typed
+                        # capacity miss.
+                        _profile_exc = _r55_exc2
+                        _adm_mem, _adm_code, _adm_detail = (
+                            _storage_admission_refusal(_r55_exc2)
+                        )
+                if (
+                    not _admitted
+                    and _adm_mem
+                    and not _initial_is_external
+                    and zsp.is_bounded(_STACK_STORAGE_PROFILE)
+                ):
+                    # ZM-ACTIVE-EXTERNAL-WIRING: the RAM class (stream/inmem)
+                    # cannot be admitted under the ACTIVE joint margin. Price and
+                    # admit the EXTERNAL working set at the SAME frozen geometry,
+                    # halo, memberships and frames. Nothing has started, so this
+                    # is a pure working-set selection, not a geometry change.
+                    try:
+                        _emit(
+                            "ZeGrid: bounded RAM ACTIVE admission refused for RAM "
+                            "— pricing the external (disk-spool) working set at "
+                            f"the SAME {int(nx)}x{int(ny)} geometry before the "
+                            "gauge: " + str(_profile_exc),
+                            lvl="WARN", callback=progress_callback,
+                        )
+                        _initial_bundle = _build_execution_bundle(
+                            canvas, descs, footprints,
+                            raw_available_bytes=plan_raw_bytes,
+                            budget_bytes=plan_budget_bytes,
+                            pinned_layout=_pinned_layout,
+                            min_refinement_rank=_pinned_rank,
+                            max_refinement_rank=_pinned_rank,
+                            layout_substep=None,
+                            force_external=True,
+                            **_bundle_common,
+                        )
+                        (
+                            _r55_active_decision,
+                            (
+                                _r55_active_bundle,
+                                _r55_active_candidate,
+                                _r55_active_mapping,
+                                _r55_active_adm,
+                                _r55_active_trail,
+                            ),
+                        ) = _r55_cpu_preflight(_initial_bundle)
+                        _admitted = True
+                        _emit(
+                            "ZeGrid: external working-set class ADMITTED before "
+                            "the gauge at the same "
+                            f"{int(nx)}x{int(ny)} geometry — tile="
+                            f"{_r55_active_mapping['cpu_streaming_tile']} "
+                            "column_batch="
+                            f"{_initial_bundle.external_contract['column_batch']} "
+                            "spool="
+                            f"{_initial_bundle.external_contract['spool_root']}",
+                            callback=progress_callback,
+                        )
+                    except (
+                        zal.LayoutInfeasible, zpar.ModeInfeasible,
+                        zsched.SchedulerError, rcontract.RamContractError,
+                    ) as _r55_ext_exc:
+                        _ext_code = str(
+                            getattr(
+                                _r55_ext_exc, "reason_code",
+                                type(_r55_ext_exc).__name__,
+                            )
+                        )
+                        _emit(
+                            "ZeGrid: NO ACTIVE plan can be admitted before the "
+                            "gauge — refusing. RAM: "
+                            f"{_profile_exc} | external: {_ext_code}: "
+                            f"{_r55_ext_exc}",
+                            lvl="ERROR", callback=progress_callback,
+                        )
+                        err = RuntimeError(
+                            "R55-D2 active refused before the gauge/stack "
+                            f"(RAM: {_profile_exc}; external: {_ext_code}: "
+                            f"{_r55_ext_exc})"
+                        )
+                        err.storage_refusals = {
+                            "ram": {"detail": str(_profile_exc)},
+                            "external": {
+                                "reason_code": _ext_code,
+                                "detail": str(_r55_ext_exc),
+                            },
+                        }
+                        raise err from _r55_ext_exc
+                if not _admitted:
+                    _emit(
                         "ZeGrid: R55-D2 active REFUSED before the gauge/stack — "
-                        f"{_r55_exc}",
+                        f"{_profile_exc}",
                         lvl="ERROR", callback=progress_callback,
                     )
                     raise RuntimeError(
                         "R55-D2 active refused before the gauge/stack: "
-                        + str(_r55_exc)
-                    ) from _r55_exc
-                _emit(
-                    "ZeGrid: dense ACTIVE admission refused for RAM — retrying "
-                    "ONCE with the bounded storage profile on the SAME "
-                    f"{int(nx)}x{int(ny)} geometry: {_r55_exc}",
-                    lvl="WARN", callback=progress_callback,
-                )
-                try:
-                    # ZM-ZEGRID-ACTIVE-OOC-FALLBACK rework-1 (HIGH): the exact
-                    # admitted geometry/rank live on the VALIDATED envelope, not
-                    # on the bundle object.
-                    _pinned_layout = tuple(
-                        int(v) for v in _initial_bundle.envelope.layout
-                    )
-                    _pinned_rank = int(
-                        _initial_bundle.envelope.refinement_rank
-                    )
-                    _initial_bundle = _build_execution_bundle(
-                        canvas, descs, footprints,
-                        raw_available_bytes=plan_raw_bytes,
-                        budget_bytes=plan_budget_bytes,
-                        pinned_layout=_pinned_layout,
-                        min_refinement_rank=_pinned_rank,
-                        max_refinement_rank=_pinned_rank,
-                        layout_substep=None,
-                        **_bundle_common,
-                    )
-                    (
-                        _r55_active_decision,
-                        (
-                            _r55_active_bundle,
-                            _r55_active_candidate,
-                            _r55_active_mapping,
-                            _r55_active_adm,
-                            _r55_active_trail,
-                        ),
-                    ) = _r55_cpu_preflight(_initial_bundle)
-                except (
-                    zal.LayoutInfeasible, zpar.ModeInfeasible,
-                    zsched.SchedulerError, rcontract.RamContractError,
-                ) as _r55_exc2:
-                    _emit(
-                        "ZeGrid: NO ACTIVE plan can be admitted in EITHER "
-                        "storage profile before the gauge — refusing. dense: "
-                        f"{_r55_exc} | bounded: {_r55_exc2}",
-                        lvl="ERROR", callback=progress_callback,
-                    )
-                    raise RuntimeError(
-                        "R55-D2 active refused in both storage profiles "
-                        f"(dense: {_r55_exc}; bounded: {_r55_exc2})"
-                    ) from _r55_exc2
+                        + str(_profile_exc)
+                    ) from _profile_exc
                 layout = _initial_bundle.layout
                 cell_ctxs = _initial_bundle.cell_ctxs
                 nx, ny = int(layout["nx"]), int(layout["ny"])
