@@ -13661,7 +13661,7 @@ def _run_single(
                     callback=progress_callback,
                 )
 
-            def _r55_record_gpu_cpu_fallback(exc):
+            def _r55_record_gpu_cpu_fallback(exc, *, extra=None):
                 nonlocal _r55_gpu_fallback_reason
                 nonlocal _r55_active_gpu_decision, _r55_active_bundle
                 # Qualified whole-batch CPU fallback from a clean state; the
@@ -13678,6 +13678,8 @@ def _run_single(
                         or {}
                     ),
                 }
+                if extra:
+                    _r55_gpu_fallback_reason.update(dict(extra))
                 _r55_active_gpu_decision = None
                 _r55_active_bundle = None
                 _emit(
@@ -13748,6 +13750,28 @@ def _run_single(
                     str(_r55_gpu_exc.reason_code) == str(zgr.REASON_REFUSE_VRAM)
                     and _r55_active_gpu_decision is None
                 )
+                # ZM-ACTIVE-EXTERNAL-GPU-HOSTRAM: the initial bundle may ALREADY
+                # be the EXTERNAL working set because the ONE dense->bounded
+                # profile transition was consumed during bundle planning (AUTO
+                # layout/plan refusal). The external class is CPU-only; its GPU
+                # ACTIVE attempt prices N resident frames for the device rung and
+                # can therefore refuse host RAM before any gauge/stack/work. The
+                # profile retry is already spent, but that retry was NEVER the
+                # decision needed here: the truthful outcome is to DECLINE the
+                # resident GPU plan and keep the SAME pinned external bundle on
+                # CPU. No second profile switch, no geometry/science change.
+                _r55_initial_is_external = (
+                    str(getattr(_initial_bundle, "stack_working_set", ""))
+                    == WORKING_SET_EXTERNAL
+                )
+                _r55_external_gpu_decline = (
+                    _r55_initial_is_external
+                    and zsp.is_bounded(_STORAGE_EFFECTIVE)
+                    and not _storage_fallback_available()
+                    and str(_r55_gpu_exc.reason_code)
+                    == str(renv.REASON_REFUSE_HOST_RAM)
+                    and _r55_active_gpu_decision is None
+                )
                 if _r55_vram_decline:
                     _r55_record_gpu_cpu_fallback(_r55_gpu_exc)
                     _emit(
@@ -13756,6 +13780,41 @@ def _run_single(
                         "Declining the GPU (no partial GPU result) and keeping "
                         "the already-admitted CPU working set; the decline is "
                         "recorded in the manifest.",
+                        lvl="WARN", callback=progress_callback,
+                    )
+                elif _r55_external_gpu_decline:
+                    # The GPU request is NOT coerced into an external GPU
+                    # product: the external working set executes on CPU. Record
+                    # the typed host-RAM refusal as the decline reason and keep
+                    # the SAME initial external bundle for CPU ACTIVE admission.
+                    _r55_record_gpu_cpu_fallback(
+                        _r55_gpu_exc,
+                        extra={
+                            "working_set_class": WORKING_SET_EXTERNAL,
+                            "storage_profile": str(_STORAGE_EFFECTIVE),
+                            "decline": "external_working_set_cpu_only",
+                        },
+                    )
+                    try:
+                        gpu_ctx = dict(gpu_ctx)
+                        gpu_ctx["pre_execution_fallback"] = dict(
+                            _r55_gpu_fallback_reason
+                        )
+                        gpu_ctx["fallback_reason"] = str(
+                            _r55_gpu_exc.reason_code
+                        )
+                    except Exception:
+                        # Provenance must never change the admission outcome.
+                        pass
+                    _emit(
+                        "ZeGrid: ACTIVE GPU declined before the gauge/stack — "
+                        f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}. "
+                        "The initial bundle is the EXTERNAL (disk-spool) "
+                        "working set, which executes on CPU; the single "
+                        "dense->bounded profile transition is already consumed, "
+                        "so no second profile switch is requested. Continuing "
+                        "the SAME pinned geometry/halo/science on CPU ACTIVE "
+                        "external (no GPU work, gauge or stack started).",
                         lvl="WARN", callback=progress_callback,
                     )
                 elif not (
@@ -13776,7 +13835,9 @@ def _run_single(
                         f"{_r55_gpu_exc.reason_code}: {_r55_gpu_exc.detail}"
                     ) from _r55_gpu_exc
 
-                if not _r55_vram_decline:
+                if not (
+                    _r55_vram_decline or _r55_external_gpu_decline
+                ):
                     # ONE bounded retry: same raw/budget/layout/halo/science.
                     if not _activate_bounded_storage(
                         phase="plan_gpu_admission",
