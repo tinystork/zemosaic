@@ -321,18 +321,18 @@ def test_column_batch_budget_sub_line_pixel_granularity():
     n, iw, c = 20_000, 32, 3
     per = n * xstream.REDUCTION_BYTES_PER_POSITION_FRAME
     budget = 7_440_000
-    ppr = iw * c  # 96 positions: one full row costs 59 520 000 B
+    ppr = iw * c  # 96 positions: one full row costs 119 040 000 B
     assert ppr * per > budget
     batch = xstream.largest_admissible_column_batch(
         budget_bytes=budget, n_frames=n, interior_width=iw, channels=c
     )
-    # 7 440 000 // 620 000 == 12 positions == 4 pixels x 3 channels.
-    assert batch == 12
+    # 7 440 000 // 1 240 000 == 6 positions == 2 pixels x 3 channels.
+    assert batch == 6
     assert 0 < batch < ppr
     assert batch % c == 0
     assert batch * per <= budget
-    # One pixel (1 860 000 B) ALWAYS fits the probe budget.
-    assert c * per == 1_860_000
+    # One pixel (3 720 000 B) ALWAYS fits the probe budget.
+    assert c * per == 3_720_000
 
 
 def test_column_batch_budget_largest_multiple_and_determinism():

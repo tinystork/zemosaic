@@ -263,6 +263,7 @@ def test_frozen_tile_and_batch_are_reused_or_refused(tmp_path, monkeypatch):
         worst_patch_hw=(40, 40), max_n_frames=10, channels=3,
         budget_bytes=512 * 2 ** 20, halo_px=9, cache_root=str(tmp_path),
         storage_profile="bounded", frozen_tile=16, frozen_batch=64,
+        observation_domain=zz.rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     assert ok["refused"] is False
     assert ok["tile"] == 16 and ok["column_batch"] == 64
@@ -271,6 +272,7 @@ def test_frozen_tile_and_batch_are_reused_or_refused(tmp_path, monkeypatch):
         worst_patch_hw=(40, 40), max_n_frames=10, channels=3,
         budget_bytes=512 * 2 ** 20, halo_px=9, cache_root=str(tmp_path),
         storage_profile="bounded", frozen_tile=16, frozen_batch=10 ** 9,
+        observation_domain=zz.rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     assert bad["refused"] is True
     # A VALID frozen batch that no longer fits the fresh reduction RAM budget

@@ -42,6 +42,7 @@ from test_zegrid_active_external_wiring import (  # noqa: E402
     MIB,
     _FakeModel,
     _bundle,
+    _corpus,
     _e2e_config,
     _fits_array,
     _frame_ids,
@@ -114,6 +115,7 @@ def _selector(tmp_path, monkeypatch, **kwargs):
         halo_px=32,
         cache_root=str(tmp_path / "cache"),
         storage_profile="bounded",
+        observation_domain=rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     base.update(kwargs)
     return zz._select_external_fallback(**base)
@@ -149,7 +151,24 @@ def test_lp_like_budget_keeps_phase_local_reduction_budget(
     assert decision["column_batch"] >= 1
     assert (
         decision["pricing"]["ram"]["reduction_workspace_bytes"]
-        <= decision["reduction_budget_bytes"]
+        <= decision["residual_batch_budget_bytes"]
+    )
+    # The ONE truthful host peak is <= the margin ceiling, and the batch was
+    # sized from the residual AFTER the fixed concurrent host terms.
+    host = decision["host_components"]
+    assert decision["host_peak_bytes"] == host["peak_bytes"]
+    assert decision["host_peak_bytes"] <= decision["phase_budget_bytes"]
+    assert host["persistent_result_bytes"] > 0
+    assert host["reduce_tile_outputs_bytes"] > 0
+    assert host["provider_window_bytes"] > 0
+    assert host["write_tile_bytes"] > 0
+    assert host["disk_bytes_in_host_peak"] == 0
+    assert (
+        decision["residual_batch_budget_bytes"]
+        == decision["phase_budget_bytes"] - host["reduce_fixed_bytes"]
+    )
+    assert decision["budget_domain"] == (
+        rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE
     )
 
     # The PRE-FIX concurrent formula subtracted both the baseline and the
@@ -167,17 +186,31 @@ def test_minimum_micro_batch_admitted_when_incremental_fits(
     tmp_path, monkeypatch
 ):
     _free(monkeypatch, 78 * GIB)
-    min_ws = (
-        LP_FRAMES
-        * 3
-        * zext.REDUCTION_BYTES_PER_POSITION_FRAME
+    # A large frame count makes the minimum batch dominate the write-phase
+    # fixed terms, so the residual can hold EXACTLY one pixel.
+    frames = 100_000
+    probe = zext.estimate_external_working_set(
+        n_frames=frames,
+        height=64,
+        width=64,
+        channels=3,
+        tile_size=8,
+        halo_px=32,
+        column_batch=1,
     )
-    # Smallest budget whose 15/100 margin ceiling still holds ONE pixel batch.
-    budget = (min_ws * 115 + 99) // 100
+    min_batch = int(probe["host"]["reduction_batch_bytes"])
+    required = max(
+        int(probe["host"]["fixed_peak_bytes"]),
+        int(probe["host"]["reduce_fixed_bytes"]) + min_batch,
+    )
+    # Smallest budget whose 15/100 margin ceiling holds the fixed host terms
+    # AND exactly ONE pixel batch.
+    budget = (required * 115 + 99) // 100
     decision = _selector(
         tmp_path,
         monkeypatch,
         budget_bytes=budget,
+        max_n_frames=frames,
         worst_patch_hw=(64, 64),
         permitted_tiles=(8,),
     )
@@ -187,9 +220,10 @@ def test_minimum_micro_batch_admitted_when_incremental_fits(
     assert decision["pricing"]["ram"]["rows_per_batch"] == 1
     assert decision["pricing"]["ram"]["cols_per_batch"] == 1
     assert (
-        decision["pricing"]["ram"]["reduction_workspace_bytes"] == min_ws
+        decision["pricing"]["ram"]["reduction_workspace_bytes"] == min_batch
     )
-    assert decision["reduction_budget_bytes"] >= min_ws
+    assert decision["host_peak_bytes"] <= decision["phase_budget_bytes"]
+    assert decision["residual_batch_budget_bytes"] >= min_batch
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +377,194 @@ def test_ram_class_still_sums_assembly_and_refuses_on_the_same_numbers():
 
 
 # ---------------------------------------------------------------------------
+# 3b. Truthful host model: fixed terms, disk separation, ghost cache.
+# ---------------------------------------------------------------------------
+
+def test_large_patch_outputs_shrink_the_column_batch(
+    tmp_path, monkeypatch
+):
+    _free(monkeypatch, 78 * GIB)
+    small = _selector(
+        tmp_path, monkeypatch, worst_patch_hw=(128, 128),
+        permitted_tiles=(16,),
+    )
+    large = _selector(
+        tmp_path, monkeypatch, worst_patch_hw=(1024, 1024),
+        permitted_tiles=(16,),
+    )
+    assert small["refused"] is False, small
+    assert large["refused"] is False, large
+    assert (
+        large["host_components"]["persistent_result_bytes"]
+        > small["host_components"]["persistent_result_bytes"]
+    )
+    assert (
+        large["residual_batch_budget_bytes"]
+        < small["residual_batch_budget_bytes"]
+    )
+    assert large["column_batch"] <= small["column_batch"]
+    assert large["host_peak_bytes"] <= large["phase_budget_bytes"]
+
+
+def test_huge_spool_disk_envelope_does_not_inflate_host_ram(
+    tmp_path, monkeypatch
+):
+    # A large spool (2000 frames x a large patch) has a multi-GiB DISK
+    # envelope. With ample disk it is admitted, and the host peak must be
+    # strictly lower and independent of those disk bytes.
+    _free(monkeypatch, 200 * GIB)
+    decision = _selector(
+        tmp_path,
+        monkeypatch,
+        max_n_frames=2000,
+        worst_patch_hw=(2048, 2048),
+        permitted_tiles=(128,),
+        halo_px=64,
+    )
+    assert decision["refused"] is False, decision
+    host = decision["host_components"]
+    assert host["disk_bytes_in_host_peak"] == 0
+    assert decision["host_peak_bytes"] < decision["disk_envelope_bytes"]
+    assert decision["host_peak_bytes"] <= decision["phase_budget_bytes"]
+    assert decision["host_peak_bytes"] < 1024 * MIB  # no disk terms leaked in
+
+
+def test_generic_cache_worker_footprint_is_ghost_for_external(
+    tmp_path, monkeypatch
+):
+    huge = 10 * GIB
+    monkeypatch.setattr(zpar, "cache_footprint_bytes", lambda px: huge)
+    monkeypatch.setattr(zpar, "_CACHE_PER_WORKER_FOOTPRINT_BYTES", huge)
+    monkeypatch.setattr(zpar, "_PER_WORKER_BASELINE_BYTES", 0)
+
+    # The selector never consults the generic aligned-cache term.
+    sel = _selector(tmp_path, monkeypatch)
+    assert sel["refused"] is False, sel
+
+    # The product ACTIVE external plan charges the cache phase exactly 0.
+    descs = _corpus(4)
+    bundle = _bundle(
+        tmp_path, monkeypatch, force_external=True, descs=descs,
+    )
+    assert bundle.chosen_mode == "external"
+    decision = zz._r55_active_decide(
+        bundle=bundle,
+        cell_ctxs=bundle.cell_ctxs,
+        canvas=zg.build_canvas(descs),
+        halo_px=int(bundle.layout.get("halo_px", 8) or 8),
+        cache_root=str(tmp_path / "cache"),
+        output_dir=str(tmp_path / "out"),
+        frame_ids=_frame_ids(descs),
+    )
+    cache_env = decision.plan_set.phase_map()[renv.PHASE_CACHE_BUILD]
+    assert cache_env.estimate.peak_bytes == 0
+    assert (
+        decision.plan_set.aggregate_host_peak_bytes
+        <= bundle.envelope.budget_bytes
+    )
+
+
+def test_external_observation_domain_is_closed(tmp_path, monkeypatch):
+    _free(monkeypatch, 78 * GIB)
+    with pytest.raises(rcontract.RamContractError):
+        _selector(
+            tmp_path, monkeypatch,
+            observation_domain="gross_total",
+        )
+    with pytest.raises(rcontract.RamContractError):
+        _selector(
+            tmp_path, monkeypatch,
+            observation_domain=None,
+        )
+
+
+def test_external_host_component_formula_matches_real_arrays():
+    px, c = 40 * 40, 3
+    host = zext.external_cell_host_components(
+        n_frames=5,
+        patch_hw=(40, 40),
+        tile_hw=(48, 48),
+        interior_hw=(40, 40),
+        channels=c,
+        column_batch=6,
+        rejection_sink=True,
+    )
+    persistent_arrays = [
+        np.empty((40, 40, c), np.float32),
+        np.empty((40, 40, c), np.float64),
+        np.empty((40, 40, c), bool),
+        np.empty((40, 40, c), np.int64),
+    ]
+    support_arrays = [
+        np.empty((40, 40), np.float64),
+        np.empty((40, 40), np.float64),
+    ]
+    assert host["persistent_result_bytes"] == (
+        sum(a.nbytes for a in persistent_arrays)
+        + sum(a.nbytes for a in support_arrays)
+    )
+    tile_arrays = [
+        np.empty((48, 48, c), np.float32),
+        np.empty((48, 48, c), np.float64),
+        np.empty((48, 48, c), bool),
+        np.empty((48, 48, c), np.int64),
+        np.empty((40, 40), np.float64),
+        np.empty((40, 40), np.float64),
+    ]
+    assert host["reduce_tile_outputs_bytes"] == sum(
+        a.nbytes for a in tile_arrays
+    )
+    assert host["provider_window_bytes"] == 40 * 40 * (4 * c + 1)
+    assert host["write_tile_bytes"] == 48 * 48 * (
+        c * zext.WRITE_TILE_BYTES_PER_PIXEL_CHANNEL
+        + zext.WRITE_TILE_AUX_BYTES_PER_PIXEL
+    )
+    assert host["finalize_n_eff_bytes"] == 40 * 40 * 8
+    assert host["reduction_batch_bytes"] == (
+        5 * 6 * zext.EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+    )
+    assert host["phases"]["reduce"] == (
+        host["persistent_result_bytes"]
+        + host["reduce_tile_outputs_bytes"]
+        + host["reduction_batch_bytes"]
+    )
+    assert host["peak_bytes"] == max(host["phases"].values())
+    assert host["disk_bytes_in_host_peak"] == 0
+
+    dense = zext.external_cell_host_components(
+        n_frames=5,
+        patch_hw=(40, 40),
+        tile_hw=(48, 48),
+        interior_hw=(40, 40),
+        channels=c,
+        column_batch=6,
+        rejection_sink=False,
+    )
+    assert dense["dense_rejection_mask_bytes"] == 5 * px * c
+    assert dense["persistent_result_bytes"] == (
+        host["persistent_result_bytes"] + 5 * px * c
+    )
+
+
+def test_result_unit_formula_covers_all_core_planes():
+    px, c = 40 * 40, 3
+    arrays = [
+        np.empty((40, 40, c), np.float32),
+        np.empty((40, 40, c), np.float64),
+        np.empty((40, 40, c), bool),
+        np.empty((40, 40, c), np.int64),
+        np.empty((40, 40), np.float64),
+        np.empty((40, 40), np.float64),
+        np.empty((40, 40), np.float64),
+    ]
+    expected = sum(a.nbytes for a in arrays) + 7 * 128 + 3 * 8
+    assert zz._external_result_unit_bytes(px, c) == expected
+    # The old (pre-rework) formula omitted both support planes and n_eff.
+    legacy = px * c * 21 + 2 * 8 + 8
+    assert zz._external_result_unit_bytes(px, c) > legacy
+
+
+# ---------------------------------------------------------------------------
 # 4. Product ACTIVE seam: the LP-like bundle admits the external class.
 # ---------------------------------------------------------------------------
 
@@ -385,6 +607,13 @@ def test_active_external_bundle_admits_at_lp_like_budget(
         frame_ids=_frame_ids(descs),
     )
     assert decision.working_set_class == zz.WORKING_SET_EXTERNAL
+    contract = bundle.external_contract
+    assert contract["budget_domain"] == (
+        rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE
+    )
+    assert contract["host_components"]["peak_bytes"] == (
+        contract["host_peak_bytes"]
+    )
     phases = decision.plan_set.phase_map()
     assert phases[renv.PHASE_CELL_STACK_STREAM].overlaps_with == ()
     assert phases[renv.PHASE_ASSEMBLY].overlaps_with == ()
@@ -401,6 +630,20 @@ def test_active_external_bundle_admits_at_lp_like_budget(
     assert decision.plan_set.aggregate_host_peak_bytes_raw == max(
         reduction, assembly
     )
+    assert reduction == contract["host_peak_bytes"]
+
+    # The product application uses the SAME frozen peak and charges the ghost
+    # cache zero. A large disk envelope must not appear in the host aggregate.
+    monkeypatch.setattr(zz, "available_memory_bytes", lambda: 4 * GIB)
+    admitted, _cand, mapping, _outcome, _trail = zz._r55_active_admit(
+        initial_bundle=bundle, decision=decision
+    )
+    assert mapping["cell_task_mode"] == "external"
+    assert admitted.envelope.stack_total_bytes == contract["host_peak_bytes"]
+    assert admitted.envelope.cache_total_bytes == 0
+    assert admitted.envelope.shared_bytes == 0
+    assert admitted.envelope.aggregate_bytes == contract["host_peak_bytes"]
+    assert contract["host_components"]["disk_bytes_in_host_peak"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -494,12 +737,12 @@ def test_external_end_to_end_scratch_assembly_parity(tmp_path, monkeypatch):
     )
     assert ext_manifest["stack_working_set"] == zz.WORKING_SET_EXTERNAL
     assert ext_manifest["working_set"]["class"] == zz.WORKING_SET_EXTERNAL
-    assert (
-        ext_manifest["working_set"]["phase_budgets"][
-            "process_baseline_charged_bytes"
-        ]
-        == 0
-    )
+    ws = ext_manifest["working_set"]
+    assert ws["phase_budgets"]["process_baseline_charged_bytes"] == 0
+    assert ws["budget_domain"] == rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE
+    assert ws["host_peak_bytes"] == ws["host_components"]["peak_bytes"]
+    assert ws["host_components"]["disk_bytes_in_host_peak"] == 0
+    assert ws["host_peak_bytes"] <= ws["phase_budgets"]["margin_ceiling_bytes"]
 
     for name in ("mosaic_grid.fits", "mosaic_grid_coverage.fits"):
         np.testing.assert_array_equal(

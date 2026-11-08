@@ -88,6 +88,15 @@ __all__ = [
     "SPOOL_OWNER_NAME",
     "COLUMN_BATCH_MIN",
     "REDUCTION_BYTES_PER_POSITION_FRAME",
+    "EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME",
+    "EXTERNAL_HOST_MODEL_SCHEMA",
+    "RESULT_PLANE_BYTES_PER_POSITION",
+    "RESULT_SUPPORT_BYTES_PER_PIXEL",
+    "RESULT_N_EFF_BYTES_PER_PIXEL",
+    "REJECTION_MASK_BYTES_PER_POSITION_FRAME",
+    "WRITE_TILE_BYTES_PER_PIXEL_CHANNEL",
+    "WRITE_TILE_AUX_BYTES_PER_PIXEL",
+    "external_cell_host_components",
     "ExternalSpoolError",
     "ExternalSpoolPathError",
     "ExternalSpoolStaleError",
@@ -127,10 +136,47 @@ SPOOL_STATE_READY = "ready"
 SPOOL_STATE_COMMITTED = "committed"
 SPOOL_STATES = (SPOOL_STATE_WRITING, SPOOL_STATE_READY, SPOOL_STATE_COMMITTED)
 
-#: Reduction bytes per (pixel-channel position x frame), excluding the optional
-#: in-flight rejection booleans (counted separately): img f32 (4) + orig f64 (8)
-#: + wmap f64 (8) + combine temporaries (8) + survivor/initial/next bools (3).
-REDUCTION_BYTES_PER_POSITION_FRAME = 4 + 8 + 8 + 8 + 3
+#: RESULT planes per (pixel x channel) of one Cell: science f32 (4) +
+#: estimator_weight_sum f64 (8) + valid_mask bool (1) + surviving int64 (8).
+#: These are allocated over the FULL cell patch before the tile loop and held
+#: until the durable commit releases them.
+RESULT_PLANE_BYTES_PER_POSITION = 4 + 8 + 1 + 8  # 21
+#: support_w1 f64 + support_w2 f64, per patch pixel.
+RESULT_SUPPORT_BYTES_PER_PIXEL = 8 + 8  # 16
+#: n_eff_support f64, per patch pixel, allocated at finalization.
+RESULT_N_EFF_BYTES_PER_PIXEL = 8
+#: Dense rejection mask bool per (frame x pixel x channel), allocated only when
+#: NO bounded rejection sink is supplied. The product external path ALWAYS
+#: supplies ``BoundedCountingRejectionSink``, so this term is 0 there.
+REJECTION_MASK_BYTES_PER_POSITION_FRAME = 1
+
+#: Spool-WRITE tile preparation, per tile pixel x channel: raw provider tile
+#: f32 (4) + src f64 (8) + transformed f64 (8) + transformed f32 (4) +
+#: output frame f32 (4) = 28c.
+WRITE_TILE_BYTES_PER_PIXEL_CHANNEL = 4 + 8 + 8 + 4 + 4  # 28
+#: Spool-WRITE taper/support auxiliaries per tile pixel (NOT per channel):
+#: finite/pre/post bools (3) + taper f32 (4) + distance-transform f64 (8) +
+#: frac f32 (4) + np.where f64 (8) + taper output f32 (4) = 31.
+WRITE_TILE_AUX_BYTES_PER_PIXEL = 3 + 4 + 8 + 4 + 8 + 4  # 31
+
+#: Truthful reduction-batch workspace per (position x frame). The executor
+#: allocates, simultaneously:
+#:   img f32 4 + weights f64 8 + orig f64 8 + wmap f64 8
+#:   finite/initial/survivor/rejection/eligible/degenerate bools 6
+#: and then EITHER the rejection peak (masked 8 + winsor 8 + in-place sort
+#: copy 8 + interval/equality/keep/new2 4 = 28) OR the mean-combine peak
+#: (masked 8 + weights 8 + product 8 = 24). Rejection and combine are
+#: sequential, so the peak adds max(28, 24) to the common 34-byte terms.
+#: Total = 34 + 28 = 62 bytes per (position x frame).
+EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME = (
+    4 + 8 + 8 + 8 + 6 + max(28, 24)
+)  # 62
+
+#: Backwards-compatible public name: the truthful column-batch workspace.
+REDUCTION_BYTES_PER_POSITION_FRAME = EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+
+#: Explicit external HOST model schema (not a disk model).
+EXTERNAL_HOST_MODEL_SCHEMA = "zemosaic-external-host-components-v1"
 
 #: Documented minimum batch: ONE interior tile row (its pixel-channel positions).
 COLUMN_BATCH_MIN = 1
@@ -1009,6 +1055,125 @@ def batch_positions_for(
     return 1, cols
 
 
+def external_cell_host_components(
+    *,
+    n_frames: int,
+    patch_hw: tuple[int, int],
+    tile_hw: tuple[int, int],
+    interior_hw: tuple[int, int],
+    channels: int,
+    column_batch: int,
+    rejection_sink: bool = True,
+) -> dict:
+    """Explicit, integer HOST-RAM components of ONE external Cell.
+
+    Lifetime model (all values are the REAL arrays inspected in
+    ``run_cell_streaming_external`` / ``reduce_spooled_tile`` / ``write_tile``):
+
+    * ``persistent`` — result planes allocated BEFORE the tile loop and held
+      until the durable commit releases them: science f32, weight_sum f64,
+      valid_mask bool, surviving int64 over the full patch, plus support_w1/w2
+      f64 over the patch. The dense rejection mask is added only when no
+      bounded sink is used (the product path always supplies one).
+    * ``write`` — while the persistent planes are live, one tile is prepared
+      from the provider: the provider window (one full prepared RGB f32 frame
+      + bool support over the patch), the per-frame transformed planes, and the
+      taper/distance transform. The PREVIOUS tile's output planes are still
+      referenced until the next reduction rebinds them, so they are included.
+    * ``reduce`` — while the persistent planes are live, the tile-local output
+      planes (four f32/f64/bool/int64 planes + interior support_w1/w2) and the
+      column-batch workspace coexist.
+    * ``finalize`` — n_eff_support f64 is allocated after the tile loop while
+      the persistent planes are still live.
+
+    The returned ``peak_bytes`` is ``max(write, reduce, finalize)``: the
+    sub-phases are SEQUENTIAL within one Cell. Spool bytes are deliberately
+    absent — they belong to the DISK contract, never to host RAM. Final mosaic
+    assembly is a LATER, separately admitted phase and is absent too.
+    """
+    n = _require_int(n_frames, "n_frames", minimum=1)
+    c = _require_int(channels, "channels", minimum=1)
+    ph, pw = int(patch_hw[0]), int(patch_hw[1])
+    th, tw = int(tile_hw[0]), int(tile_hw[1])
+    ih, iw = int(interior_hw[0]), int(interior_hw[1])
+    for name, value in (("patch_h", ph), ("patch_w", pw), ("tile_h", th),
+                        ("tile_w", tw), ("interior_h", ih), ("interior_w", iw)):
+        if value < 1:
+            raise ExternalBudgetError(
+                f"external host model requires a positive {name}, got {value}"
+            )
+    req = _require_int(column_batch, "column_batch", minimum=1)
+    sink = bool(rejection_sink)
+
+    patch_px = ph * pw
+    tile_px = th * tw
+    interior_px = ih * iw
+
+    persistent = patch_px * (
+        c * RESULT_PLANE_BYTES_PER_POSITION + RESULT_SUPPORT_BYTES_PER_PIXEL
+    )
+    dense_rejection = (
+        0 if sink else n * patch_px * c * REJECTION_MASK_BYTES_PER_POSITION_FRAME
+    )
+    persistent += dense_rejection
+    n_eff = patch_px * RESULT_N_EFF_BYTES_PER_PIXEL
+
+    provider_window = patch_px * (4 * c + 1)
+    write_tile = tile_px * (
+        c * WRITE_TILE_BYTES_PER_PIXEL_CHANNEL + WRITE_TILE_AUX_BYTES_PER_PIXEL
+    )
+    reduce_tile = (
+        tile_px * c * RESULT_PLANE_BYTES_PER_POSITION
+        + interior_px * RESULT_SUPPORT_BYTES_PER_PIXEL
+    )
+
+    rows, cols = batch_positions_for(req, iw, c)
+    positions = rows * cols * c
+    batch = n * positions * EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+
+    first_write = persistent + provider_window + write_tile
+    # The previous tile's outputs stay referenced through the next write_tile.
+    write_phase = persistent + reduce_tile + provider_window + write_tile
+    reduce_phase = persistent + reduce_tile + batch
+    finalize = persistent + n_eff
+    peak = max(first_write, write_phase, reduce_phase, finalize)
+
+    return {
+        "schema": EXTERNAL_HOST_MODEL_SCHEMA,
+        "observation_domain": "net_available",
+        "n_frames": int(n),
+        "patch_hw": [int(ph), int(pw)],
+        "tile_hw": [int(th), int(tw)],
+        "interior_hw": [int(ih), int(iw)],
+        "channels": int(c),
+        "column_batch": int(req),
+        "rows_per_batch": int(rows),
+        "cols_per_batch": int(cols),
+        "batch_positions": int(positions),
+        "batch_bytes_per_position_frame": int(
+            EXTERNAL_BATCH_BYTES_PER_POSITION_FRAME
+        ),
+        "persistent_result_bytes": int(persistent),
+        "dense_rejection_mask_bytes": int(dense_rejection),
+        "finalize_n_eff_bytes": int(n_eff),
+        "provider_window_bytes": int(provider_window),
+        "write_tile_bytes": int(write_tile),
+        "reduce_tile_outputs_bytes": int(reduce_tile),
+        "reduction_batch_bytes": int(batch),
+        "phases": {
+            "first_write": int(first_write),
+            "write": int(write_phase),
+            "reduce": int(reduce_phase),
+            "finalize": int(finalize),
+        },
+        "reduce_fixed_bytes": int(persistent + reduce_tile),
+        "fixed_peak_bytes": int(max(write_phase, finalize, first_write)),
+        "peak_bytes": int(peak),
+        # Spool/disk bytes are intentionally NOT a host component.
+        "disk_bytes_in_host_peak": 0,
+    }
+
+
 def estimate_external_working_set(
     *,
     n_frames: int,
@@ -1039,6 +1204,7 @@ def estimate_external_working_set(
     amplification = 1.0  # contiguous row slices: each payload byte read once
 
     max_iw = _max_interior_width(tiles)
+    max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in tiles)
     rows, cols = batch_positions_for(req, max_iw, c)
     positions = rows * cols * c
     reduction_bytes = n * positions * REDUCTION_BYTES_PER_POSITION_FRAME
@@ -1048,6 +1214,15 @@ def estimate_external_working_set(
     tile_area = max_th * max_tw
     output_bytes = tile_area * c * (4 + 8 + 1 + 8) + max_th * max_tw * 16
     rejection_block_bytes = n * tile_area * c
+    host = external_cell_host_components(
+        n_frames=n,
+        patch_hw=(h, w),
+        tile_hw=(max_th, max_tw),
+        interior_hw=(max_ih, max_iw),
+        channels=c,
+        column_batch=req,
+        rejection_sink=True,
+    )
 
     cleanup_margin = max(
         _CLEANUP_MARGIN_MIN_BYTES,
@@ -1070,11 +1245,21 @@ def estimate_external_working_set(
             "batch_positions": int(positions),
             "positions_per_row": int(_positions_per_row(max_iw, c)),
             "bytes_per_position_frame": int(REDUCTION_BYTES_PER_POSITION_FRAME),
-            "tile_output_temporaries_bytes": int(output_bytes),
+            "tile_output_temporaries_bytes": int(
+                host["reduce_tile_outputs_bytes"]
+            ),
             "rejection_block_bytes_if_dense": int(rejection_block_bytes),
+            "persistent_result_bytes": int(host["persistent_result_bytes"]),
+            "provider_window_bytes": int(host["provider_window_bytes"]),
+            "write_tile_bytes": int(host["write_tile_bytes"]),
+            "host_peak_bytes": int(host["peak_bytes"]),
+            "host_fixed_peak_bytes": int(host["fixed_peak_bytes"]),
+            "host_reduce_fixed_bytes": int(host["reduce_fixed_bytes"]),
             "independent_of_patch_area": True,
+            "host_peak_depends_on_patch_area": True,
             "depends_on": ["n_frames", "column_batch", "tile_area"],
         },
+        "host": host,
         "disk": {
             "spool_peak_bytes_worst_tile": int(worst_tile_bytes),
             "cumulative_writes_bytes": int(cumulative_writes),

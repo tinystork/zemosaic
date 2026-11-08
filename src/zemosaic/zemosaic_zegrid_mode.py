@@ -5836,10 +5836,23 @@ def _r55_gpu_tile_ladder(
 # ---------------------------------------------------------------------------
 
 def _external_result_unit_bytes(worst_patch_px, channels) -> int:
-    """Durable result bytes of ONE cell (science/support/valid/n_eff planes)."""
+    """Durable result bytes of ONE cell, audited against the real planes.
+
+    The durable store writes SEVEN core planes (``run_registry.CORE_PLANES``):
+    science f32, estimator_weight_sum f64, valid_mask bool, surviving int64
+    over ``(px, channels)``; support_w1 f64, support_w2 f64 and n_eff_support
+    f64 over ``(px,)``. Each plane has its own ``.npy`` header. The previous
+    formula omitted both support planes and the n_eff plane (disk undercount).
+    """
     px = max(0, int(worst_patch_px))
     c = max(1, int(channels))
-    return int(px) * c * (4 + 8 + 1 + 8) + 2 * 8 + 8
+    return int(
+        int(px) * c * int(zext.RESULT_PLANE_BYTES_PER_POSITION)
+        + int(px) * int(zext.RESULT_SUPPORT_BYTES_PER_PIXEL)
+        + int(px) * int(zext.RESULT_N_EFF_BYTES_PER_PIXEL)
+        + 7 * 128  # one .npy header per durable core plane
+        + 3 * 8    # bounded scalar diagnostics
+    )
 
 
 def _external_spool_root(cache_root) -> Path:
@@ -5875,6 +5888,46 @@ def _working_set_class_for_mode(mode) -> str:
     return WORKING_SET_RAM_TILE
 
 
+def _external_phase_budget_block(
+    *,
+    budget_domain,
+    plan_budget_bytes,
+    margin_num,
+    margin_den,
+    effective_phase_budget,
+    charged_baseline_bytes,
+    charged_assembly_bytes,
+    assembly_reserve_excluded_bytes,
+    host_fixed_bytes,
+    reduce_fixed_bytes,
+    residual_batch_budget_bytes,
+    host_peak_bytes,
+    host_components,
+) -> dict:
+    """Diagnostics derived from the EXACT variables used by admission (L1)."""
+    return {
+        "phase": "external_reduction",
+        "budget_domain": str(budget_domain),
+        "plan_budget_bytes": int(plan_budget_bytes),
+        "margin_num": int(margin_num),
+        "margin_den": int(margin_den),
+        "margin_ceiling_bytes": int(effective_phase_budget),
+        "reduction_budget_bytes": int(effective_phase_budget),
+        "process_baseline_charged_bytes": int(charged_baseline_bytes),
+        "process_baseline_already_in_available": True,
+        "assembly_reserve_charged_bytes": int(charged_assembly_bytes),
+        "assembly_reserve_excluded_bytes": int(
+            assembly_reserve_excluded_bytes
+        ),
+        "assembly_admission": "separate_at_assembly_time",
+        "fixed_host_bytes": int(host_fixed_bytes),
+        "reduce_fixed_bytes": int(reduce_fixed_bytes),
+        "residual_batch_budget_bytes": int(residual_batch_budget_bytes),
+        "host_peak_bytes": int(host_peak_bytes),
+        "host_components": dict(host_components),
+    }
+
+
 def _select_external_fallback(
     *,
     permitted_tiles,
@@ -5888,6 +5941,7 @@ def _select_external_fallback(
     frozen_tile=None,
     frozen_batch=None,
     fixed_overlap_bytes=0,
+    observation_domain=None,
 ) -> dict:
     """Choose `stream_external(tile, batch)` or return a typed refusal.
 
@@ -5950,48 +6004,123 @@ def _select_external_fallback(
         )
     )
     result_unit = _external_result_unit_bytes(worst_patch_px, channels)
-    # ZM-EXTERNAL-PHASE-BUDGET: the external reduction is a PHASE-LOCAL
-    # admission. ``budget_bytes`` is derived from the CURRENT NET
-    # ``psutil.virtual_memory().available`` observation, which already excludes
-    # the resident process baseline; subtracting PROCESS_BASELINE here charged
-    # the same shared residency a SECOND time. Final assembly is a LATER,
-    # SEPARATE phase: external payloads are durably committed and released
-    # before it, and assembly performs its own fresh RAM admission (anonymous
-    # first, then scratch-backed). Its retained cores/halo are therefore NOT
-    # live during the reduction and must not be reserved here. The margin is
-    # the SAME one the ACTIVE envelope validation applies (never relaxed).
-    # ``_r55_margin_raw_ceiling`` is the established integer-margin seam; it
-    # delegates to ``ram_contract.incremental_phase_budget_bytes`` (single
-    # source). It is applied to the NET budget and then NOT reduced by either
-    # the resident baseline or the later assembly reserve (see above).
-    phase_budget = _r55_margin_raw_ceiling(
-        int(budget_bytes),
-        margin_num=int(renv.DEFAULT_MARGIN_NUM),
-        margin_den=int(renv.DEFAULT_MARGIN_DEN),
+    # ZM-EXTERNAL-PHASE-BUDGET rework-1: PHASE-LOCAL host admission.
+    # ``budget_bytes`` is derived from a CURRENT NET ``available`` observation
+    # (validated against the CLOSED ``net_available`` domain): the resident
+    # process baseline is already excluded. The external Cell host peak is the
+    # MAXIMUM of its sequential sub-phases (persistent result planes + spool
+    # write preparation, persistent + reduce tile outputs + column batch,
+    # persistent + finalization). Final mosaic assembly is a LATER phase and is
+    # not charged here. Spool bytes are DISK-only and never enter this peak.
+    budget_domain = rcontract.require_observation_domain(
+        observation_domain, name="external observation_domain"
     )
-    reduction_budget = max(1, int(phase_budget))
-    phase_budgets = {
-        "phase": "external_reduction",
-        "source": "current_net_available_plan_budget",
-        "plan_budget_bytes": int(budget_bytes),
-        "margin_num": int(renv.DEFAULT_MARGIN_NUM),
-        "margin_den": int(renv.DEFAULT_MARGIN_DEN),
-        "reduction_budget_bytes": int(reduction_budget),
-        "process_baseline_charged_bytes": 0,
-        "process_baseline_already_in_available": True,
-        "assembly_reserve_excluded_bytes": int(fixed_overlap_bytes),
-        "assembly_admission": "separate_at_assembly_time",
-    }
+    margin_num = int(renv.DEFAULT_MARGIN_NUM)
+    margin_den = int(renv.DEFAULT_MARGIN_DEN)
+    margin_ceiling = max(
+        1,
+        int(
+            _r55_margin_raw_ceiling(
+                int(budget_bytes),
+                margin_num=margin_num,
+                margin_den=margin_den,
+            )
+        ),
+    )
+    # Explicit, derived charges (never independent literals): the net
+    # observation already contains the baseline, and the later assembly is not
+    # live. Both are charged exactly zero times here.
+    charged_baseline_bytes = 0
+    charged_assembly_bytes = 0
+    effective_phase_budget = (
+        int(margin_ceiling)
+        - int(charged_baseline_bytes)
+        - int(charged_assembly_bytes)
+    )
+    if effective_phase_budget < 1:
+        return {
+            "refused": True,
+            "reason": "reduction_workspace_floor",
+            "detail": (
+                "the phase-local external budget is empty after the exact "
+                f"charges (margin ceiling {margin_ceiling} B, baseline "
+                f"{charged_baseline_bytes} B, assembly {charged_assembly_bytes} B)"
+            ),
+            "trials": [],
+            "free_bytes": int(free),
+            "budget_domain": str(budget_domain),
+            "reduction_budget_bytes": int(effective_phase_budget),
+            "phase_budgets": _external_phase_budget_block(
+                budget_domain=budget_domain,
+                plan_budget_bytes=int(budget_bytes),
+                margin_num=margin_num,
+                margin_den=margin_den,
+                effective_phase_budget=int(effective_phase_budget),
+                charged_baseline_bytes=charged_baseline_bytes,
+                charged_assembly_bytes=charged_assembly_bytes,
+                assembly_reserve_excluded_bytes=int(fixed_overlap_bytes),
+                host_fixed_bytes=0,
+                reduce_fixed_bytes=0,
+                residual_batch_budget_bytes=0,
+                host_peak_bytes=0,
+                host_components={},
+            ),
+            "best_envelope_bytes": None,
+        }
     trials = []
     best = None
     priced_any = False
+    floor_fixed = 0
+    floor_residual = None
+    floor_host = {}
     for tile in permitted_tiles:
+        # Geometry-only probe: the fixed host terms are batch-independent.
+        probe = zext.estimate_external_working_set(
+            n_frames=int(max_n_frames),
+            height=int(worst_patch_hw[0]),
+            width=int(worst_patch_hw[1]),
+            channels=int(channels),
+            tile_size=int(tile),
+            halo_px=int(halo_px),
+            column_batch=1,
+        )
+        host_fixed = int(probe["host"]["fixed_peak_bytes"])
+        reduce_fixed = int(probe["host"]["reduce_fixed_bytes"])
+        residual = int(effective_phase_budget) - int(reduce_fixed)
+        floor_fixed = max(floor_fixed, host_fixed)
+        floor_residual = (
+            residual if floor_residual is None else min(floor_residual, residual)
+        )
+        floor_host = dict(probe["host"])
+        if host_fixed > int(effective_phase_budget) or residual < 1:
+            trials.append(
+                {
+                    "tile": int(tile),
+                    "fits": False,
+                    "reason_code": (
+                        "external_host_fixed_floor"
+                        if host_fixed > int(effective_phase_budget)
+                        else "column_batch_floor"
+                    ),
+                    "host_fixed_bytes": int(host_fixed),
+                    "reduce_fixed_bytes": int(reduce_fixed),
+                    "residual_batch_budget_bytes": int(max(0, residual)),
+                    "host_peak_bytes": int(host_fixed),
+                    "detail": (
+                        f"fixed concurrent host terms {host_fixed} B exceed "
+                        f"the phase budget {effective_phase_budget} B"
+                        if host_fixed > int(effective_phase_budget)
+                        else f"only {max(0, residual)} B remain for the column "
+                        "batch after the fixed concurrent host terms"
+                    ),
+                }
+            )
+            continue
         if frozen_batch is not None:
             # A resumed external run reuses its FROZEN column-batch policy.
             # A MALFORMED frozen value is a configuration/identity failure, not
             # a resource shortfall; a VALID frozen batch that no longer fits the
-            # fresh reduction RAM budget is an honest HOST-RAM refusal. The two
-            # must never be conflated (and neither is a disk shortfall).
+            # fresh host peak is an honest HOST-RAM refusal.
             batch = int(frozen_batch)
             if batch < 1:
                 return {
@@ -6003,34 +6132,27 @@ def _select_external_fallback(
                     ),
                     "trials": [],
                     "free_bytes": int(free),
-                    "phase_budgets": dict(phase_budgets),
-                }
-            required = (
-                int(max_n_frames) * batch
-                * int(zext.REDUCTION_BYTES_PER_POSITION_FRAME)
-            )
-            if required > int(reduction_budget):
-                return {
-                    "refused": True, "reason": "frozen_batch_ram",
-                    "detail": (
-                        f"frozen column_batch {batch} requires {required} B of "
-                        "incremental reduction workspace but only "
-                        f"{int(reduction_budget)} B remain in the phase-local "
-                        "budget (the process baseline is already excluded from "
-                        "current available and the later assembly is separately "
-                        "admitted); refusing to shrink the frozen identity "
-                        "silently (HOST RAM)"
+                    "budget_domain": str(budget_domain),
+                    "phase_budgets": _external_phase_budget_block(
+                        budget_domain=budget_domain,
+                        plan_budget_bytes=int(budget_bytes),
+                        margin_num=margin_num,
+                        margin_den=margin_den,
+                        effective_phase_budget=int(effective_phase_budget),
+                        charged_baseline_bytes=charged_baseline_bytes,
+                        charged_assembly_bytes=charged_assembly_bytes,
+                        assembly_reserve_excluded_bytes=int(fixed_overlap_bytes),
+                        host_fixed_bytes=host_fixed,
+                        reduce_fixed_bytes=reduce_fixed,
+                        residual_batch_budget_bytes=residual,
+                        host_peak_bytes=host_fixed,
+                        host_components=probe["host"],
                     ),
-                    "trials": [],
-                    "free_bytes": int(free),
-                    "required_reduction_bytes": int(required),
-                    "reduction_budget_bytes": int(reduction_budget),
-                    "phase_budgets": dict(phase_budgets),
                 }
         else:
             try:
                 batch = zext.largest_admissible_column_batch(
-                    budget_bytes=int(reduction_budget),
+                    budget_bytes=int(residual),
                     n_frames=int(max_n_frames),
                     interior_width=min(int(tile), int(worst_patch_hw[1])),
                     channels=int(channels),
@@ -6038,7 +6160,11 @@ def _select_external_fallback(
             except zext.ExternalBudgetError as exc:
                 trials.append({
                     "tile": int(tile), "fits": False,
-                    "reason_code": "column_batch_floor", "detail": str(exc),
+                    "reason_code": "column_batch_floor",
+                    "host_fixed_bytes": int(host_fixed),
+                    "reduce_fixed_bytes": int(reduce_fixed),
+                    "residual_batch_budget_bytes": int(max(0, residual)),
+                    "detail": str(exc),
                 })
                 continue
         priced_any = True
@@ -6051,6 +6177,60 @@ def _select_external_fallback(
             halo_px=int(halo_px),
             column_batch=int(batch),
         )
+        host = pricing["host"]
+        host_peak = int(host["peak_bytes"])
+        if host_peak > int(effective_phase_budget):
+            if frozen_batch is not None:
+                return {
+                    "refused": True, "reason": "frozen_batch_ram",
+                    "detail": (
+                        f"frozen column_batch {batch} yields a host peak of "
+                        f"{host_peak} B but only {effective_phase_budget} B "
+                        "remain in the phase-local budget (the process baseline "
+                        "is already excluded from current available and the "
+                        "later assembly is separately admitted); refusing to "
+                        "shrink the frozen identity silently (HOST RAM)"
+                    ),
+                    "trials": [],
+                    "free_bytes": int(free),
+                    "required_reduction_bytes": int(
+                        host["reduction_batch_bytes"]
+                    ),
+                    "reduction_budget_bytes": int(effective_phase_budget),
+                    "residual_batch_budget_bytes": int(residual),
+                    "host_fixed_bytes": int(host_fixed),
+                    "host_peak_bytes": int(host_peak),
+                    "host_components": dict(host),
+                    "budget_domain": str(budget_domain),
+                    "phase_budgets": _external_phase_budget_block(
+                        budget_domain=budget_domain,
+                        plan_budget_bytes=int(budget_bytes),
+                        margin_num=margin_num,
+                        margin_den=margin_den,
+                        effective_phase_budget=int(effective_phase_budget),
+                        charged_baseline_bytes=charged_baseline_bytes,
+                        charged_assembly_bytes=charged_assembly_bytes,
+                        assembly_reserve_excluded_bytes=int(fixed_overlap_bytes),
+                        host_fixed_bytes=host_fixed,
+                        reduce_fixed_bytes=reduce_fixed,
+                        residual_batch_budget_bytes=residual,
+                        host_peak_bytes=host_peak,
+                        host_components=host,
+                    ),
+                }
+            trials.append({
+                "tile": int(tile), "fits": False,
+                "reason_code": "host_peak_over_budget",
+                "host_fixed_bytes": int(host_fixed),
+                "reduce_fixed_bytes": int(reduce_fixed),
+                "residual_batch_budget_bytes": int(residual),
+                "host_peak_bytes": int(host_peak),
+                "detail": (
+                    f"column_batch {batch} yields host peak {host_peak} B > "
+                    f"phase budget {effective_phase_budget} B"
+                ),
+            })
+            continue
         envelope = int(
             pricing["disk"]["spool_peak_bytes_worst_tile"]
             + resident_unit
@@ -6066,6 +6246,11 @@ def _select_external_fallback(
             "spool_peak_bytes": int(
                 pricing["disk"]["spool_peak_bytes_worst_tile"]
             ),
+            "host_fixed_bytes": int(host_fixed),
+            "reduce_fixed_bytes": int(reduce_fixed),
+            "residual_batch_budget_bytes": int(residual),
+            "host_peak_bytes": int(host_peak),
+            "host_components": dict(host),
             "reason_code": None if fits else "disk_envelope_unavailable",
         }
         trials.append(entry)
@@ -6076,14 +6261,34 @@ def _select_external_fallback(
                 "column_batch": int(batch),
                 "spool_root": str(spool_root),
                 "pricing": pricing,
+                "budget_domain": str(budget_domain),
+                "phase_budget_bytes": int(effective_phase_budget),
+                "reduction_budget_bytes": int(effective_phase_budget),
+                "residual_batch_budget_bytes": int(residual),
+                "host_fixed_bytes": int(host_fixed),
+                "host_peak_bytes": int(host_peak),
+                "host_components": dict(host),
                 # The aligned cache is not a disk cost here (source-backed);
                 # publish the exact resident staging unit instead.
                 "resident_unit_bytes": int(resident_unit),
                 "result_unit_bytes": int(result_unit),
                 "disk_envelope_bytes": int(envelope),
                 "free_bytes": int(free),
-                "reduction_budget_bytes": int(reduction_budget),
-                "phase_budgets": dict(phase_budgets),
+                "phase_budgets": _external_phase_budget_block(
+                    budget_domain=budget_domain,
+                    plan_budget_bytes=int(budget_bytes),
+                    margin_num=margin_num,
+                    margin_den=margin_den,
+                    effective_phase_budget=int(effective_phase_budget),
+                    charged_baseline_bytes=charged_baseline_bytes,
+                    charged_assembly_bytes=charged_assembly_bytes,
+                    assembly_reserve_excluded_bytes=int(fixed_overlap_bytes),
+                    host_fixed_bytes=host_fixed,
+                    reduce_fixed_bytes=reduce_fixed,
+                    residual_batch_budget_bytes=residual,
+                    host_peak_bytes=host_peak,
+                    host_components=host,
+                ),
                 "trials": trials,
             }
         if best is None or envelope < best["disk_envelope_bytes"]:
@@ -6093,21 +6298,25 @@ def _select_external_fallback(
         and not priced_any
         and trials
         and all(
-            str(entry.get("reason_code")) == "column_batch_floor"
+            str(entry.get("reason_code")) in (
+                "column_batch_floor", "external_host_fixed_floor"
+            )
             for entry in trials
         )
     ):
-        # The disk was OBSERVED and is not the cause: even the minimum
-        # reduction workspace (one pixel x channels x n_frames x 31 B) cannot
-        # fit the margin-aware reduction budget. This is a HOST-RAM floor.
+        # The disk was OBSERVED and is not the cause: even the minimum batch
+        # plus the fixed concurrent host terms cannot fit the phase-local
+        # budget. This is a HOST-RAM floor.
         return {
             "refused": True,
             "reason": "reduction_workspace_floor",
             "detail": (
-                "no external column batch can be priced: even the minimum "
-                "incremental reduction workspace does not fit the phase-local "
-                f"reduction budget {int(reduction_budget)} B (from the current "
-                "net available PLAN budget; the resident process baseline is "
+                "no external column batch can be priced: the fixed concurrent "
+                f"host terms reach {int(floor_fixed)} B and the residual for "
+                f"the minimum batch is {int(max(0, floor_residual or 0))} B "
+                f"inside the phase-local host budget "
+                f"{int(effective_phase_budget)} B (from the current net "
+                "available PLAN budget; the resident process baseline is "
                 "already excluded and the later assembly is separately "
                 "admitted); this is a HOST-RAM floor, not a disk shortfall. "
                 "Remedy: increase the PLAN budget or use a smaller "
@@ -6115,9 +6324,28 @@ def _select_external_fallback(
             ),
             "trials": trials,
             "free_bytes": int(free),
-            "reduction_budget_bytes": int(reduction_budget),
+            "budget_domain": str(budget_domain),
+            "reduction_budget_bytes": int(effective_phase_budget),
+            "residual_batch_budget_bytes": int(max(0, floor_residual or 0)),
+            "host_fixed_bytes": int(floor_fixed),
+            "host_peak_bytes": int(floor_fixed),
+            "host_components": dict(floor_host),
             "fixed_overlap_bytes": int(fixed_overlap_bytes),
-            "phase_budgets": dict(phase_budgets),
+            "phase_budgets": _external_phase_budget_block(
+                budget_domain=budget_domain,
+                plan_budget_bytes=int(budget_bytes),
+                margin_num=margin_num,
+                margin_den=margin_den,
+                effective_phase_budget=int(effective_phase_budget),
+                charged_baseline_bytes=charged_baseline_bytes,
+                charged_assembly_bytes=charged_assembly_bytes,
+                assembly_reserve_excluded_bytes=int(fixed_overlap_bytes),
+                host_fixed_bytes=int(floor_fixed),
+                reduce_fixed_bytes=int(floor_fixed),
+                residual_batch_budget_bytes=int(max(0, floor_residual or 0)),
+                host_peak_bytes=int(floor_fixed),
+                host_components=floor_host,
+            ),
             "best_envelope_bytes": None,
         }
     return {
@@ -6138,8 +6366,33 @@ def _select_external_fallback(
         ),
         "trials": trials,
         "free_bytes": int(free),
-        "reduction_budget_bytes": int(reduction_budget),
-        "phase_budgets": dict(phase_budgets),
+        "budget_domain": str(budget_domain),
+        "reduction_budget_bytes": int(effective_phase_budget),
+        "host_fixed_bytes": int(best["host_fixed_bytes"]) if best else int(floor_fixed),
+        "host_peak_bytes": int(best["host_peak_bytes"]) if best else int(floor_fixed),
+        "residual_batch_budget_bytes": (
+            int(best["residual_batch_budget_bytes"]) if best
+            else int(max(0, floor_residual or 0))
+        ),
+        "host_components": dict(best.get("host_components") or {}) if best else dict(floor_host),
+        "phase_budgets": _external_phase_budget_block(
+            budget_domain=budget_domain,
+            plan_budget_bytes=int(budget_bytes),
+            margin_num=margin_num,
+            margin_den=margin_den,
+            effective_phase_budget=int(effective_phase_budget),
+            charged_baseline_bytes=charged_baseline_bytes,
+            charged_assembly_bytes=charged_assembly_bytes,
+            assembly_reserve_excluded_bytes=int(fixed_overlap_bytes),
+            host_fixed_bytes=int(best["host_fixed_bytes"]) if best else int(floor_fixed),
+            reduce_fixed_bytes=int(best["reduce_fixed_bytes"]) if best else int(floor_fixed),
+            residual_batch_budget_bytes=(
+                int(best["residual_batch_budget_bytes"]) if best
+                else int(max(0, floor_residual or 0))
+            ),
+            host_peak_bytes=int(best["host_peak_bytes"]) if best else int(floor_fixed),
+            host_components=dict(best.get("host_components") or {}) if best else floor_host,
+        ),
         "best_envelope_bytes": (
             None if best is None else int(best["disk_envelope_bytes"])
         ),
@@ -6201,6 +6454,17 @@ def _working_set_block(
         "phase_budgets": (
             None if external is None
             else dict(external.get("phase_budgets") or {})
+        ),
+        "budget_domain": (
+            None if external is None else external.get("budget_domain")
+        ),
+        "host_peak_bytes": (
+            None if external is None
+            else int(external.get("host_peak_bytes") or 0)
+        ),
+        "host_components": (
+            None if external is None
+            else dict(external.get("host_components") or {})
         ),
         "layout": [int(layout[0]), int(layout[1])],
         "refinement_rank": int(layout[0]) * int(layout[1]),
@@ -6738,8 +7002,10 @@ def _build_execution_bundle(
                     else None
                 ),
                 fixed_overlap_bytes=int(_ext_overlap_bytes),
+                observation_domain=rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
             )
             if not external_selection.get("refused"):
+                _ext_host_peak = int(external_selection["host_peak_bytes"])
                 _ext_ws = int(
                     external_selection["pricing"]["ram"][
                         "reduction_workspace_bytes"
@@ -6754,9 +7020,15 @@ def _build_execution_bundle(
                     # external class is CPU-only and serialises one Cell, so it
                     # is never GPU-serialized.
                     "gpu_serialized": False,
-                    "stack_total_bytes": max(int(shared_bytes), int(_ext_ws)),
-                    "cache_total_bytes": int(shared_bytes),
-                    "aggregate_bytes": max(int(shared_bytes), int(_ext_ws)),
+                    # ZM-EXTERNAL-PHASE-BUDGET rework-1: the external envelope
+                    # is NET/incremental. Its budget already excludes the
+                    # resident baseline, the stack term is the ONE truthful
+                    # external host peak, and the generic aligned-cache RAM
+                    # worker term is 0 (source-backed execution builds no
+                    # aligned cache). Spool bytes stay in the DISK envelope.
+                    "stack_total_bytes": int(_ext_host_peak),
+                    "cache_total_bytes": 0,
+                    "aggregate_bytes": int(_ext_host_peak),
                     "chosen_reason": (
                         "external working set selected: no in-memory plan and "
                         "no RAM streaming tile fits; the complete disk "
@@ -7008,6 +7280,19 @@ def _build_execution_bundle(
                         "reduction_workspace_bytes"
                     ]
                 ),
+                # ONE frozen external host contract carried selector -> task ->
+                # ACTIVE scheduler -> _r55_active_apply -> manifest.
+                "host_peak_bytes": int(external_selection["host_peak_bytes"]),
+                "host_components": dict(
+                    external_selection["host_components"]
+                ),
+                "budget_domain": str(external_selection["budget_domain"]),
+                "phase_budget_bytes": int(
+                    external_selection["phase_budget_bytes"]
+                ),
+                "residual_batch_budget_bytes": int(
+                    external_selection["residual_batch_budget_bytes"]
+                ),
                 "resident_unit_bytes": int(
                     external_selection.get("resident_unit_bytes") or 0
                 ),
@@ -7042,8 +7327,7 @@ def _build_execution_bundle(
             elif chosen_mode == "external":
                 cell_tasks.append(_cell_task(
                     cell, patch, mem, cache_dir, "external",
-                    int(external_selection["pricing"]["ram"][
-                        "reduction_workspace_bytes"]),
+                    int(external_selection["host_peak_bytes"]),
                     _profile, _external_task_info))
             else:
                 bound_b = (
@@ -7162,6 +7446,9 @@ def _build_execution_bundle(
                     "reason": cpu_fallback_plan.get("chosen_reason"),
                 })
 
+        _envelope_shared = (
+            0 if chosen_mode == "external" else int(shared_bytes)
+        )
         envelope = rcontract.PlanEnvelope(
             phase=rcontract.PHASE_PLAN,
             raw_available_bytes=int(raw_available_bytes),
@@ -7175,7 +7462,7 @@ def _build_execution_bundle(
             backend=(rcontract.BACKEND_GPU if effective_gpu else rcontract.BACKEND_CPU),
             cells_in_flight=int(cells_in_flight),
             cache_workers_per_cell=int(cache_workers_per_cell),
-            shared_bytes=int(shared_bytes),
+            shared_bytes=int(_envelope_shared),
             stack_total_bytes=int(plan["stack_total_bytes"]),
             cache_total_bytes=int(plan["cache_total_bytes"]),
             aggregate_bytes=int(plan["aggregate_bytes"]),
@@ -8258,11 +8545,36 @@ def _r55_external_contract(bundle) -> dict:
     batch = int(contract.get("column_batch") or 0)
     envelope = int(contract.get("disk_envelope_bytes") or 0)
     workspace = int(contract.get("reduction_workspace_bytes") or 0)
-    if tile < 1 or batch < 1 or envelope < 1 or workspace < 1:
+    host_peak = int(contract.get("host_peak_bytes") or 0)
+    components = contract.get("host_components")
+    budget_domain = str(contract.get("budget_domain") or "")
+    if (
+        tile < 1 or batch < 1 or envelope < 1 or workspace < 1
+        or host_peak < 1
+    ):
         raise zsched.SchedulerConfigError(
             "external contract carries a non-positive execution fact: "
             f"tile={tile}, column_batch={batch}, disk_envelope={envelope}, "
-            f"reduction_workspace={workspace}"
+            f"reduction_workspace={workspace}, host_peak={host_peak}"
+        )
+    if not isinstance(components, dict) or not components:
+        raise zsched.SchedulerConfigError(
+            "external contract must carry its explicit HOST component model"
+        )
+    if budget_domain != rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE:
+        raise zsched.SchedulerConfigError(
+            "external contract budget_domain must be the closed "
+            f"{rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE!r}, got "
+            f"{budget_domain!r}"
+        )
+    if int(components.get("peak_bytes") or 0) != int(host_peak):
+        raise zsched.SchedulerConfigError(
+            "external contract host_peak_bytes disagrees with its component "
+            f"model: {host_peak} != {components.get('peak_bytes')!r}"
+        )
+    if int(components.get("disk_bytes_in_host_peak", -1)) != 0:
+        raise zsched.SchedulerConfigError(
+            "external host component model must not contain disk bytes"
         )
     return contract
 
@@ -8271,8 +8583,9 @@ def _r55_active_external_context(facts, bundle, cache_workers_cap):
     """Build the SINGLE external working-set context for ACTIVE admission.
 
     The context prices exactly the real external execution:
-    * the stack term is the column-reduction workspace (never a patch-area
-      aligned cache);
+    * the stack term is the ONE frozen external HOST PEAK (persistent result
+      planes + max(spool-write, reduce + column batch, finalize)); it is never
+      a patch-area aligned cache and never includes spool/disk bytes;
     * the ON-DISK residency per in-flight Cell is the complete spool envelope
       already priced and checked against fresh free space by
       :func:`_select_external_fallback`;
@@ -8282,15 +8595,18 @@ def _r55_active_external_context(facts, bundle, cache_workers_cap):
     contract = _r55_external_contract(bundle)
     tile = int(contract["tile_size"])
     workspace = int(contract["reduction_workspace_bytes"])
+    host_peak = int(contract["host_peak_bytes"])
     envelope = int(contract["disk_envelope_bytes"])
     return _r55_active_context(
         facts,
         phase=renv.PHASE_CELL_STACK_STREAM,
-        per_unit_stack=workspace,
+        # The ONE frozen external host peak (persistent + write/reduce/finalize
+        # maximum), never the column block alone and never a patch-area cache.
+        per_unit_stack=host_peak,
         per_unit_cache=envelope,
         per_unit_prefetch=0,
         bundle=bundle,
-        per_tile_stack_bytes={tile: workspace},
+        per_tile_stack_bytes={tile: host_peak},
         cache_workers_cap=int(cache_workers_cap),
         tile_ladder=(tile,),
         prefetch_ladder=(0,),
@@ -8331,6 +8647,13 @@ def _r55_active_external_decide(
         output_dir=output_dir,
         frame_ids=frame_ids,
     )
+    # ZM-EXTERNAL-PHASE-BUDGET rework-1: the external bounded path is
+    # SOURCE-BACKED and NEVER builds the aligned cache. The generic
+    # ``cache_footprint_bytes`` RAM worker term is therefore a GHOST: charge it
+    # exactly zero. The real provider/result RAM lives in the frozen external
+    # host peak; the worker count is retained for identity/mapping only.
+    facts["cache_footprint_bytes"] = 0
+    facts["cache_phase_ram_bytes"] = 0
     trail: list[dict] = []
     last_exc = None
     plan_set = None
@@ -9789,7 +10112,9 @@ def _r55_active_apply(
         elif external_class:
             cell_tasks.append(_cell_task(
                 cell, patch, mem, cache_dir, "external",
-                int(external_contract["reduction_workspace_bytes"]),
+                # The per-cell executable bound is the ONE frozen host peak,
+                # never the column-batch block alone.
+                int(external_contract["host_peak_bytes"]),
                 getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE),
                 external_contract))
         else:
@@ -9833,26 +10158,29 @@ def _r55_active_apply(
         int(bundle.cache_worker_footprint_bytes),
     ))
     if external_class:
-        # ZM-EXTERNAL-PHASE-BUDGET: the external envelope is a NET/incremental
-        # accounting. Its budget derives from the CURRENT NET ``available``
-        # observation, which already excludes resident process memory; the
-        # reduction workspace is the only NEW stack allocation. Charging
-        # ``bundle.shared_bytes`` again here doubled the baseline and made a
-        # phase-local plan that the scheduler had just admitted fail its own
-        # B_plan re-check.
+        # ZM-EXTERNAL-PHASE-BUDGET rework-1: the external envelope is NET and
+        # INCREMENTAL. Its budget derives from the CURRENT NET ``available``
+        # observation, so the resident baseline is already excluded. The stack
+        # term is the ONE frozen external host peak (persistent result planes +
+        # max(write, reduce+column batch, finalize); spool is DISK-only).
+        # Source-backed preparation builds NO aligned cache, so the generic
+        # ``cache_worker_footprint_bytes`` RAM charge is a GHOST and is exactly
+        # zero for this class. Disk residency stays in ``candidate.disk_bytes``.
+        contract = _r55_external_contract(bundle)
+        frozen_peak = int(contract["host_peak_bytes"])
+        if int(per_cell_footprint) != frozen_peak:
+            raise zsched.ActivePlanRejected(
+                renv.REASON_INTERNAL_ERROR,
+                "external cell task bound does not match the frozen host peak: "
+                f"{int(per_cell_footprint)} != {frozen_peak}",
+                mapping=mapping,
+            )
         envelope_shared = 0
         stack_total = int(rcontract.stack_phase_total_bytes(
             0, units, int(per_cell_footprint)
         ))
-        cache_incremental = max(
-            0, int(cache_per_cell) - int(rcontract.PROCESS_BASELINE_BYTES)
-        )
-        cache_total = int(rcontract.cache_phase_total_bytes(
-            0, units, cache_incremental
-        ))
-        aggregate = int(
-            rcontract.aggregate_phase_bytes(stack_total, cache_total)
-        )
+        cache_total = 0
+        aggregate = int(stack_total)
     else:
         envelope_shared = int(bundle.shared_bytes)
         stack_total = int(rcontract.stack_phase_total_bytes(
@@ -9931,6 +10259,18 @@ def _r55_active_apply(
         "stack_total_bytes": int(stack_total),
         "cache_total_bytes": int(cache_total),
         "aggregate_bytes": int(aggregate),
+        **(
+            {
+                "host_peak_bytes": int(per_cell_footprint),
+                "host_components": dict(
+                    (_r55_external_contract(bundle)).get("host_components") or {}
+                ),
+                "budget_domain": str(
+                    (_r55_external_contract(bundle)).get("budget_domain") or ""
+                ),
+            }
+            if external_class else {}
+        ),
     }
     cpu_fallback_info = {
         "applicable": False,

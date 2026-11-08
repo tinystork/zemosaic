@@ -66,6 +66,9 @@ __all__ = [
     "plan_budget_bytes",
     "admit_budget_bytes",
     "incremental_phase_budget_bytes",
+    "OBSERVATION_DOMAIN_NET_AVAILABLE",
+    "OBSERVATION_DOMAINS",
+    "require_observation_domain",
     "requires_tolerance",
     "require_nonneg_int",
     "validate_envelope",
@@ -228,6 +231,28 @@ def admit_budget_bytes(available_bytes: int) -> int:
     """``B_admit = (9 * available) // 10`` — exact integer arithmetic."""
     a = _require_positive_observation(available_bytes)
     return (ADMIT_FACTOR_NUM * a) // ADMIT_FACTOR_DEN
+
+
+#: Closed observation-domain vocabulary for phase-local budgets. Only a
+#: CURRENT NET `available` observation may feed the incremental contract: the
+#: resident process footprint is already excluded from it.
+OBSERVATION_DOMAIN_NET_AVAILABLE = "net_available"
+OBSERVATION_DOMAINS = (OBSERVATION_DOMAIN_NET_AVAILABLE,)
+
+
+def require_observation_domain(domain, *, name="observation_domain") -> str:
+    """Fail closed unless ``domain`` is a member of the closed vocabulary.
+
+    This makes the net-observation contract EXECUTABLE at the call boundary,
+    not merely a prose/diagnostic claim. A gross/total observation (which still
+    contains the resident baseline) is refused rather than silently treated as
+    net.
+    """
+    if not isinstance(domain, str) or domain not in OBSERVATION_DOMAINS:
+        raise RamContractError(
+            f"{name} must be one of {OBSERVATION_DOMAINS}, got {domain!r}"
+        )
+    return str(domain)
 
 
 def incremental_phase_budget_bytes(

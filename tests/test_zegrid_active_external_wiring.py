@@ -26,6 +26,7 @@ from zemosaic import zemosaic_zegrid_mode as zz
 from zemosaic.core.zegrid import auto_layout as zal
 from zemosaic.core.zegrid import geometry as zg
 from zemosaic.core.zegrid import parallel as zpar
+from zemosaic.core.zegrid import ram_contract as rcontract
 from zemosaic.core.zegrid import resource_envelope as renv
 from zemosaic.core.zegrid import run_resume as zres
 from zemosaic.core.zegrid import scheduler as zsched
@@ -286,7 +287,12 @@ def test_ram_bundle_missing_active_margin_selects_external_same_identity(
     # stack miss the 15 % ACTIVE joint margin while the preliminary bundle
     # (no margin) still fits. The SAME geometry is then priced as external.
     halo = 64
-    layout = (1, 1)
+    # A 3x3 layout keeps the LARGE canvas assembly reserve that makes the RAM
+    # stack miss the ACTIVE margin, while each Cell's truthful persistent
+    # result planes still fit the external phase budget (a 1x1 Cell over the
+    # same 9k canvas would need ~7 GB of persistent outputs and is honestly
+    # refused by the rework-1 host model).
+    layout = (3, 3)
     table = {int(t): 1260 * MIB for t in zz.CPU_STREAMING_TILE_LADDER}
     descs = _wide_corpus()
     ram_bundle = _bundle(
@@ -915,13 +921,17 @@ def test_selector_reports_host_ram_when_minimum_batch_does_not_fit(
         halo_px=8,
         cache_root=str(tmp_path / "cache"),
         storage_profile="bounded",
+        observation_domain=rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     assert decision["refused"] is True
     assert decision["reason"] == "reduction_workspace_floor"
     assert decision["free_bytes"] == 77 * GIB
     assert decision["trials"]
     assert all(
-        t["reason_code"] == "column_batch_floor" for t in decision["trials"]
+        t["reason_code"] in (
+            "column_batch_floor", "external_host_fixed_floor"
+        )
+        for t in decision["trials"]
     )
     assert "HOST-RAM floor" in decision["detail"]
 
@@ -939,6 +949,7 @@ def test_selector_distinguishes_frozen_batch_ram_from_invalid(
         halo_px=8,
         cache_root=str(tmp_path / "cache"),
         storage_profile="bounded",
+        observation_domain=rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     ram = zz._select_external_fallback(
         **kwargs, frozen_tile=16, frozen_batch=10 ** 7

@@ -208,6 +208,7 @@ def test_external_refused_when_disk_envelope_does_not_fit(tmp_path, monkeypatch)
         halo_px=9,
         cache_root=str(tmp_path),
         storage_profile="bounded",
+        observation_domain=zz.rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     assert decision["refused"] is True
     assert decision["reason"] == "disk_envelope_unavailable"
@@ -238,6 +239,7 @@ def test_external_admission_does_not_bill_phantom_aligned_cache(
         halo_px=8,
         cache_root=str(tmp_path),
         storage_profile="bounded",
+        observation_domain=zz.rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     assert decision["refused"] is False, decision
     assert decision["tile"] == 8
@@ -271,6 +273,7 @@ def test_external_admission_does_not_bill_phantom_aligned_cache(
         halo_px=8,
         cache_root=str(tmp_path),
         storage_profile="bounded",
+        observation_domain=zz.rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
     assert short["refused"] is True
     assert short["reason"] == "disk_envelope_unavailable"
