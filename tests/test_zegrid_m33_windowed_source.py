@@ -310,3 +310,186 @@ def test_host_components_positions_bounded_by_interior():
     assert got["batch_fixed_position_bytes"] == int(
         xstream.EXTERNAL_BATCH_FIXED_POSITION_BYTES
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. REWORK-1 (LOW): the degraded (Bayer) branch counts the bytes it read
+# ---------------------------------------------------------------------------
+
+def _write_bayer_corpus(tmp_path, *, shape=(64, 72), n=2, seed=11):
+    rng = np.random.default_rng(seed)
+    descs = []
+    for i in range(n):
+        wcs = _aligned_wcs(shape, sip=False)
+        wcs.wcs.crval = [10.0 + i * 0.00035, 30.0]
+        raw = rng.integers(200, 3000, shape).astype(np.int16)
+        header = wcs.to_header(relax=True)
+        header["BAYERPAT"] = "GRBG"
+        path = Path(tmp_path) / f"b{i}.fit"
+        fits.PrimaryHDU(raw, header=header).writeto(path)
+        descs.append(zg.FrameDescriptor(
+            frame_id=zg.FrameId(path.name), source_path=str(path),
+            shape_hw=shape, wcs_header=header.tostring(),
+            header_sha256="", instrument="",
+        ))
+    canvas = zg.build_canvas(descs)
+    layout = zg.build_layout(canvas, 1, 1)
+    row, col, core = next(iter(layout.iter_cells(canvas)))
+    cell = zg.ZeGridCell(
+        cell_id=zg.cell_id(row, col), canvas_id=canvas.canvas_id,
+        layout_id=layout.layout_id, row=row, col=col, core=core,
+    )
+    patch = zg.build_patch(canvas, cell, halo_px=4)
+    mem = zg.compute_membership(descs, canvas, cell, patch)
+    return descs, canvas, cell, patch, mem
+
+
+def test_degraded_bayer_decode_counts_source_bytes(tmp_path):
+    """A Bayer source cannot be section-decoded: it degrades AND is billed.
+
+    The whole frame is really read, so an I/O audit must never see 0 bytes on
+    the degraded path (Nono LOW, rework-1).
+    """
+    descs, canvas, _cell, patch, mem = _write_bayer_corpus(tmp_path)
+    planned = zz._plan_cell_source_frames(descs, canvas, patch, mem)
+    h, w = patch.patch_shape_hw
+    stats = zz._new_source_window_stats()
+    for frame, plan in planned:
+        full_rgb, full_sup = zz._prepare_cell_source_frame(
+            frame, plan.source_bounds, patch.patch_wcs_header, (h, w)
+        )
+        for window in _windows(h, w):
+            y0, y1, x0, x1 = window
+            rgb, sup = zz._prepare_cell_source_window(
+                frame, plan.source_bounds, patch.patch_wcs_header, (h, w),
+                window, stats=stats,
+            )
+            np.testing.assert_array_equal(
+                np.asarray(rgb, dtype=np.float32),
+                np.asarray(full_rgb[y0:y1, x0:x1], dtype=np.float32),
+            )
+            np.testing.assert_array_equal(np.isnan(rgb), np.isnan(full_rgb[y0:y1, x0:x1]))
+            np.testing.assert_array_equal(sup, full_sup[y0:y1, x0:x1])
+    # Every window had to fall back to the whole-frame decode ...
+    assert stats["full_decode_fallbacks"] == len(planned) * len(_windows(h, w))
+    # ... and that read is counted: one float32 HWC frame per degradation.
+    frame_bytes = int(descs[0].shape_hw[0] * descs[0].shape_hw[1] * 3 * 4)
+    assert stats["source_bytes_decoded"] == stats["full_decode_fallbacks"] * frame_bytes
+    assert stats["source_bytes_decoded"] > 0
+
+
+# ---------------------------------------------------------------------------
+# 7. REWORK-1 (LOW): the hull covers the FULL perimeter under strong SIP
+# ---------------------------------------------------------------------------
+
+def test_source_hull_covers_full_perimeter_under_strong_sip():
+    rng = np.random.default_rng(23)
+    shape = (90, 96)
+    src_wcs = _aligned_wcs(shape, sip=False)
+    a = np.zeros((4, 4))
+    b = np.zeros((4, 4))
+    # Deliberately strong low-order SIP (far beyond typical instrument terms).
+    a[2, 0] = 2.0e-4
+    a[1, 1] = -1.2e-4
+    a[0, 2] = 6.0e-5
+    b[0, 2] = -2.2e-4
+    b[2, 1] = 9.0e-5
+    src_wcs.sip = Sip(a, b, None, None, src_wcs.wcs.crpix)
+    src_wcs.wcs.ctype = ["RA---TAN-SIP", "DEC--TAN-SIP"]
+    src_wcs.array_shape = shape
+    path = Path("/tmp") / f"m33_sip_{rng.integers(1 << 30)}.fits"
+    data = rng.normal(0, 1, shape).astype(np.float32)
+    fits.PrimaryHDU(data, header=src_wcs.to_header(relax=True)).writeto(path)
+    try:
+        frame = zg.FrameDescriptor(
+            frame_id=zg.FrameId(path.name), source_path=str(path),
+            shape_hw=shape, wcs_header=src_wcs.to_header(relax=True).tostring(),
+            header_sha256="", instrument="",
+        )
+        patch_hw = (70, 84)
+        patch_wcs = _aligned_wcs(patch_hw, sip=False)
+        window = (0, patch_hw[0], 0, patch_hw[1])
+        cell_bounds = zg.SourceBounds(0, 0, shape[1], shape[0])
+        from astropy.wcs.utils import pixel_to_pixel
+
+        bounds, uncovered = zz._window_source_bounds(
+            frame, cell_bounds, patch_wcs, window
+        )
+        assert uncovered is False
+        assert bounds is not None
+        # Independent DENSE perimeter sampling: every projected point must be
+        # inside the returned rect (or outside the readable cell).
+        y0, y1, x0, x1 = window
+        xs = np.arange(x0, x1, dtype=float)
+        ys = np.arange(y0, y1, dtype=float)
+        px = np.concatenate([xs, xs, np.full(ys.size, x0), np.full(ys.size, x1 - 1)])
+        py = np.concatenate([np.full(xs.size, y0), np.full(xs.size, y1 - 1), ys, ys])
+        xi, yi = pixel_to_pixel(patch_wcs, frame.wcs(), px, py)
+        finite = np.isfinite(xi) & np.isfinite(yi)
+        in_cell = (
+            finite
+            & (xi >= bounds.x0) & (xi < bounds.x1)
+            & (yi >= bounds.y0) & (yi < bounds.y1)
+        )
+        readable = (
+            finite
+            & (xi >= cell_bounds.x0) & (xi < cell_bounds.x1)
+            & (yi >= cell_bounds.y0) & (yi < cell_bounds.y1)
+        )
+        assert bool(in_cell[readable].all()), (
+            "perimeter samples outside the computed source hull"
+        )
+        # The hull must be a real bound, not the whole frame.
+        assert (
+            (bounds.x1 - bounds.x0) * (bounds.y1 - bounds.y0)
+            < shape[0] * shape[1]
+        )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 8. REWORK-1 (MEDIUM): the cell RECORD publishes requested/effective/clamped
+# ---------------------------------------------------------------------------
+
+def test_cell_record_publishes_column_batch_clamp(tmp_path):
+    """A boundable frozen batch is admitted and recorded, never silently lost."""
+    from zemosaic.core.zegrid.science_adapter import MiniTileScienceConfig
+
+    descs, canvas, cell, patch, mem = _write_corpus(tmp_path, n=3)
+    cfg = MiniTileScienceConfig(
+        normalization="sky_mean", cell_gauge_mode="per_cell",
+    )
+    zz._init_stack_worker(descs, canvas, cfg, None, None, None, 16, 1)
+    h, w = patch.patch_shape_hw
+    interior_px = None
+    external = {
+        "class": zz.WORKING_SET_EXTERNAL,
+        "tile_size": 16,
+        "column_batch": 10 ** 9,
+        "requested_column_batch": 10 ** 9,
+        "effective_column_batch": 768,
+        "column_batch_clamped": True,
+        "spool_root": str(tmp_path / "spool"),
+        "disk_envelope_bytes": 0,
+    }
+    (tmp_path / "spool").mkdir()
+    task = zz._cell_task(
+        cell, patch, mem, tmp_path / "no-cache", "external", 1,
+        "bounded", external_info=external,
+    )
+    got = zz._stack_cell(task)
+    record = got["record"]
+    assert record["mode"] == "external"
+    ext = record["external"]
+    assert ext["requested_column_batch"] == 10 ** 9
+    assert ext["column_batch_clamped"] is True
+    assert ext["effective_column_batch"] == 768
+    assert ext["column_batch"] == 10 ** 9
+    storage = record["storage"]
+    assert storage["external"]["requested_column_batch"] == 10 ** 9
+    assert storage["external"]["column_batch_clamped"] is True
+    assert storage["external"]["effective_column_batch"] == 768
+    # The windowed-source proof counters travel with the same record.
+    assert "source_window" in storage
+    assert storage["source_window"]["window_prepared_count"] > 0

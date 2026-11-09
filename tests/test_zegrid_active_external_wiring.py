@@ -1018,6 +1018,55 @@ def test_builder_normalizes_oversized_frozen_batch_to_interior(
     assert host["batch_total_bytes"] == xstream.external_batch_bytes(
         int(host["n_frames"]), int(host["batch_positions"])
     )
+    # REWORK-1 (Nono MEDIUM): the clamp is VISIBLE on the task/record contract.
+    info = external_tasks[0][7]
+    assert info["requested_column_batch"] == 10 ** 9
+    assert info["column_batch_clamped"] is True
+    assert info["effective_column_batch"] == host["batch_positions"]
+    assert info["column_batch"] == 10 ** 9  # requested value preserved verbatim
+
+
+def test_frozen_batch_clamp_is_recorded_and_admitted(tmp_path, monkeypatch):
+    """REWORK-1: a frozen batch merely larger than the tile stays ADMITTED.
+
+    Tile 128 over a 160 px patch: the honest interior batch (128x128x3) is
+    priced, the clamp is reported (requested vs effective), and no
+    ``frozen_batch_ram``/``frozen_batch_invalid`` refusal is fabricated. Only
+    un-interpretable values (< 1) are refused, never a boundable one.
+    """
+    _free(monkeypatch, 77 * GIB)
+    decision = zz._select_external_fallback(
+        permitted_tiles=(128,),
+        worst_patch_hw=(160, 160),
+        max_n_frames=40,
+        channels=3,
+        budget_bytes=4096 * MIB,
+        halo_px=8,
+        cache_root=str(tmp_path / "cache"),
+        storage_profile="bounded",
+        observation_domain=rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
+        frozen_tile=128,
+        frozen_batch=10 ** 9,
+    )
+    assert decision["refused"] is False
+    assert decision["tile"] == 128
+    assert decision["column_batch"] == 10 ** 9
+    assert decision["requested_column_batch"] == 10 ** 9
+    assert decision["column_batch_clamped"] is True
+    host = decision["host_components"]
+    ih, iw = (int(v) for v in host["interior_hw"])
+    assert decision["effective_column_batch"] == host["batch_positions"]
+    assert 1 <= decision["effective_column_batch"] <= ih * iw * int(host["channels"])
+    # Pricing and host components agree on the same resolved positions.
+    assert (
+        decision["pricing"]["ram"]["batch_positions"]
+        == decision["effective_column_batch"]
+    )
+    assert (
+        decision["pricing"]["ram"]["column_batch_clamped"]
+        is host["column_batch_clamped"]
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------

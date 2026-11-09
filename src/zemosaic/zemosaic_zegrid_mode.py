@@ -1007,48 +1007,139 @@ def _decode_frame_section_hwc(frame_desc, bounds):
 
 
 _WINDOW_BOUNDS_GRID = 9
+#: Hard cap on perimeter samples per window (O(perimeter), never O(area)).
+_WINDOW_PERIMETER_MAX_SAMPLES = 8192
+#: Bounded expansion rounds for the source hull (2 are enough in practice).
+_WINDOW_HULL_EXPANSIONS = 2
+
+
+def _window_sample_points(window) -> np.ndarray:
+    """Pixel-centre samples covering ONE window: interior grid + FULL perimeter.
+
+    The 9x9 grid bounds the interior; the perimeter is sampled at a step chosen
+    so the count stays O(perimeter) and is capped, because a smooth projection's
+    extremes can sit between two grid nodes (Nono LOW). Returns ``(N, 2)`` in
+    patch ``(x, y)`` order.
+    """
+    y0, y1, x0, x1 = (float(v) for v in window)
+    gx = np.linspace(x0, max(x0, x1 - 1), _WINDOW_BOUNDS_GRID)
+    gy = np.linspace(y0, max(y0, y1 - 1), _WINDOW_BOUNDS_GRID)
+    mx, my = np.meshgrid(gx, gy, indexing="xy")
+    w = max(1.0, x1 - x0)
+    h = max(1.0, y1 - y0)
+    step = max(
+        1,
+        int(np.ceil((2.0 * (w + h)) / float(_WINDOW_PERIMETER_MAX_SAMPLES))),
+    )
+    xs = np.arange(x0, x1, dtype=float)[::step]
+    ys = np.arange(y0, y1, dtype=float)[::step]
+    if xs.size == 0:
+        xs = np.array([x0])
+    if ys.size == 0:
+        ys = np.array([y0])
+    px = np.concatenate([
+        xs, xs,
+        np.full(ys.size, x0), np.full(ys.size, max(x0, x1 - 1)),
+    ])
+    py = np.concatenate([
+        np.full(xs.size, y0), np.full(xs.size, max(y0, y1 - 1)),
+        ys, ys,
+    ])
+    return np.vstack([
+        np.stack([mx.ravel(), my.ravel()], axis=1),
+        np.stack([px, py], axis=1),
+    ])
 
 
 def _window_source_bounds(frame_desc, cell_bounds, patch_wcs, window):
     """Conservative source read rect that covers ONE patch sub-window.
 
-    Samples the window's pixel-centre grid through ``patch WCS -> source WCS``
-    (the transform each target pixel uses), takes the outward integer hull plus
-    the interpolation margin, and clips to the cell's planned read rect. Clipping
-    to ``cell_bounds`` guarantees the windowed decoder never reads a source pixel
-    the historical whole-cell path could not have read, so parity is structural
-    rather than assumed. Returns ``None`` when the window cannot be covered.
+    Samples the window's pixel grid AND its full perimeter through
+    ``patch WCS -> source WCS`` (the transform each target pixel uses), then
+    builds an outward integer hull plus the interpolation margin. The hull is
+    expanded in at most ``_WINDOW_HULL_EXPANSIONS`` rounds if any sampled point
+    falls outside it, and the final rect is clipped to the cell's planned read
+    rect. That clip is REQUIRED for parity: the historical whole-cell path could
+    only ever see source pixels inside that same rect.
+
+    Returns ``(bounds, uncovered)``:
+    * ``bounds`` is a :class:`SourceBounds` (the cell rect when the window's
+      preimage lies entirely outside the cell plan, which is parity-safe and
+      never a whole-frame read), or ``None`` when no projection is available;
+    * ``uncovered`` is True only if, after the bounded expansion AND the cell
+      clip, an in-cell sample is still not covered (pathological): the caller
+      then degrades explicitly and counts it.
     """
     y0, y1, x0, x1 = (int(v) for v in window)
     if y1 <= y0 or x1 <= x0:
-        return None
-    gx = np.linspace(x0, max(x0, x1 - 1), _WINDOW_BOUNDS_GRID)
-    gy = np.linspace(y0, max(y0, y1 - 1), _WINDOW_BOUNDS_GRID)
-    mx, my = np.meshgrid(gx, gy, indexing="xy")
+        return None, False
+    pts = _window_sample_points((y0, y1, x0, x1))
     try:
         xi, yi = pixel_to_pixel(
-            patch_wcs, frame_desc.wcs(), mx.ravel(), my.ravel()
+            patch_wcs, frame_desc.wcs(), pts[:, 0], pts[:, 1]
         )
     except Exception:  # noqa: BLE001 - unprojectable window -> degrade
-        return None
-    if not (np.all(np.isfinite(xi)) and np.all(np.isfinite(yi))):
-        return None
+        return None, False
+    finite = np.isfinite(xi) & np.isfinite(yi)
+    if not bool(finite.any()):
+        return None, False
+    xi = np.asarray(xi, dtype=float)[finite]
+    yi = np.asarray(yi, dtype=float)[finite]
+    # Bounded hull expansion: the grid-only hull first, then fold in any
+    # perimeter point it misses (one round usually suffices by monotonicity).
+    n_grid = _WINDOW_BOUNDS_GRID * _WINDOW_BOUNDS_GRID
+    n_grid = min(int(n_grid), int(xi.size))
+    lo_x = float(xi[:n_grid].min())
+    hi_x = float(xi[:n_grid].max())
+    lo_y = float(yi[:n_grid].min())
+    hi_y = float(yi[:n_grid].max())
+    uncovered = False
+    for _round in range(int(_WINDOW_HULL_EXPANSIONS)):
+        outside = (
+            (xi < lo_x) | (xi > hi_x) | (yi < lo_y) | (yi > hi_y)
+        )
+        if not bool(outside.any()):
+            break
+        lo_x = min(lo_x, float(xi[outside].min()))
+        hi_x = max(hi_x, float(xi[outside].max()))
+        lo_y = min(lo_y, float(yi[outside].min()))
+        hi_y = max(hi_y, float(yi[outside].max()))
+    else:
+        # Loop exhausted without converging: check coverage explicitly.
+        uncovered = bool(
+            ((xi < lo_x) | (xi > hi_x) | (yi < lo_y) | (yi > hi_y)).any()
+        )
     margin = int(zg.DEFAULT_SOURCE_MARGIN_PX)
     h, w = (int(v) for v in frame_desc.shape_hw)
-    sx0 = max(int(cell_bounds.x0), int(np.floor(xi.min() - margin)))
-    sy0 = max(int(cell_bounds.y0), int(np.floor(yi.min() - margin)))
-    sx1 = min(int(cell_bounds.x1), int(np.ceil(xi.max() + margin)) + 1)
-    sy1 = min(int(cell_bounds.y1), int(np.ceil(yi.max() + margin)) + 1)
+    sx0 = max(int(cell_bounds.x0), int(np.floor(lo_x - margin)))
+    sy0 = max(int(cell_bounds.y0), int(np.floor(lo_y - margin)))
+    sx1 = min(int(cell_bounds.x1), int(np.ceil(hi_x + margin)) + 1)
+    sy1 = min(int(cell_bounds.y1), int(np.ceil(hi_y + margin)) + 1)
     sx0, sy0 = max(0, sx0), max(0, sy0)
     sx1, sy1 = min(w, sx1), min(h, sy1)
     out = zg.SourceBounds(sx0, sy0, sx1, sy1)
     if out.empty:
-        # The window's preimage fell outside the cell's planned read rect (an
-        # edge/corner tile). Still never fall back to the whole frame: the cell
-        # rect is a valid, smaller bounding read and the reprojection stays
-        # bounded to the window.
-        return cell_bounds
-    return out
+        # The window's preimage lies entirely outside the cell plan (edge /
+        # corner tile). The cell rect is still a valid, smaller bounding read
+        # and the reprojection stays bounded to the window.
+        return cell_bounds, uncovered
+    # Coverage guard on the READABLE samples only (inside the cell plan): the
+    # historical path could not see anything outside it, so those samples need
+    # no coverage. This is the formal check behind the clamp above.
+    in_cell = (
+        (xi >= float(cell_bounds.x0)) & (xi < float(cell_bounds.x1))
+        & (yi >= float(cell_bounds.y0)) & (yi < float(cell_bounds.y1))
+    )
+    if bool(in_cell.any()):
+        uncovered = uncovered or bool(
+            (
+                (xi[in_cell] < float(out.x0))
+                | (xi[in_cell] >= float(out.x1))
+                | (yi[in_cell] < float(out.y0))
+                | (yi[in_cell] >= float(out.y1))
+            ).any()
+        )
+    return out, uncovered
 
 
 def _new_source_window_stats() -> dict:
@@ -1056,6 +1147,7 @@ def _new_source_window_stats() -> dict:
     return {
         "window_prepares": 0,
         "full_decode_fallbacks": 0,
+        "bounds_expand_fallbacks": 0,
         "source_pixels_decoded": 0,
         "source_bytes_decoded": 0,
         "reprojected_pixels": 0,
@@ -1076,9 +1168,12 @@ def _prepare_cell_source_window(
     stats = stats if stats is not None else _new_source_window_stats()
     window = (int(window[0]), int(window[1]), int(window[2]), int(window[3]))
     patch_wcs = WCS(patch_wcs_header)
-    src_bounds = _window_source_bounds(
+    src_bounds, uncovered = _window_source_bounds(
         frame_desc, cell_bounds, patch_wcs, window
     )
+    if uncovered:
+        stats["bounds_expand_fallbacks"] += 1
+        src_bounds = None
     crop_hwc = None
     if src_bounds is not None:
         decoded = _decode_frame_section_hwc(frame_desc, src_bounds)
@@ -1095,7 +1190,12 @@ def _prepare_cell_source_window(
         crop_hwc = hwc[cell_bounds.y0:cell_bounds.y1, cell_bounds.x0:cell_bounds.x1]
         crop_wcs = zxe.slice_wcs(frame_desc.wcs(), cell_bounds)
         stats["full_decode_fallbacks"] += 1
+        # ZM-M33 rework-1 (Nono LOW): the degraded branch really reads the whole
+        # frame; an I/O audit must never see "0 bytes". Count the bytes the
+        # decoder materialised (float32 HWC), same counter as the section path
+        # (which counts the raw FITS section bytes).
         stats["source_pixels_decoded"] += int(crop_hwc.shape[0] * crop_hwc.shape[1])
+        stats["source_bytes_decoded"] += int(np.asarray(hwc).nbytes)
     crop_chw = np.ascontiguousarray(np.moveaxis(crop_hwc, -1, 0))
     rgb, geom = zxe.reproject_cropped(
         crop_chw, crop_wcs, patch_wcs, tuple(patch_hw), window=window
@@ -2833,6 +2933,38 @@ def _run_cell_external(
         if source_context is not None
         else _make_cell_provider(cache_dir, _profile)
     )
+    # ZM-M33 rework-1 (Nono MEDIUM): the interior clamp is RECORDED and WARNed
+    # once per cell (never per tile). It never refuses a batch that is merely
+    # larger than the tile: the executor already bounds it, and a resumed run
+    # may carry such a value. Only un-interpretable values (< 1) are refused,
+    # by ``_select_external_fallback`` (``frozen_batch_invalid``).
+    _batch_truth = None
+    try:
+        _tiles, _max_th, _max_tw = zext._tile_geometry(
+            int(patch.patch.height), int(patch.patch.width),
+            int(tile_size), int(patch.halo_px),
+        )
+        _max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in _tiles)
+        _max_iw = zext._max_interior_width(_tiles)
+        _batch_truth = zext.resolve_column_batch(
+            int(column_batch), interior_hw=(_max_ih, _max_iw),
+            channels=int(getattr(provider, "channels", 3) or 3),
+        )
+    except Exception:  # noqa: BLE001 - telemetry must never fail the cell
+        _batch_truth = None
+    if _batch_truth is not None and _batch_truth["column_batch_clamped"]:
+        _emit(
+            "ZeGrid: column_batch "
+            f"{_batch_truth['requested_column_batch']} exceeds the interior "
+            f"tile surface; executing with "
+            f"{_batch_truth['effective_column_batch']} positions "
+            f"(rows={_batch_truth['rows_per_batch']}, "
+            f"cols={_batch_truth['cols_per_batch']}). This is a configuration "
+            "signal, not a science change; the batch is clamped to the real "
+            "tile, never refused.",
+            lvl="WARN",
+            callback=progress_callback,
+        )
     sink = None
     try:
         request = zstream.build_streaming_request(config, provider.n_frames)
@@ -2884,6 +3016,19 @@ def _run_cell_external(
                 "external": {
                     "tile_size": int(tile_size),
                     "column_batch": int(column_batch),
+                    # ZM-M33 rework-1: the clamp is visible at execution time.
+                    "requested_column_batch": int(
+                        _batch_truth["requested_column_batch"]
+                        if _batch_truth is not None else column_batch
+                    ),
+                    "effective_column_batch": int(
+                        _batch_truth["effective_column_batch"]
+                        if _batch_truth is not None else column_batch
+                    ),
+                    "column_batch_clamped": bool(
+                        _batch_truth["column_batch_clamped"]
+                        if _batch_truth is not None else False
+                    ),
                     "spool_root": str(spool_root),
                     "rejection_mask_available": (
                         result.rejection_mask is not None
@@ -4991,6 +5136,24 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         record["external"] = {
             "tile_size": int((external_info or {}).get("tile_size")),
             "column_batch": int((external_info or {}).get("column_batch")),
+            # ZM-M33 rework-1: requested vs effective batch, and whether the
+            # interior surface actually clamped it (additive; never a refusal
+            # for a value merely larger than the tile).
+            "requested_column_batch": int(
+                (external_info or {}).get(
+                    "requested_column_batch",
+                    (external_info or {}).get("column_batch", 0),
+                )
+            ),
+            "effective_column_batch": int(
+                (external_info or {}).get(
+                    "effective_column_batch",
+                    (external_info or {}).get("column_batch", 0),
+                )
+            ),
+            "column_batch_clamped": bool(
+                (external_info or {}).get("column_batch_clamped", False)
+            ),
             "spool_root": str((external_info or {}).get("spool_root")),
         }
     # Additive, request-only: honest intra-cell prefetch ledger. Absent on the
@@ -6462,6 +6625,9 @@ def _select_external_fallback(
         entry = {
             "tile": int(tile),
             "column_batch": int(batch),
+            "requested_column_batch": int(host["requested_column_batch"]),
+            "effective_column_batch": int(host["effective_column_batch"]),
+            "column_batch_clamped": bool(host["column_batch_clamped"]),
             "fits": bool(fits),
             "disk_envelope_bytes": int(envelope),
             "spool_peak_bytes": int(
@@ -6480,6 +6646,10 @@ def _select_external_fallback(
                 "refused": False,
                 "tile": int(tile),
                 "column_batch": int(batch),
+                # ZM-M33 rework-1: the clamp is VISIBLE (requested vs effective).
+                "requested_column_batch": int(host["requested_column_batch"]),
+                "effective_column_batch": int(host["effective_column_batch"]),
+                "column_batch_clamped": bool(host["column_batch_clamped"]),
                 "spool_root": str(spool_root),
                 "pricing": pricing,
                 "budget_domain": str(budget_domain),
@@ -7498,6 +7668,16 @@ def _build_execution_bundle(
                 "class": WORKING_SET_EXTERNAL,
                 "tile_size": int(chosen_tile),
                 "column_batch": int(external_selection["column_batch"]),
+                # ZM-M33 rework-1: recorded (not silently normalized) clamp.
+                "requested_column_batch": int(
+                    external_selection["requested_column_batch"]
+                ),
+                "effective_column_batch": int(
+                    external_selection["effective_column_batch"]
+                ),
+                "column_batch_clamped": bool(
+                    external_selection["column_batch_clamped"]
+                ),
                 "spool_root": str(external_selection["spool_root"]),
                 "disk_envelope_bytes": int(
                     external_selection["disk_envelope_bytes"]

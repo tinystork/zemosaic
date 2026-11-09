@@ -1137,6 +1137,39 @@ def batch_positions_for(
     return 1, cols
 
 
+def resolve_column_batch(
+    column_batch: int, *, interior_hw: tuple[int, int], channels: int,
+) -> dict:
+    """Resolve a requested column batch against the REAL interior surface.
+
+    Single source of truth for the batch clamp: the host model, the pricing
+    function and the published cell record all read this. ``< 1`` is rejected
+    (``ExternalBudgetError``); a value merely LARGER than the tile interior is
+    normalized, never refused (a resumed run may carry one that never had an
+    effect). ``clamped`` is True only when the interior bound actually reduced
+    the batch; ordinary row/pixel quantization is not a clamp.
+    """
+    req = _require_int(column_batch, "column_batch", minimum=1)
+    ih = _require_int(interior_hw[0], "interior_height", minimum=1)
+    iw = _require_int(interior_hw[1], "interior_width", minimum=1)
+    c = _require_int(channels, "channels", minimum=1)
+    rows, cols = batch_positions_for(req, iw, c)
+    rows_eff = min(int(rows), ih)
+    cols_eff = min(int(cols), iw)
+    positions = int(rows_eff * cols_eff * c)
+    return {
+        "requested_column_batch": int(req),
+        # ``effective_column_batch`` is expressed in POSITIONS (the same unit a
+        # caller passes as ``column_batch``), i.e. the real interior surface.
+        "effective_column_batch": positions,
+        "rows_per_batch": int(rows_eff),
+        "cols_per_batch": int(cols_eff),
+        "batch_positions": positions,
+        "unclamped_batch_positions": int(rows * cols * c),
+        "column_batch_clamped": bool(rows_eff != rows or cols_eff != cols),
+    }
+
+
 def external_batch_live_bytes_per_position_frame(
     rejection: str = "winsorized_sigma_clip", combine: str = "mean"
 ) -> int:
@@ -1250,15 +1283,14 @@ def external_cell_host_components(
         + interior_px * RESULT_SUPPORT_BYTES_PER_PIXEL
     )
 
-    rows, cols = batch_positions_for(req, iw, c)
     # ZM-M33 lot 1: a batch can never hold more positions than the interior
-    # tile actually has. ``batch_positions_for`` sizes rows from the request
-    # alone, so a very large ``column_batch`` could price (and later appear to
-    # allocate) several times the tile surface. Bound BOTH dimensions by the
-    # real interior geometry before pricing the batch.
-    rows = min(int(rows), ih)
-    cols = min(int(cols), iw)
-    positions = rows * cols * c
+    # tile actually has (``batch_positions_for`` sizes rows from the request
+    # alone). The clamp is RECORDED, not silent: the caller publishes
+    # requested/effective/clamped in the cell record.
+    resolved = resolve_column_batch(req, interior_hw=(ih, iw), channels=c)
+    rows = resolved["rows_per_batch"]
+    cols = resolved["cols_per_batch"]
+    positions = resolved["batch_positions"]
     batch = external_batch_bytes(n, positions)
 
     first_write = persistent + provider_window + write_tile
@@ -1277,6 +1309,9 @@ def external_cell_host_components(
         "interior_hw": [int(ih), int(iw)],
         "channels": int(c),
         "column_batch": int(req),
+        "requested_column_batch": int(resolved["requested_column_batch"]),
+        "effective_column_batch": int(resolved["batch_positions"]),
+        "column_batch_clamped": bool(resolved["column_batch_clamped"]),
         "rows_per_batch": int(rows),
         "cols_per_batch": int(cols),
         "batch_positions": int(positions),
@@ -1359,13 +1394,13 @@ def estimate_external_working_set(
 
     max_iw = _max_interior_width(tiles)
     max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in tiles)
-    rows, cols = batch_positions_for(req, max_iw, c)
-    # ZM-M33 lot 1: a batch never exceeds the real interior surface (same bound
-    # as ``external_cell_host_components``). Pricing and host components read
-    # the SAME positions so the published telemetry cannot disagree.
-    rows = min(int(rows), int(max_ih))
-    cols = min(int(cols), int(max_iw))
-    positions = rows * cols * c
+    # ZM-M33 lot 1: a batch never exceeds the real interior surface. Pricing
+    # and host components read the SAME resolved positions so the published
+    # telemetry cannot disagree.
+    resolved = resolve_column_batch(req, interior_hw=(max_ih, max_iw), channels=c)
+    rows = resolved["rows_per_batch"]
+    cols = resolved["cols_per_batch"]
+    positions = resolved["batch_positions"]
     reduction_bytes = external_batch_bytes(n, positions)
 
     # Inherent O(tile_area) planes: per-tile outputs + support, plus the
@@ -1402,6 +1437,9 @@ def estimate_external_working_set(
         "ram": {
             "reduction_workspace_bytes": int(reduction_bytes),
             "column_batch": int(req),
+            "requested_column_batch": int(resolved["requested_column_batch"]),
+            "effective_column_batch": int(resolved["batch_positions"]),
+            "column_batch_clamped": bool(resolved["column_batch_clamped"]),
             "rows_per_batch": int(rows),
             "cols_per_batch": int(cols),
             "batch_positions": int(positions),
