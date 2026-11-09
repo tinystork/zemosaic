@@ -377,6 +377,27 @@ _GAUGE_TILED_REFERENCE_DEFAULT = True
 # Canvas edge of ONE reference tile (R32b tiled reference).
 _GAUGE_REF_TILE_PX = 1024
 
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-R32C-GAUGE-FOOTPRINT — ONE memory model for the gauge phase
+# ---------------------------------------------------------------------------
+#
+# The per-worker gauge bound must be derived from the path that ACTUALLY runs,
+# not from the historical R17 full-canvas convention. R32c runs with bounded
+# pairs (each frame reprojected on ITS OWN footprint bbox) and a tiled reference
+# (one 1024-px tile transient at a time, clipped to the canvas). The canvas
+# convention therefore over-charged the gauge by the canvas/bbox ratio and made
+# the ACTIVE external admission refuse a run whose real gauge worker fits.
+#
+# This is the SINGLE source of truth: PLAN, ACTIVE (GPU + CPU, RAM + external)
+# and RUN all consume the frozen descriptor produced by
+# :func:`gauge_memory_model`. The formula/coefficient stays the frozen R16-M1
+# one (``parallel.gauge_footprint_bytes``: import baseline + area x 36 B/px);
+# only the AREA it is applied to changes, and a strict override (bounded/tiled
+# disabled) returns the historical full-canvas bound.
+_GAUGE_MEMORY_MODEL_SCHEMA = "zemosaic-zegrid-gauge-memory-model-v1"
+_GAUGE_MEMORY_MODE_R32C = "r32c_bounded_tiled"
+_GAUGE_MEMORY_MODE_CANVAS = "canvas_strict"
+
 
 def _resolve_switch(value: bool | None, default: bool) -> bool:
     """Resolve an internal lever switch (``None`` -> module default)."""
@@ -416,6 +437,415 @@ def _bbox_area(bbox) -> int:
     """Pixel area of a canvas bbox ``(y0, y1, x0, x1)``."""
     y0, y1, x0, x1 = bbox
     return max(0, int(y1) - int(y0)) * max(0, int(x1) - int(x0))
+
+
+# Conservative per-area coefficients for the gauge worker peaks. Every number
+# is a source-derived BYTE cost, not a measured RSS and not an empirical fit.
+# The sub-phase bound sums the buffers that are SIMULTANEOUSLY LIVE inside that
+# sub-phase, then takes the MAX across the sequential sub-phases.
+_GAUGE_SOURCE_DECODE_BYTES_PER_PX = 24      # decoder HWC f32 + owned CHW f32 copy
+_GAUGE_REPROJECT_SRC_F64_BYTES_PER_PX = 24  # ascontiguousarray(CHW, f64)
+_GAUGE_REPROJECT_WORK_BYTES_PER_PX = 96     # coords/clip/reset + scipy out + footprint + geom
+_GAUGE_COUNTS_PREPARE_BYTES_PER_PX = 40     # rgb+geom input + owned NHWC copy/mask/finite
+_GAUGE_PAIRS_PREPARE_BYTES_PER_PX = 80      # two frames: r_crop+rgb+masks+owned NHWC copy
+_GAUGE_CANON_PERMANENT_BYTES_PER_PX = 52    # caller frames + owned batch (images/mask)
+_GAUGE_CANON_COPY_BYTES_PER_PX = 74         # images copy + mask copy + ref64 + src64
+_GAUGE_CANON_COMMON_BYTES_PER_PX = 2        # common mask + expression temporary
+_GAUGE_CANON_SKYMEAN_STATS_BYTES_PER_PX = 32  # ref[common]/src[common] + sigma-clip workspace
+_GAUGE_CANON_LINFIT_TEMPS_BYTES_PER_PX = 76   # x/y/mask/resid/mad/keep/new_mask/_ols
+_GAUGE_CANON_TRANSFORM_BYTES_PER_PX = 36      # transformed f64 + transformed32 f32
+_GAUGE_WEIGHT_PERMANENT_BYTES_PER_PX = 78     # post-normalize batch + caller frames
+_GAUGE_WEIGHT_LUM_BYTES_PER_PX = 32           # r/g/b f64 planes + luminance f64
+_GAUGE_WEIGHT_NOISE_STATS_BYTES_PER_PX = 24   # valid_lum + sigma-clipped workspace
+_GAUGE_WEIGHT_FWHM_EXTRA_BYTES_PER_PX = 40    # plane/mask/segmentation/catalog workspace
+_GAUGE_REFERENCE_TILE_WORK_BYTES_PER_PX = 96  # same reproject work, tile-sized
+
+
+def _gauge_canonical_coeffs(normalization: str | None) -> tuple[int, int]:
+    """``(sky_mean, linear_fit)`` canonical-batch coefficients (B/px)."""
+    base = (
+        _GAUGE_CANON_PERMANENT_BYTES_PER_PX
+        + _GAUGE_CANON_COPY_BYTES_PER_PX
+    )
+    sky = (
+        base
+        + _GAUGE_CANON_COMMON_BYTES_PER_PX
+        + _GAUGE_CANON_SKYMEAN_STATS_BYTES_PER_PX
+        + _GAUGE_CANON_TRANSFORM_BYTES_PER_PX
+    )
+    linear = (
+        base
+        + _GAUGE_CANON_COMMON_BYTES_PER_PX
+        + _GAUGE_CANON_LINFIT_TEMPS_BYTES_PER_PX
+        + _GAUGE_CANON_TRANSFORM_BYTES_PER_PX
+    )
+    none = base  # method "none" skips common/stats/transform and src64
+    token = str(normalization or "").strip().lower()
+    if token == "none":
+        return none, none
+    if token == "linear_fit":
+        return sky, linear
+    # Unknown/unspecified: return both, and the caller uses the conservative MAX
+    # of the requested-method peak and the worst declared method.
+    return sky, linear
+
+
+def _gauge_canonical_coeff(normalization: str | None) -> int:
+    sky, linear = _gauge_canonical_coeffs(normalization)
+    token = str(normalization or "").strip().lower()
+    if token == "sky_mean":
+        return sky
+    if token == "linear_fit":
+        return linear
+    if token == "none":
+        return sky  # both equal base
+    return max(sky, linear)
+
+
+def _gauge_weight_coeff(weighting: str | None) -> int:
+    base = (
+        _GAUGE_WEIGHT_PERMANENT_BYTES_PER_PX
+        + _GAUGE_WEIGHT_LUM_BYTES_PER_PX
+        + _GAUGE_WEIGHT_NOISE_STATS_BYTES_PER_PX
+    )
+    token = str(weighting or "").strip().lower()
+    if token == "none":
+        return _GAUGE_WEIGHT_PERMANENT_BYTES_PER_PX
+    if token == "noise_fwhm":
+        return base + _GAUGE_WEIGHT_FWHM_EXTRA_BYTES_PER_PX
+    if token == "noise_variance":
+        return base
+    return base + _GAUGE_WEIGHT_FWHM_EXTRA_BYTES_PER_PX
+
+
+def _gauge_phase_peaks(
+    *,
+    source_px: int,
+    bbox_px: int,
+    tile_px: int,
+    normalization: str | None,
+    weighting: str | None,
+    strict: bool,
+) -> dict:
+    """Per-sub-phase ADDED bytes (excluding the process baseline).
+
+    Strict overrides use canvas-equivalent areas because the union bbox can
+    approach the canvas and the reference is a full-canvas resident plane.
+    """
+    s = max(0, int(source_px))
+    a = max(0, int(bbox_px))
+    t = max(0, int(tile_px))
+    canon = _gauge_canonical_coeff(normalization)
+    weight = _gauge_weight_coeff(weighting)
+    decode = _GAUGE_SOURCE_DECODE_BYTES_PER_PX * s
+    # During reprojection the decoded CHW source (12 B/px) and the owned
+    # float64 `src` copy (24 B/px) are BOTH live, plus the output workspace.
+    reproject = (
+        12 * s
+        + _GAUGE_REPROJECT_SRC_F64_BYTES_PER_PX * s
+        + _GAUGE_REPROJECT_WORK_BYTES_PER_PX * a
+    )
+    counts_prepare = (
+        12 * s + _GAUGE_COUNTS_PREPARE_BYTES_PER_PX * a
+    )
+    pairs_prepare = (
+        12 * s + _GAUGE_PAIRS_PREPARE_BYTES_PER_PX * a
+    )
+    normalize = 12 * s + canon * a
+    weight_peak = 12 * s + weight * a
+    reference = (
+        (_GAUGE_SOURCE_DECODE_BYTES_PER_PX + _GAUGE_REPROJECT_SRC_F64_BYTES_PER_PX)
+        * s
+        + _GAUGE_REFERENCE_TILE_WORK_BYTES_PER_PX * t
+    )
+    peaks = {
+        "decode": int(decode),
+        "counts_reproject": int(reproject),
+        "counts_prepare": int(counts_prepare),
+        "reference_tile": int(reference),
+        "pairs_reproject": int(reproject),
+        "pairs_prepare": int(pairs_prepare),
+        "pairs_normalize": int(normalize),
+        "pairs_weight": int(weight_peak),
+    }
+    if strict:
+        # Full-canvas resident reference/union path: same canonical peak with
+        # the canvas as the area, plus the reference plane construction.
+        peaks["reference_full"] = int(
+            (_GAUGE_SOURCE_DECODE_BYTES_PER_PX
+             + _GAUGE_REPROJECT_SRC_F64_BYTES_PER_PX) * s
+            + (_GAUGE_REPROJECT_WORK_BYTES_PER_PX + 13) * a
+        )
+    return peaks
+
+
+def gauge_memory_model(
+    canvas=None,
+    frames=None,
+    *,
+    canvas_px: int | None = None,
+    polygons=None,
+    max_bbox_px: int | None = None,
+    max_frame_px: int | None = None,
+    bounded_pairs: bool | None = None,
+    tiled_reference: bool | None = None,
+    tile_px: int | None = None,
+    normalization: str | None = None,
+    weighting: str | None = None,
+) -> dict:
+    """ONE conservative per-worker gauge bound for the path that ACTUALLY runs.
+
+    ``footprint_bytes = process_baseline + max(phase_peaks[*].added_bytes)``.
+    Each phase peak SUMS every buffer simultaneously live in that sub-phase
+    (decoded source, reproject float64 source/coordinate/output workspace,
+    canonical NHWC copy, normalization workspace, weighting workspace, tiled
+    reference transient). Sequential sub-phases are never summed: the MAX is
+    taken across them.
+
+    ``normalization``/``weighting`` select the canonical/weighting coefficients.
+    ``None`` means "worst declared method" (linear_fit + noise_fwhm), so an
+    unspecified caller can never under-budget a run.
+
+    STRICT OVERRIDE (either R32c switch disabled, unknown bbox, empty canvas):
+    the same sub-phase model is used with the canvas as BOTH the bbox and tile
+    area, because the union bbox can approach the canvas and the reference is a
+    full-canvas resident plane. This is MORE conservative than the historical
+    ``baseline + canvas*36`` and is returned with ``mode='canvas_strict'``.
+    """
+    if canvas is not None:
+        cpx = int(canvas.width) * int(canvas.height)
+    else:
+        cpx = max(0, int(canvas_px or 0))
+    bounded = _resolve_switch(bounded_pairs, _GAUGE_BOUNDED_PAIRS_DEFAULT)
+    tiled = _resolve_switch(tiled_reference, _GAUGE_TILED_REFERENCE_DEFAULT)
+    tile = max(1, int(tile_px or _GAUGE_REF_TILE_PX))
+
+    if frames is not None:
+        if polygons is not None:
+            if len(polygons) != len(frames):
+                raise ValueError(
+                    "gauge_memory_model: polygons length "
+                    f"{len(polygons)} != frames length {len(frames)}; the "
+                    "footprint artifact and descriptor cannot be associated"
+                )
+            # ProjectedFootprints.frames and .polygons are aligned BY CONTRACT;
+            # never reorder one side independently.
+            ordered = list(frames)
+        else:
+            ordered = sorted(frames, key=lambda f: f.frame_id)
+        if polygons is None:
+            bboxes = [_footprint_bbox(f, canvas) for f in ordered]
+        else:
+            bboxes = [
+                _footprint_bbox_from_polygon(poly, canvas)
+                for poly in polygons
+            ]
+        if max_bbox_px is None:
+            max_bbox_px = max((_bbox_area(b) for b in bboxes), default=0)
+        if max_frame_px is None:
+            max_frame_px = max(
+                (
+                    int(f.shape_hw[0]) * int(f.shape_hw[1])
+                    for f in ordered
+                ),
+                default=0,
+            )
+    elif polygons is not None and max_bbox_px is None and canvas is not None:
+        max_bbox_px = max(
+            (
+                _bbox_area(_footprint_bbox_from_polygon(poly, canvas))
+                for poly in polygons
+            ),
+            default=0,
+        )
+
+    # Explicit zero-accounting override (tests/benchmarks monkeypatch
+    # ``parallel.gauge_footprint_bytes`` to 0 to neutralize the gauge phase).
+    # Production never hits this: the real function returns the baseline at 0 px.
+    if int(zpar.gauge_footprint_bytes(0)) <= 0:
+        return {
+            "schema": _GAUGE_MEMORY_MODEL_SCHEMA,
+            "mode": (
+                _GAUGE_MEMORY_MODE_R32C
+                if (bounded and tiled and max_bbox_px is not None and cpx > 0)
+                else _GAUGE_MEMORY_MODE_CANVAS
+            ),
+            "bounded_pairs": bool(bounded),
+            "tiled_reference": bool(tiled),
+            "tile_px": int(tile) if tiled else None,
+            "canvas_px": int(cpx),
+            "max_bbox_px": None if max_bbox_px is None else int(max_bbox_px),
+            "max_frame_px": None if max_frame_px is None else int(max_frame_px),
+            "dominant_area_px": 0,
+            "phase_peaks": {},
+            "peak_phase": None,
+            "subphase_added_bytes": 0,
+            "footprint_bytes": 0,
+            "strict_reason": None,
+            "zero_accounting": True,
+            "normalization": normalization,
+            "weighting": weighting,
+            "components": {
+                "process_baseline_bytes": 0,
+                "peak_added_bytes": 0,
+            },
+        }
+
+    strict_reason = None
+    if not bounded:
+        strict_reason = "bounded_pairs disabled"
+    elif not tiled:
+        strict_reason = "tiled_reference disabled"
+    elif max_bbox_px is None:
+        strict_reason = "bbox area unknown"
+    elif cpx <= 0:
+        strict_reason = "empty canvas"
+
+    if strict_reason is not None:
+        peaks = _gauge_phase_peaks(
+            source_px=max(0, int(max_frame_px or 0)),
+            bbox_px=int(cpx),
+            tile_px=int(cpx),
+            normalization=normalization,
+            weighting=weighting,
+            strict=True,
+        )
+        peak_phase = max(peaks, key=lambda name: peaks[name])
+        peak_added = int(peaks[peak_phase])
+        baseline = int(zpar._PER_WORKER_BASELINE_BYTES)
+        return {
+            "schema": _GAUGE_MEMORY_MODEL_SCHEMA,
+            "mode": _GAUGE_MEMORY_MODE_CANVAS,
+            "bounded_pairs": bool(bounded),
+            "tiled_reference": bool(tiled),
+            "tile_px": int(tile) if tiled else None,
+            "canvas_px": int(cpx),
+            "max_bbox_px": None if max_bbox_px is None else int(max_bbox_px),
+            "max_frame_px": None if max_frame_px is None else int(max_frame_px),
+            "dominant_area_px": int(cpx),
+            "phase_peaks": {
+                name: {"added_bytes": int(value), "area_px": int(cpx)}
+                for name, value in peaks.items()
+            },
+            "peak_phase": str(peak_phase),
+            "subphase_added_bytes": peak_added,
+            "footprint_bytes": baseline + peak_added,
+            "strict_reason": strict_reason,
+            "zero_accounting": False,
+            "normalization": normalization,
+            "weighting": weighting,
+            "components": {
+                "process_baseline_bytes": baseline,
+                "peak_added_bytes": peak_added,
+            },
+        }
+
+    max_bbox = max(0, int(max_bbox_px))
+    max_frame = max(0, int(max_frame_px or 0))
+    tile_area = min(int(tile) * int(tile), int(cpx))
+    dominant = max(max_bbox, max_frame, tile_area)
+    peaks = _gauge_phase_peaks(
+        source_px=max_frame,
+        bbox_px=max_bbox,
+        tile_px=tile_area,
+        normalization=normalization,
+        weighting=weighting,
+        strict=False,
+    )
+    peak_phase = max(peaks, key=lambda name: peaks[name])
+    peak_added = int(peaks[peak_phase])
+    baseline = int(zpar._PER_WORKER_BASELINE_BYTES)
+    return {
+        "schema": _GAUGE_MEMORY_MODEL_SCHEMA,
+        "mode": _GAUGE_MEMORY_MODE_R32C,
+        "bounded_pairs": True,
+        "tiled_reference": True,
+        "tile_px": int(tile),
+        "canvas_px": int(cpx),
+        "max_bbox_px": int(max_bbox),
+        "max_frame_px": int(max_frame),
+        "reference_tile_area_px": int(tile_area),
+        "dominant_area_px": int(dominant),
+        "phase_peaks": {
+            name: {
+                "added_bytes": int(value),
+                "source_px": int(max_frame),
+                "bbox_px": int(max_bbox),
+                "tile_px": int(tile_area),
+            }
+            for name, value in peaks.items()
+        },
+        "peak_phase": str(peak_phase),
+        "subphase_added_bytes": peak_added,
+        "footprint_bytes": baseline + peak_added,
+        "strict_reason": None,
+        "zero_accounting": False,
+        "normalization": normalization,
+        "weighting": weighting,
+        "components": {
+            "process_baseline_bytes": baseline,
+            "peak_added_bytes": peak_added,
+        },
+    }
+
+
+def gauge_model_matches(
+    model,
+    canvas,
+    *,
+    frames=None,
+    polygons=None,
+    max_bbox_px: int | None = None,
+    normalization: str | None = None,
+    weighting: str | None = None,
+) -> bool:
+    """Validate a transported descriptor against the CURRENT canvas/corpus.
+
+    ZM-ZEGRID-R32C-GAUGE-FOOTPRINT L1: never reuse a descriptor from another
+    canvas/corpus/footprint artifact. Returns False (caller recomputes
+    conservatively) on any mismatch; it never projects WCS.
+    """
+    if not isinstance(model, dict):
+        return False
+    try:
+        cpx = int(canvas.width) * int(canvas.height)
+    except Exception:
+        return False
+    if int(model.get("canvas_px", -1)) != cpx:
+        return False
+    if frames is not None:
+        try:
+            max_frame = max(
+                (int(f.shape_hw[0]) * int(f.shape_hw[1]) for f in frames),
+                default=0,
+            )
+        except Exception:
+            return False
+        if int(model.get("max_frame_px", -1)) != max_frame:
+            return False
+    if polygons is not None:
+        try:
+            derived_bbox = max(
+                (
+                    _bbox_area(_footprint_bbox_from_polygon(poly, canvas))
+                    for poly in polygons
+                ),
+                default=0,
+            )
+        except Exception:
+            return False
+        if int(model.get("max_bbox_px", -1)) != derived_bbox:
+            return False
+    elif max_bbox_px is not None:
+        if int(model.get("max_bbox_px", -1)) != int(max_bbox_px):
+            return False
+    if normalization is not None:
+        if str(model.get("normalization")) != str(normalization):
+            return False
+    if weighting is not None:
+        if str(model.get("weighting")) != str(weighting):
+            return False
+    return True
 
 
 def _bbox_intersection_area(b1, b2) -> int:
@@ -570,9 +1000,13 @@ def _cleanup_gauge_reference(ref_dir: str | None) -> None:
         pass
 
 
-def _footprint_bbox(f, canvas) -> tuple:
-    """Canvas bbox ``(y0, y1, x0, x1)`` bounding a frame's footprint + margin."""
-    poly = zg._source_polygon(f.shape_hw, f.wcs(), canvas.wcs())
+def _footprint_bbox_from_polygon(poly, canvas) -> tuple:
+    """Canvas bbox ``(y0, y1, x0, x1)`` around an ALREADY projected polygon.
+
+    Byte-identical to :func:`_footprint_bbox` (same margin/clipping) but never
+    re-projects the frame; this is what lets the gauge memory model reuse the
+    layout's ONE exact footprint projection.
+    """
     minx, miny, maxx, maxy = poly.bounds
     m = _FOOTPRINT_MARGIN_PX
     x0 = max(0, int(np.floor(minx)) - m)
@@ -580,6 +1014,12 @@ def _footprint_bbox(f, canvas) -> tuple:
     x1 = min(canvas.width, int(np.ceil(maxx)) + m + 1)
     y1 = min(canvas.height, int(np.ceil(maxy)) + m + 1)
     return (y0, y1, x0, x1)
+
+
+def _footprint_bbox(f, canvas) -> tuple:
+    """Canvas bbox ``(y0, y1, x0, x1)`` bounding a frame's footprint + margin."""
+    poly = zg._source_polygon(f.shape_hw, f.wcs(), canvas.wcs())
+    return _footprint_bbox_from_polygon(poly, canvas)
 
 
 def _bbox_wcs_header(canvas, bbox) -> str:
@@ -810,6 +1250,17 @@ def compute_global_gauge(
 
     # --- per-frame valid counts over each frame's own footprint bbox (bounded) ---
     bboxes = [_footprint_bbox(f, canvas) for f in ordered]
+    # ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: the SAME descriptor the planner froze, so
+    # the executed path and the audited bound cannot drift (the switches are the
+    # RESOLVED ones, not a second copy of the defaults).
+    _gauge_memory_model = gauge_memory_model(
+        canvas,
+        ordered,
+        bounded_pairs=_bounded,
+        tiled_reference=_tiled_ref,
+        normalization=getattr(config, "normalization", None),
+        weighting=getattr(config, "weighting", None),
+    )
     count_tasks = [
         (
             decode_fn,
@@ -1079,6 +1530,7 @@ def compute_global_gauge(
 
     if diagnostics is not None:
         diagnostics["workers"] = int(workers)
+        diagnostics["memory_model"] = dict(_gauge_memory_model)
         diagnostics["parent_daemon"] = bool(zpar._parent_is_daemonic())
         diagnostics["executor"] = pairs_meta.get("executor")
         diagnostics["fallback"] = bool(

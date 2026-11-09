@@ -2094,6 +2094,11 @@ def _choose_layout_mode_aware(
     observer=None,
     footprints_out=None,
     footprints_in=None,
+    gauge_model_out=None,
+    gauge_model_in=None,
+    attempt_state=None,
+    normalization="sky_mean",
+    weighting="noise_variance",
     min_refinement_rank=None,
     max_refinement_rank=None,
     allow_external=False,
@@ -2218,6 +2223,40 @@ def _choose_layout_mode_aware(
         # the final chosen-cell memberships (never placed in the returned dict).
         footprints_out.append(footprints)
 
+    # ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: the layout joint probe must price the SAME
+    # gauge path ACTIVE/RUN will execute. The descriptor is produced ONCE from the
+    # exact R28 footprint artifact (already projected polygons) and transported
+    # to the bundle through the private ``gauge_model_out`` channel. A later
+    # refinement/replan call that already owns it passes it back as
+    # ``gauge_model_in`` and is reused verbatim -- never recomputed from ``descs``.
+    if gauge_model_in is not None and zphot.gauge_model_matches(
+        gauge_model_in,
+        canvas,
+        frames=footprints.frames,
+        polygons=footprints.polygons,
+        normalization=normalization,
+        weighting=weighting,
+    ):
+        _gauge_memory_model = gauge_model_in
+    else:
+        # A foreign / stale descriptor is NEVER reused. Recompute from the
+        # CURRENT artifact (polygons are already projected; no WCS pass).
+        _gauge_memory_model = zphot.gauge_memory_model(
+            canvas,
+            footprints.frames,
+            polygons=footprints.polygons,
+            normalization=normalization,
+            weighting=weighting,
+        )
+        if gauge_model_out is not None:
+            gauge_model_out.append(_gauge_memory_model)
+    # Publish the attempt artifacts BEFORE any budget/geometry refusal can abort
+    # this layout (the dense->bounded retry needs them even when this call raises).
+    if attempt_state is not None:
+        attempt_state["footprints"] = footprints
+        attempt_state["gauge_memory_model"] = dict(_gauge_memory_model)
+    _gauge_memory_fp = int(_gauge_memory_model["footprint_bytes"])
+
     if pinned_layout is not None:
         nx, ny = int(pinned_layout[0]), int(pinned_layout[1])
         if not (1 <= nx <= canvas.width and 1 <= ny <= canvas.height):
@@ -2319,6 +2358,7 @@ def _choose_layout_mode_aware(
                     },
                     refinement_rank=int(nx) * int(ny),
                     pinned=True,
+                    gauge_footprint_bytes=int(_gauge_memory_fp),
                 )
                 if not _pinned_joint["ok"]:
                     _jmsg = (
@@ -2504,6 +2544,7 @@ def _choose_layout_mode_aware(
                 },
                 refinement_rank=int(nx) * int(ny),
                 pinned=False,
+                gauge_footprint_bytes=int(_gauge_memory_fp),
             )
             admissible = bool(joint_probe["ok"])
         bound_mib = worst["cheaper_bound_bytes"] / 2**20
@@ -3760,6 +3801,7 @@ def _plan_bundle_auto(
     emit=None,
     restored_geometry=None,
     frozen_admission=None,
+    gauge_memory_model=None,
 ):
     """Build the initial bundle; in AUTO ACTIVE mode retry bounded ONCE.
 
@@ -3780,16 +3822,33 @@ def _plan_bundle_auto(
         # happened in ``run_artifacts.restore_geometry``.
         kw["restored_geometry"] = restored_geometry
 
+    # ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: a SHARED attempt channel. The dense build
+    # may refuse AFTER it produced the footprint artifact and gauge descriptor
+    # (the exact condition that triggers the bounded retry). Those artifacts are
+    # published by ``_build_execution_bundle`` as soon as they exist, so the
+    # retry receives the SAME footprints + descriptor instead of re-projecting.
+    _attempt = {
+        "footprints": footprints,
+        "gauge_memory_model": gauge_memory_model,
+    }
+
     def _build():
-        return _build_execution_bundle(
-            canvas, descs, footprints,
+        bundle = _build_execution_bundle(
+            canvas, descs, _attempt["footprints"],
             raw_available_bytes=int(raw), budget_bytes=int(budget),
             pinned_layout=pinned_layout,
             gauge_workers=gauge_workers,
             cache_build_workers=cache_build_workers,
             layout_substep=layout_substep,
+            gauge_memory_model=_attempt["gauge_memory_model"],
+            attempt_state=_attempt,
             **kw,
         )
+        # A successful build returns the authoritative artifacts (the same
+        # objects the attempt channel already holds); keep the channel in sync.
+        _attempt["footprints"] = bundle.footprints
+        _attempt["gauge_memory_model"] = bundle.gauge_memory_model
+        return bundle
 
     try:
         return _build()
@@ -6398,6 +6457,11 @@ class ExecutionBundle:
     cache_build_workers: int
     worker_budget_bytes: int
     attempts: list
+    # ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: the frozen gauge memory model (mode +
+    # resolvable switches + conservative per-worker bound + components). One
+    # producer, consumed verbatim by every later gate; ``None`` only for
+    # historical fixtures that never build a gauge phase.
+    gauge_memory_model: dict | None = None
     # R55-E8: exact device workspace of the selected GPU tile and the bounded
     # per-tile host/device trial trail used by the shared GPU ladder. ``None``
     # for pure CPU bundles so every existing consumer keeps its semantics.
@@ -7237,6 +7301,10 @@ def _build_execution_bundle(
     halo_px=None,
     restored_geometry=None,
     frozen_admission=None,
+    gauge_memory_model=None,
+    attempt_state=None,
+    normalization="sky_mean",
+    weighting="noise_variance",
     force_external=False,
     equalize_rgb=False,
     rejection="winsorized_sigma_clip",
@@ -7317,6 +7385,14 @@ def _build_execution_bundle(
     _refinement_memory_pressure = False
 
     _restored_pending = restored_geometry is not None
+    # ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: ONE descriptor per bundle build. The layout
+    # produces it from the exact footprints artifact; every refinement iteration
+    # and every caller-supplied replan reuses it verbatim (no re-projection from
+    # ``descs`` when the artifact exists).
+    _gauge_model_out: list = []
+    _gauge_model_current = (
+        dict(gauge_memory_model) if gauge_memory_model is not None else None
+    )
     while True:
         _fp_out = []
         if _restored_pending:
@@ -7343,6 +7419,11 @@ def _build_execution_bundle(
                     pinned_layout=pinned_layout, emit=emit, log_line=log_line,
                     observer=layout_substep, footprints_out=_fp_out,
                     footprints_in=footprints,
+                    gauge_model_out=_gauge_model_out,
+                    gauge_model_in=_gauge_model_current,
+                    attempt_state=attempt_state,
+                    normalization=normalization,
+                    weighting=weighting,
                     min_refinement_rank=rank_floor,
                     max_refinement_rank=rank_ceiling,
                     halo_px=_halo,
@@ -7383,6 +7464,20 @@ def _build_execution_bundle(
                 raise
             if footprints is None:
                 footprints = _fp_out[0] if _fp_out else None
+            if _gauge_model_out:
+                _gauge_model_current = _gauge_model_out[-1]
+            # ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: publish the attempt artifacts as
+            # soon as they exist, BEFORE any later budget/plan refusal can abort
+            # this build. A dense build that refuses after layout therefore
+            # still hands its footprint artifact + descriptor to the bounded
+            # retry (exactly N projections total).
+            if attempt_state is not None:
+                attempt_state["footprints"] = footprints
+                attempt_state["gauge_memory_model"] = (
+                    None
+                    if _gauge_model_current is None
+                    else dict(_gauge_model_current)
+                )
             nx, ny = int(layout["nx"]), int(layout["ny"])
             cell_ctxs = _build_chosen_cell_contexts(
                 footprints, canvas, nx, ny, layout_substep, halo_px=_halo
@@ -7414,7 +7509,39 @@ def _build_execution_bundle(
             _r55_margin_raw_ceiling(int(budget_bytes))
         )
         canvas_px = int(canvas.width) * int(canvas.height)
-        _gauge_fp = zpar.gauge_footprint_bytes(canvas_px)
+        # ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: derive the gauge worker bound from the
+        # ACTIVE R32c path (bounded pairs + tiled reference), never the
+        # historical full-canvas convention. Use the descriptor transported from
+        # the layout when it exists. ONLY a restored geometry / historical
+        # fixture without a ProjectedFootprints artifact falls back to ONE
+        # unique projection from ``descs``; that descriptor is then frozen and
+        # reused by every replan.
+        if _gauge_model_current is not None and zphot.gauge_model_matches(
+            _gauge_model_current,
+            canvas,
+            frames=descs,
+            normalization=normalization,
+            weighting=weighting,
+        ):
+            _gauge_memory_model = _gauge_model_current
+        elif _gauge_model_out:
+            _gauge_memory_model = _gauge_model_out[-1]
+            _gauge_model_current = _gauge_memory_model
+        else:
+            # Restored geometry / historical fixture without a footprints
+            # artifact: ONE unique projection, then frozen. A stale seed is
+            # ignored (never silently reused).
+            _gauge_memory_model = zphot.gauge_memory_model(
+                canvas,
+                descs,
+                normalization=normalization,
+                weighting=weighting,
+            )
+            _gauge_model_current = _gauge_memory_model
+        if attempt_state is not None:
+            attempt_state["footprints"] = footprints
+            attempt_state["gauge_memory_model"] = dict(_gauge_memory_model)
+        _gauge_fp = int(_gauge_memory_model["footprint_bytes"])
         _cache_fp = zpar.cache_footprint_bytes(patch_px_for_workers or canvas_px)
         _gauge_workers = _r55_coherent_worker_count(
             gauge_workers, worker_budget, _gauge_fp
@@ -8260,6 +8387,7 @@ def _build_execution_bundle(
             worst_patch_px=int(worst_patch_px),
             gauge_workers=int(_gauge_workers),
             cache_build_workers=int(_cache_workers),
+            gauge_memory_model=dict(_gauge_memory_model),
             worker_budget_bytes=int(worker_budget),
             attempts=attempts,
             gpu_device_workspace_bytes=(
@@ -8439,6 +8567,19 @@ def _r55_reconcile_gpu_readiness(block, gpu_ctx) -> dict:
         return block
 
 
+def _bundle_gauge_footprint_bytes(bundle, canvas_px: int) -> int:
+    """The FROZEN per-worker gauge bound carried by the execution bundle.
+
+    ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: ONE producer (the bundle) and MANY consumers
+    (observe, ACTIVE GPU/CPU, external, RUN logging). The bundle's descriptor is
+    authoritative; a fixture without one keeps the historical canvas bound.
+    """
+    model = getattr(bundle, "gauge_memory_model", None)
+    if isinstance(model, dict) and int(model.get("footprint_bytes") or 0) > 0:
+        return int(model["footprint_bytes"])
+    return int(zpar.gauge_footprint_bytes(int(canvas_px)))
+
+
 def _build_r55_observe_block(
     *,
     bundle,
@@ -8535,7 +8676,7 @@ def _build_r55_observe_block(
     canvas_px = int(canvas.width) * int(canvas.height)
     gauge_workers = max(1, int(bundle.gauge_workers))
     cache_workers = max(1, int(bundle.cache_build_workers))
-    gauge_worker_bytes = int(zpar.gauge_footprint_bytes(canvas_px)) * gauge_workers
+    gauge_worker_bytes = _bundle_gauge_footprint_bytes(bundle, canvas_px) * gauge_workers
     cache_worker_bytes = int(zpar.cache_footprint_bytes(worst_patch_px)) * cache_workers
 
     # Assembly is retained cell cores + the halo band, never a blind per-phase add.
@@ -8674,6 +8815,7 @@ def _layout_joint_plan_probe(
     pinned: bool = False,
     run_id: str = "layout-joint-probe",
     gauge_mode: str | None = None,
+    gauge_footprint_bytes: int | None = None,
 ) -> dict:
     """A1b — admit a layout only if the FULL joint CPU aggregate fits.
 
@@ -8738,7 +8880,11 @@ def _layout_joint_plan_probe(
             _asm_hw, channels=channels, gauge_mode=_asm_mode
         )["total_bytes"]
     )
-    gauge_fp = int(zpar.gauge_footprint_bytes(canvas))
+    gauge_fp = (
+        int(gauge_footprint_bytes)
+        if gauge_footprint_bytes is not None
+        else int(zpar.gauge_footprint_bytes(canvas))
+    )
     cache_fp = int(zpar.cache_footprint_bytes(patch_px))
     # L2: the caller's B_plan is AUTHORITATIVE. Derive the matching raw
     # observation with integer arithmetic instead of re-deriving the budget
@@ -8989,7 +9135,7 @@ def _r55_active_facts(
         disk_free = 0
 
     canvas_px = int(canvas.width) * int(canvas.height)
-    gauge_footprint = int(zpar.gauge_footprint_bytes(canvas_px))
+    gauge_footprint = _bundle_gauge_footprint_bytes(bundle, canvas_px)
     cache_footprint = int(zpar.cache_footprint_bytes(worst_patch_px))
     _worker_raw_ceiling = _r55_margin_raw_ceiling(
         int(bundle.envelope.budget_bytes),
@@ -9370,6 +9516,32 @@ def _r55_external_contract(bundle) -> dict:
     return contract
 
 
+def _gauge_phase_refusal_components(facts, bundle, canvas_px: int) -> str:
+    """Explicit ``phase=gauge`` component trace for a fail-closed refusal.
+
+    ZM-ZEGRID-R32C-GAUGE-FOOTPRINT: a host-RAM refusal must name the phase and
+    its components instead of vaguely blaming the external working set. The
+    values come from the SAME frozen model the plan priced. A gauge that does
+    NOT fit is the one decision this model owns; the external stack is priced
+    separately by its own contract.
+    """
+    model = getattr(bundle, "gauge_memory_model", None) or {}
+    workers = max(1, int(facts.get("gauge_workers") or 1))
+    footprint = int(
+        facts.get("gauge_footprint_bytes")
+        or _bundle_gauge_footprint_bytes(bundle, canvas_px)
+    )
+    return (
+        "phase=gauge components: "
+        f"footprint_bytes={footprint} x gauge_workers={workers} = "
+        f"{footprint * workers} B; mode={model.get('mode')}, "
+        f"peak_phase={model.get('peak_phase')}, "
+        f"max_bbox_px={model.get('max_bbox_px')}, "
+        f"reference_tile_px={model.get('tile_px')}, "
+        f"canvas_px={model.get('canvas_px', int(canvas_px))}"
+    )
+
+
 def _r55_active_external_context(facts, bundle, cache_workers_cap):
     """Build the SINGLE external working-set context for ACTIVE admission.
 
@@ -9507,6 +9679,10 @@ def _r55_active_external_decide(
             f"full bounded gauge/cache ladders (gauge "
             f"{list(_r55_worker_ladder(int(facts['gauge_workers'])))} x cache "
             f"{list(_r55_worker_ladder(int(facts['cache_workers'])))}): "
+            + _gauge_phase_refusal_components(
+                facts, bundle, int(canvas.width) * int(canvas.height)
+            )
+            + "; "
             + ("" if last_exc is None else str(last_exc.detail))
         )
         raise zsched.PlanRefused(
@@ -9662,8 +9838,12 @@ def _r55_active_decide(
         detail = (
             "no coherent gauge/cache worker configuration fits B_plan with the "
             f"{facts['margin_num']}/{facts['margin_den']} margin after the full "
-            f"bounded ladders (gauge {list(_r55_worker_ladder(int(facts['gauge_workers'])))}"
-            f" x cache {list(_r55_worker_ladder(int(facts['cache_workers'])))}): "
+            f"bounded ladders (gauge {list(_r55_worker_ladder(int(facts['gauge_workers'])))}; "
+            f"cache {list(_r55_worker_ladder(int(facts['cache_workers'])))}): "
+            + _gauge_phase_refusal_components(
+                facts, bundle, int(canvas.width) * int(canvas.height)
+            )
+            + "; "
             + ("" if last_exc is None else str(last_exc.detail))
         )
         raise zsched.PlanRefused(
@@ -10268,7 +10448,10 @@ def _r55_active_gpu_decide(
         detail = (
             "no coherent gauge/cache worker configuration fits the SAME B_plan "
             f"with the {base['margin_num']}/{base['margin_den']} margin after "
-            "the full bounded ladders"
+            "the full bounded ladders; "
+            + _gauge_phase_refusal_components(
+                base, bundle, int(canvas.width) * int(canvas.height)
+            )
         )
         if last_exc is not None:
             detail = detail + ": " + str(last_exc.detail)
@@ -14696,6 +14879,8 @@ def _run_single(
         equalize_rgb=bool(getattr(science_config, "equalize_rgb", False)),
         rejection=str(getattr(science_config, "rejection", "winsorized_sigma_clip")),
         combine=str(getattr(science_config, "combine", "mean")),
+        normalization=str(getattr(science_config, "normalization", "sky_mean")),
+        weighting=str(getattr(science_config, "weighting", "noise_variance")),
         emit=_emit_live,
         log_line=_log_line,
     )
@@ -14785,7 +14970,7 @@ def _run_single(
         _emit(f"ZeGrid: layout warning — {w}", lvl="WARN", callback=progress_callback)
 
     canvas_px = int(canvas.width) * int(canvas.height)
-    _gauge_fp = zpar.gauge_footprint_bytes(canvas_px)
+    _gauge_fp = _bundle_gauge_footprint_bytes(_initial_bundle, canvas_px)
     _cache_fp = zpar.cache_footprint_bytes(
         _initial_bundle.worst_patch_px or canvas_px
     )
@@ -15263,6 +15448,9 @@ def _run_single(
                             min_refinement_rank=_pinned_rank,
                             max_refinement_rank=_pinned_rank,
                             layout_substep=None,
+                            gauge_memory_model=(
+                                _initial_bundle.gauge_memory_model
+                            ),
                             **_bundle_common,
                         )
                         (
@@ -15316,6 +15504,9 @@ def _run_single(
                             max_refinement_rank=_pinned_rank,
                             layout_substep=None,
                             force_external=True,
+                            gauge_memory_model=(
+                                _initial_bundle.gauge_memory_model
+                            ),
                             **_bundle_common,
                         )
                         (
@@ -15520,6 +15711,11 @@ def _run_single(
                 canvas, descs, footprints,
                 raw_available_bytes=int(raw), budget_bytes=int(b_plan),
                 pinned_layout=_pin,
+                gauge_memory_model=(
+                    state["bundle"].gauge_memory_model
+                    if state["bundle"] is not None
+                    else initial_bundle.gauge_memory_model
+                ),
                 min_refinement_rank=int(previous.refinement_rank),
                 max_refinement_rank=(None if fix_rank is None else int(fix_rank)),
                 max_cpu_tile=int(previous.cpu_tile),

@@ -180,9 +180,17 @@ def test_gate_a_windows_automatic_gauge_and_gpu_plan(
         vram=vram,
     )
     # Automatic (not fixed-at-4) gauge/cache selection, made coherent with the
-    # same B_plan + 15 % margin that will validate the plan.
-    assert bundle.gauge_workers <= 12
-    assert bundle.gauge_workers >= 1
+    # same B_plan + 15 % margin that will validate the plan. ZM-ZEGRID-R32C:
+    # the gauge footprint is now the bounded+tiled path, so the old canvas-bound
+    # ceiling (<=12) is superseded; the COHERENT contract is that the selected
+    # workers x their FROZEN footprint still fit the margin-aware raw ceiling.
+    model = bundle.gauge_memory_model
+    assert model["mode"] == "r32c_bounded_tiled"
+    assert 1 <= bundle.gauge_workers <= 14
+    assert (
+        int(bundle.gauge_workers) * int(model["footprint_bytes"])
+        <= int(bundle.worker_budget_bytes)
+    )
     assert bundle.worker_budget_bytes == (WINDOWS_B_PLAN * 100) // 115
 
     decision = _active_gpu_decide(
