@@ -316,7 +316,7 @@ def test_host_components_positions_bounded_by_interior():
 # 6. REWORK-1 (LOW): the degraded (Bayer) branch counts the bytes it read
 # ---------------------------------------------------------------------------
 
-def _write_bayer_corpus(tmp_path, *, shape=(64, 72), n=2, seed=11):
+def _write_bayer_corpus(tmp_path, *, shape=(64, 72), n=2, seed=11, pattern="GRBG"):
     rng = np.random.default_rng(seed)
     descs = []
     for i in range(n):
@@ -324,7 +324,7 @@ def _write_bayer_corpus(tmp_path, *, shape=(64, 72), n=2, seed=11):
         wcs.wcs.crval = [10.0 + i * 0.00035, 30.0]
         raw = rng.integers(200, 3000, shape).astype(np.int16)
         header = wcs.to_header(relax=True)
-        header["BAYERPAT"] = "GRBG"
+        header["BAYERPAT"] = pattern
         path = Path(tmp_path) / f"b{i}.fit"
         fits.PrimaryHDU(raw, header=header).writeto(path)
         descs.append(zg.FrameDescriptor(
@@ -345,12 +345,15 @@ def _write_bayer_corpus(tmp_path, *, shape=(64, 72), n=2, seed=11):
 
 
 def test_degraded_bayer_decode_counts_source_bytes(tmp_path):
-    """A Bayer source cannot be section-decoded: it degrades AND is billed.
+    """A non-boundable CFA pattern degrades AND is billed.
 
-    The whole frame is really read, so an I/O audit must never see 0 bytes on
-    the degraded path (Nono LOW, rework-1).
+    Lot 2 makes known Bayer patterns section-decodable; an UNKNOWN pattern is
+    still refused. The whole frame is then really read, so an I/O audit must
+    never see 0 bytes on the degraded path (Nono LOW, rework-1).
     """
-    descs, canvas, _cell, patch, mem = _write_bayer_corpus(tmp_path)
+    descs, canvas, _cell, patch, mem = _write_bayer_corpus(
+        tmp_path, pattern="XYZ1"
+    )
     planned = zz._plan_cell_source_frames(descs, canvas, patch, mem)
     h, w = patch.patch_shape_hw
     stats = zz._new_source_window_stats()

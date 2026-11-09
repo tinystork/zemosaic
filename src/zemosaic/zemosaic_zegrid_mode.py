@@ -86,6 +86,7 @@ from .zegrid_halo import (
 )
 from .zemosaic_utils import (
     NONFINITE_FILL_VALUE,
+    debayer_image,
     load_image_with_optional_alpha,
     record_nonfinite_fill,
     sanitize_nonfinite_float32,
@@ -880,6 +881,33 @@ def _build_frame_descriptors(frames_info, input_folder, progress_callback, *, si
     return descs, rejected
 
 
+def _prepare_cell_source_from_hwc(
+    hwc, frame_desc, bounds, patch_wcs_header, patch_hw, *,
+    window=None, stats=None,
+):
+    """Crop + reproject an ALREADY decoded HWC frame (cache/hit path).
+
+    Byte-identical to the historical decode-crop-reproject sequence; it only
+    skips the decode. Counters stay honest: a window preparation is recorded
+    exactly as the section path records it.
+    """
+    crop_hwc = hwc[bounds.y0:bounds.y1, bounds.x0:bounds.x1]
+    crop_chw = np.ascontiguousarray(np.moveaxis(crop_hwc, -1, 0))
+    cropped_wcs = zxe.slice_wcs(frame_desc.wcs(), bounds)
+    rgb, geom = zxe.reproject_cropped(
+        crop_chw, cropped_wcs, WCS(patch_wcs_header), tuple(patch_hw),
+        window=window,
+    )
+    rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.float32))
+    geom = np.ascontiguousarray(np.asarray(geom, dtype=bool))
+    if stats is not None and window is not None:
+        stats["window_prepares"] += 1
+        stats["reprojected_pixels"] += int(
+            (int(window[1]) - int(window[0])) * (int(window[3]) - int(window[2]))
+        )
+    return rgb, geom
+
+
 def _decode_frame_hwc(frame_desc, progress_callback):
     """Decode ONE raw frame via the existing product decoder -> HWC float32 RGB.
 
@@ -940,17 +968,168 @@ def _section_image_hdu(hdul):
     return None
 
 
-def _decode_frame_section_hwc(frame_desc, bounds):
-    """Bounded decode of ONE source region -> ``(H,W,3)`` float32.
+#: Even margin added around a CFA section before local debayering. OpenCV's
+#: Bayer demosaic only mixes a 3x3 neighbourhood, so 2 px are structurally
+#: enough; 4 (even, phase-preserving) is used as the qualified constant and the
+#: parity tests prove the interior is byte-identical to the whole-frame debayer.
+_CFA_SECTION_MARGIN_PX = 4
+#: Elements per pre-scan chunk (~4 M float32 -> ~16 MiB transient, never the frame).
+_CFA_PRESCAN_CHUNK_ELEMS = 4 << 20
+
+
+def _fits_int_scaling(header):
+    """Return ``(bscale, bzero, apply)`` exactly as the product loader does."""
+    bzero = header.get("BZERO", 0.0)
+    bscale = header.get("BSCALE", 1.0)
+    try:
+        apply = (
+            abs(float(bscale) - 1.0) > 1e-6 or abs(float(bzero)) > 1e-6
+        )
+    except Exception:  # noqa: BLE001 - malformed card -> no manual scaling
+        return 1.0, 0.0, False
+    return float(bscale), float(bzero), bool(apply)
+
+
+def _frame_global_minmax(frame_desc, hdu, header):
+    """Exact global float32 ``(min, max)`` of ONE frame, WITHOUT keeping it.
+
+    Reproduces the product loader's statistics verbatim: the loader casts the
+    raw pixels to float64, applies BZERO/BSCALE only for integer dtypes, cleans
+    non-finite values, casts to **float32**, and then takes
+    ``np.nanmin/nanmax`` over the finite values. A chunked stream is exact
+    because min/max are order-insensitive and every per-pixel transform is
+    reproduced byte-for-byte. Peak memory is one chunk (~16 MiB), never the
+    frame. Returns ``None`` when the geometry is not a plain 2-D CFA frame.
+    """
+    try:
+        shape = tuple(int(v) for v in hdu.shape)
+        if len(shape) != 2:
+            return None
+        rows, cols = shape
+        bscale, bzero, apply_scale = _fits_int_scaling(header)
+        kind = str(getattr(hdu, "data", None).dtype.kind) if hdu.data is not None else ""
+        step = max(1, int(_CFA_PRESCAN_CHUNK_ELEMS) // max(1, cols))
+        lo = np.inf
+        hi = -np.inf
+        any_finite = False
+        for r0 in range(0, rows, step):
+            r1 = min(rows, r0 + step)
+            raw = np.asarray(hdu.section[r0:r1, :])
+            data = np.asarray(raw, dtype=np.float64)
+            if kind == "i" and apply_scale:
+                data = data * bscale + bzero
+            if not np.all(np.isfinite(data)):
+                data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+            data32 = data.astype(np.float32)
+            finite = np.isfinite(data32)
+            if not bool(finite.any()):
+                continue
+            any_finite = True
+            lo = min(lo, float(data32[finite].min()))
+            hi = max(hi, float(data32[finite].max()))
+        if not any_finite:
+            return (0.0, 0.0)
+        return (float(lo), float(hi))
+    except Exception:  # noqa: BLE001 - unreadable stats -> caller degrades
+        return None
+
+
+def _decode_bayer_section_hwc(
+    frame_desc, hdu, header, pattern, bounds, stats_cache, stats,
+):
+    """CFA bounded decode: phase-aligned section + local debayer, bit-exact.
+
+    Reproduces the product loader exactly:
+    ``raw -> float64 -> BZERO/BSCALE (integer dtypes) -> nan_to_num -> float32
+    -> global (min,max) -> (x-min)/range -> clip -> uint16 -> cv2 Bayer ->
+    uint16/65535 -> *range+min``. The section is expanded by an even margin and
+    its origin is forced to an EVEN absolute offset, so the CFA phase matches
+    the whole-frame debayer; only the (proven) interior is kept.
+    Returns ``(HWC, bytes_read, pixels_read)`` or ``None`` to degrade.
+    """
+    pattern = str(pattern).upper()
+    if pattern not in ("GRBG", "RGGB", "GBRG", "BGGR"):
+        return None
+    shape = tuple(int(v) for v in hdu.shape)
+    if len(shape) != 2:
+        return None
+    rows, cols = shape
+    key = frame_desc.frame_id.logical_path
+    cached = None if stats_cache is None else stats_cache.get(key)
+    if cached is None:
+        cached = _frame_global_minmax(frame_desc, hdu, header)
+        if cached is None:
+            return None
+        if stats_cache is not None:
+            stats_cache[key] = cached
+        if stats is not None:
+            # Honest I/O: the pre-scan really reads the whole frame once.
+            stats["prescans"] += 1
+            stats["prescan_pixels"] += int(rows * cols)
+            stats["prescan_bytes"] += int(rows * cols * int(np.dtype(hdu.data.dtype).itemsize))
+    data_min, data_max = cached
+    y0, y1 = int(bounds.y0), int(bounds.y1)
+    x0, x1 = int(bounds.x0), int(bounds.x1)
+    margin = int(_CFA_SECTION_MARGIN_PX)
+    sy0 = max(0, y0 - margin)
+    sx0 = max(0, x0 - margin)
+    sy0 -= sy0 % 2  # CFA phase: the section origin must be even
+    sx0 -= sx0 % 2
+    sy1 = min(rows, y1 + margin)
+    sx1 = min(cols, x1 + margin)
+    if sy1 <= sy0 or sx1 <= sx0:
+        return None
+    raw = np.asarray(hdu.section[sy0:sy1, sx0:sx1])
+    if raw.size == 0:
+        return None
+    bscale, bzero, apply_scale = _fits_int_scaling(header)
+    data = np.asarray(raw, dtype=np.float64)
+    if raw.dtype.kind == "i" and apply_scale:
+        data = data * bscale + bzero
+    if not np.all(np.isfinite(data)):
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+    data32 = np.asarray(data, dtype=np.float32)  # (h, w), loader order
+    data_range = data_max - data_min
+    finite = np.isfinite(data32)
+    if data_range > 1e-9:
+        norm = (data32 - data_min) / data_range
+    elif bool(finite.any()):
+        norm = np.full_like(data32, 0.5, dtype=np.float32)
+    else:
+        norm = np.zeros_like(data32, dtype=np.float32)
+    norm = np.clip(norm, 0.0, 1.0)
+    rgb_norm = debayer_image(norm, pattern)  # exact uint16 cv2 path
+    if data_range > 1e-9:
+        rgb = rgb_norm * data_range + data_min
+    else:
+        rgb = np.full_like(rgb_norm, data_min, dtype=np.float32)
+    oy0 = y0 - sy0
+    ox0 = x0 - sx0
+    h = y1 - y0
+    w = x1 - x0
+    crop = rgb[oy0:oy0 + h, ox0:ox0 + w]
+    if crop.shape[:2] != (h, w):
+        return None
+    pixels_read = int((sy1 - sy0) * (sx1 - sx0))
+    return (
+        np.ascontiguousarray(crop, dtype=np.float32),
+        int(raw.nbytes),
+        pixels_read,
+    )
+
+
+def _decode_frame_section_hwc(frame_desc, bounds, *, stats_cache=None, stats=None):
+    """Bounded decode of ONE source region -> ``(HWC, bytes_read, pixels_read)``.
 
     Reproduces :func:`_decode_frame_hwc` **bit-for-bit** while reading only the
     requested FITS section: raw dtype -> float64 -> manual BZERO/BSCALE (integer
     dtypes only, exactly as the product loader) -> non-finite cleanup -> float32
-    -> channel replication. Returns ``None`` whenever a section read cannot
-    provably reproduce the whole-frame decode (Bayer/CFA data, whose global
-    min/max normalisation and spatial debayer are frame-global, or an
-    unexpected axis layout); the caller then degrades to the historical
-    whole-frame decode and records it. Never silently changes the science.
+    -> channel replication. CFA sources take the phase-aligned section debayer
+    (:func:`_decode_bayer_section_hwc`) with an exact bounded global-statistics
+    pre-scan. Returns ``None`` whenever a section read cannot provably reproduce
+    the whole-frame decode (unknown Bayer pattern, odd axis layout, insufficient
+    margin); the caller then degrades to the historical whole-frame decode and
+    records it. Never silently changes the science.
     """
     path = str(frame_desc.source_path)
     try:
@@ -959,8 +1138,11 @@ def _decode_frame_section_hwc(frame_desc, bounds):
             if hdu is None:
                 return None
             header = hdu.header
-            if header.get("BAYERPAT", header.get("CFAIMAGE", None)):
-                return None
+            pattern = header.get("BAYERPAT", header.get("CFAIMAGE", None))
+            if pattern:
+                return _decode_bayer_section_hwc(
+                    frame_desc, hdu, header, pattern, bounds, stats_cache, stats
+                )
             shape = tuple(int(v) for v in hdu.shape)
             y0, y1 = int(bounds.y0), int(bounds.y1)
             x0, x1 = int(bounds.x0), int(bounds.x1)
@@ -983,13 +1165,13 @@ def _decode_frame_section_hwc(frame_desc, bounds):
     if raw.size == 0:
         return None
     decoded_bytes = int(raw.nbytes)
+    pixels_read = int((y1 - y0) * (x1 - x0))
     # --- exact product-loader transform, on the section only -----------------
     data = np.asarray(raw, dtype=np.float64)
     if raw.dtype.kind == "i":
-        bzero = header.get("BZERO", 0.0)
-        bscale = header.get("BSCALE", 1.0)
-        if abs(float(bscale) - 1.0) > 1e-6 or abs(float(bzero)) > 1e-6:
-            data = data * float(bscale) + float(bzero)
+        bscale, bzero, apply_scale = _fits_int_scaling(header)
+        if apply_scale:
+            data = data * bscale + bzero
     if not np.all(np.isfinite(data)):
         data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
     arr = np.ascontiguousarray(data.astype(np.float32))
@@ -1003,7 +1185,7 @@ def _decode_frame_section_hwc(frame_desc, bounds):
         arr = np.repeat(arr, 3, axis=-1)
     elif arr.ndim == 3 and arr.shape[-1] != 3:
         return None
-    return np.ascontiguousarray(arr, dtype=np.float32), decoded_bytes
+    return np.ascontiguousarray(arr, dtype=np.float32), decoded_bytes, pixels_read
 
 
 _WINDOW_BOUNDS_GRID = 9
@@ -1142,12 +1324,99 @@ def _window_source_bounds(frame_desc, cell_bounds, patch_wcs, window):
     return out, uncovered
 
 
+class _SourceFrameCache:
+    """RAM-budgeted cache of DECODED HWC source frames (science-neutral).
+
+    Tile-major access (``for tile: for frame:``) touches every frame in every
+    tile, so a cache smaller than the full set thrashes and is strictly worse
+    than the bounded section decoder. The policy is therefore honest and
+    binary: **all N frames** fit the explicit budget, or the cache stays
+    INACTIVE (``cache_active=False``, ``cache_bytes=0``) and the bounded
+    section path runs. No partial LRU is advertised as useful, and no cache is
+    ever claimed active if it cannot remove ``tiles x N`` decodes.
+
+    The cache only removes decode work: it stores the exact array the
+    whole-frame decoder produced, so every served pixel is byte-identical.
+    """
+
+    def __init__(self, budget_bytes, frame_bytes, n_frames, stats):
+        self.budget_bytes = max(0, int(budget_bytes or 0))
+        self.frame_bytes = max(0, int(frame_bytes or 0))
+        self.n_frames = int(n_frames)
+        self.stats = stats if stats is not None else {}
+        capacity = (
+            self.budget_bytes // self.frame_bytes if self.frame_bytes else 0
+        )
+        self.enabled = bool(self.n_frames > 0 and capacity >= self.n_frames)
+        self._frames = {}
+        self._order = []
+        self.bytes = 0
+        self.stats.update({
+            "budget_bytes": int(self.budget_bytes),
+            "frame_bytes": int(self.frame_bytes),
+            "cache_capacity_frames": int(capacity),
+            "cache_active": bool(self.enabled),
+            # Self-describing state: never a silent "off", never a fake "on".
+            "cache_policy": (
+                "active_all_frames_fit" if self.enabled
+                else (
+                    "disabled_budget_too_small"
+                    if self.budget_bytes > 0
+                    else "disabled_no_budget"
+                )
+            ),
+            "cache_bytes": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        })
+
+    def get(self, index):
+        if not self.enabled:
+            return None
+        frame = self._frames.get(int(index))
+        if frame is None:
+            self.stats["cache_misses"] += 1
+            return None
+        self.stats["cache_hits"] += 1
+        return frame
+
+    def put(self, index, frame):
+        if not self.enabled:
+            return frame
+        size = int(frame.nbytes)
+        # Never exceed the budget: release the oldest frames BEFORE storing.
+        while self.bytes + size > self.budget_bytes and self._order:
+            oldest = self._order.pop(0)
+            old = self._frames.pop(oldest, None)
+            if old is not None:
+                self.bytes -= int(old.nbytes)
+        if size > self.budget_bytes:
+            return frame
+        self._frames[int(index)] = frame
+        self._order.append(int(index))
+        self.bytes += size
+        self.stats["cache_bytes"] = int(self.bytes)
+        return frame
+
+    def release(self):
+        self._frames.clear()
+        self._order.clear()
+        self.bytes = 0
+        self.stats["cache_bytes"] = 0
+
+
 def _new_source_window_stats() -> dict:
     """Honest, additive counters for the windowed source path."""
     return {
         "window_prepares": 0,
         "full_decode_fallbacks": 0,
         "bounds_expand_fallbacks": 0,
+        "prescans": 0,
+        "prescan_pixels": 0,
+        "prescan_bytes": 0,
+        # Whole-frame decodes (degradation or cache miss); windowed section
+        # decodes are NOT counted here.
+        "decodes": 0,
         "source_pixels_decoded": 0,
         "source_bytes_decoded": 0,
         "reprojected_pixels": 0,
@@ -1155,7 +1424,8 @@ def _new_source_window_stats() -> dict:
 
 
 def _prepare_cell_source_window(
-    frame_desc, cell_bounds, patch_wcs_header, patch_hw, window, *, stats=None,
+    frame_desc, cell_bounds, patch_wcs_header, patch_hw, window, *,
+    stats=None, stats_cache=None,
 ):
     """Decode/reproject ONLY the requested patch sub-window (bit-exact).
 
@@ -1176,17 +1446,18 @@ def _prepare_cell_source_window(
         src_bounds = None
     crop_hwc = None
     if src_bounds is not None:
-        decoded = _decode_frame_section_hwc(frame_desc, src_bounds)
+        decoded = _decode_frame_section_hwc(
+            frame_desc, src_bounds, stats_cache=stats_cache, stats=stats,
+        )
         if decoded is not None:
-            crop_hwc, _decoded_bytes = decoded
+            crop_hwc, _decoded_bytes, _decoded_pixels = decoded
             crop_wcs = zxe.slice_wcs(frame_desc.wcs(), src_bounds)
-            stats["source_pixels_decoded"] += int(
-                src_bounds.width * src_bounds.height
-            )
+            stats["source_pixels_decoded"] += int(_decoded_pixels)
             stats["source_bytes_decoded"] += int(_decoded_bytes)
     if crop_hwc is None:
         # Explicit degradation: the historical whole-frame decode + cell crop.
         hwc = _decode_frame_hwc(frame_desc, None)
+        stats["decodes"] += 1
         crop_hwc = hwc[cell_bounds.y0:cell_bounds.y1, cell_bounds.x0:cell_bounds.x1]
         crop_wcs = zxe.slice_wcs(frame_desc.wcs(), cell_bounds)
         stats["full_decode_fallbacks"] += 1
@@ -1226,20 +1497,57 @@ class _CellSourceContext:
     def frame_ids(self):
         return tuple(f.frame_id.logical_path for f, _bounds in self.planned)
 
-    def open_provider(self):
+    def open_provider(self, *, budget_bytes=None):
         stats = _new_source_window_stats()
+        stats["decodes"] = 0
+        # Per-frame CFA global statistics (two floats), never the frame itself.
+        stats_cache = {}
+        frame_bytes = 0
+        for frame, _bounds in self.planned:
+            fh, fw = (int(v) for v in frame.shape_hw)
+            frame_bytes = max(frame_bytes, fh * fw * 3 * 4)
+        decoded = _SourceFrameCache(
+            budget_bytes, frame_bytes, len(self.planned), stats
+        )
+
+        def _full_hwc(index):
+            cached = decoded.get(index)
+            if cached is not None:
+                return cached
+            frame, _bounds = self.planned[index]
+            hwc = _decode_frame_hwc(frame, None)
+            stats["decodes"] += 1
+            # Honest I/O: a cached-path decode really reads the whole frame.
+            stats["source_pixels_decoded"] += int(hwc.shape[0] * hwc.shape[1])
+            stats["source_bytes_decoded"] += int(np.asarray(hwc).nbytes)
+            return decoded.put(index, hwc)
 
         def prepare(index):
             frame, bounds = self.planned[index]
+            if decoded.enabled:
+                return _prepare_cell_source_from_hwc(
+                    _full_hwc(index), frame, bounds,
+                    self.patch_wcs_header, self.patch_hw,
+                )
+            stats["decodes"] += 1
+            fh, fw = (int(v) for v in frame.shape_hw)
+            stats["source_pixels_decoded"] += int(fh * fw)
+            stats["source_bytes_decoded"] += int(fh * fw * 3 * 4)
             return _prepare_cell_source_frame(
                 frame, bounds, self.patch_wcs_header, self.patch_hw
             )
 
         def prepare_window(index, y0, y1, x0, x1):
             frame, bounds = self.planned[index]
+            if decoded.enabled:
+                return _prepare_cell_source_from_hwc(
+                    _full_hwc(index), frame, bounds,
+                    self.patch_wcs_header, self.patch_hw,
+                    window=(y0, y1, x0, x1), stats=stats,
+                )
             return _prepare_cell_source_window(
                 frame, bounds, self.patch_wcs_header, self.patch_hw,
-                (y0, y1, x0, x1), stats=stats,
+                (y0, y1, x0, x1), stats=stats, stats_cache=stats_cache,
             )
 
         return zfp.WindowedCanonicalProvider(
@@ -2707,7 +3015,9 @@ def _build_cell_sres(result, frame_ids):
     )
 
 
-def _make_cell_provider(cache_dir, storage_profile, *, source_context=None):
+def _make_cell_provider(
+    cache_dir, storage_profile, *, source_context=None, cache_budget_bytes=None,
+):
     """Select the Cell provider for the admitted storage profile.
 
     New bounded product tasks pass a frozen source recipe and never create an
@@ -2720,6 +3030,12 @@ def _make_cell_provider(cache_dir, storage_profile, *, source_context=None):
             raise RuntimeError("source-backed cell input requires bounded storage")
         if not isinstance(source_context, _CellSourceContext):
             raise TypeError("invalid cell source context")
+        if cache_budget_bytes:
+            return source_context.open_provider(
+                budget_bytes=int(cache_budget_bytes)
+            )
+        # No explicit budget => no decoded-frame cache; keep the historical
+        # zero-argument call so existing wrappers/spies stay valid.
         return source_context.open_provider()
     if zsp.is_bounded(profile):
         return zfp.BoundedMemmapCanonicalProvider(cache_dir)
@@ -2897,7 +3213,7 @@ def _run_cell_external(
     spool_root, fixed=None, storage_profile=None, storage_info=None,
     cell_id="cell", attempt_id=None, required_free_bytes=None,
     owner_token=None, owner_record=None, owner_liveness=None,
-    retain_for_commit=False, source_context=None,
+    retain_for_commit=False, source_context=None, cache_budget_bytes=None,
 ):
     """Run ONE cell through the exact external working set (M2 primitive).
 
@@ -2929,7 +3245,10 @@ def _run_cell_external(
                 f"on {spool_root}; already-committed cells are intact"
             )
     provider = (
-        _make_cell_provider(cache_dir, _profile, source_context=source_context)
+        _make_cell_provider(
+            cache_dir, _profile, source_context=source_context,
+            cache_budget_bytes=cache_budget_bytes,
+        )
         if source_context is not None
         else _make_cell_provider(cache_dir, _profile)
     )
@@ -5022,6 +5341,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             owner_token=_ext.get("owner_token"),
             owner_record=_ext.get("owner_record"),
             retain_for_commit=bool(_EXTERNAL_RETAIN_FOR_COMMIT),
+            cache_budget_bytes=int(_ext.get("cache_budget_bytes") or 0),
             **source_kwargs,
         )
     elif mode == "inmem":
@@ -7677,6 +7997,14 @@ def _build_execution_bundle(
                 ),
                 "column_batch_clamped": bool(
                     external_selection["column_batch_clamped"]
+                ),
+                # ZM-M33 lot 2: the ONLY headroom a decoded-frame cache may use:
+                # phase-local host budget MINUS the already-admitted host peak.
+                # Never swap, never a raw "free RAM" estimate.
+                "cache_budget_bytes": max(
+                    0,
+                    int(external_selection["reduction_budget_bytes"])
+                    - int(external_selection["host_peak_bytes"]),
                 ),
                 "spool_root": str(external_selection["spool_root"]),
                 "disk_envelope_bytes": int(
