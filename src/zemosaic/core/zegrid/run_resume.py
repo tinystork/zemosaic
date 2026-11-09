@@ -133,6 +133,37 @@ class ResumeFrozenAdmissionUnavailable(ResumeError):
         self.detail = detail
 
 
+class ResumeLegacyBackendIdentity(ResumeError):
+    """A store produced by the known CPU-frozen-identity/GPU-commit bug.
+
+    The durable science identity says a CPU execution contract while immutable
+    commit records uniformly declare ``backend=gpu``. The immutable identity is
+    never rewritten and the commits are never modified. Recovery would require
+    the COMPLETE effective GPU contract (backend AND execution tile) to be
+    provable from durable evidence; it is not, so the resume refuses with an
+    explicit ``legacy_inconsistent_backend_identity`` diagnostic.
+    """
+
+    reason_code = "legacy_inconsistent_backend_identity"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        frozen_backend: str,
+        frozen_tile_px: int,
+        commit_backends: Sequence[str] = (),
+        commit_count: int = 0,
+        detail: str | None = None,
+    ):
+        super().__init__(message)
+        self.frozen_backend = str(frozen_backend)
+        self.frozen_tile_px = int(frozen_tile_px)
+        self.commit_backends = [str(v) for v in commit_backends]
+        self.commit_count = int(commit_count)
+        self.detail = detail
+
+
 # ---------------------------------------------------------------------------
 # Mode
 # ---------------------------------------------------------------------------
@@ -691,6 +722,59 @@ def _stat_token(path: Path) -> tuple[int, int]:
     return int(st.st_size), int(getattr(st, "st_mtime_ns", 0))
 
 
+def detect_legacy_backend_identity(store: zrs.RunCellStore) -> dict | None:
+    """Detect the known bug: CPU-frozen identity + GPU-declaring commits.
+
+    ZM-ACTIVE-RESUME-FROZEN-IDENTITY: older builds froze the durable identity
+    from the provisional CPU planning bundle while the ACTIVE GPU executor wrote
+    the Cells. Such a store is INTERNALLY INCONSISTENT. The immutable identity is
+    never rewritten and the commits are never modified. Recovery would require
+    the complete effective GPU contract (backend AND execution tile) to be
+    provable from durable evidence; a commit record carries the backend but not
+    the execution tile, so it is NOT provable here.
+
+    Returns ``None`` for a consistent store, or a diagnostic dict describing the
+    inconsistency. Never mutates anything.
+    """
+    contract = store.identity["science_contract"]["backend"]
+    frozen_backend = str(contract["backend"])
+    if frozen_backend != "cpu":
+        return None
+    backends: list[str] = []
+    count = 0
+    for record in store.iter_commit_records():
+        count += 1
+        backends.append(str(record.backend))
+    if count == 0:
+        return None
+    # Only execution backends carry this meaning; an unknown token is not
+    # evidence of a backend switch.
+    execution = [b for b in backends if b in ("cpu", "gpu")]
+    if not execution:
+        return None
+    gpu = [b for b in execution if b == "gpu"]
+    if not gpu:
+        return None
+    return {
+        "reason_code": "legacy_inconsistent_backend_identity",
+        "frozen_backend": frozen_backend,
+        "frozen_tile_px": int(contract["tile_px"]),
+        "parity_qualified": bool(contract["parity_qualified"]),
+        "commit_count": int(count),
+        "commit_backends": sorted(set(execution)),
+        "gpu_commit_count": int(len(gpu)),
+        "cpu_commit_count": int(len(execution) - len(gpu)),
+        "recoverable": False,
+        "detail": (
+            "the frozen science identity declares backend='cpu' but immutable "
+            f"commit records declare backend(s) {sorted(set(execution))}; the "
+            "complete effective GPU contract (backend AND execution tile) is "
+            "not provable from durable evidence, so this run stays "
+            "forensic-only and is never silently migrated"
+        ),
+    }
+
+
 class ResumeBootstrap:
     """An opened, locked, validated view of ONE resumable run."""
 
@@ -770,6 +854,28 @@ class ResumeBootstrap:
                         f"tile_px={expected[1]} parity_qualified={expected[2]} "
                         "(never a silent re-derivation)"
                     )
+            # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a store produced by the known
+            # CPU-identity/GPU-commit bug is refused with an explicit diagnostic.
+            # Immutable identity and every commit are preserved untouched.
+            legacy = detect_legacy_backend_identity(store)
+            if legacy is not None:
+                raise ResumeLegacyBackendIdentity(
+                    "resume refused: legacy_inconsistent_backend_identity — "
+                    f"the frozen identity declares backend="
+                    f"{legacy['frozen_backend']!r} tile_px="
+                    f"{legacy['frozen_tile_px']} while {legacy['commit_count']} "
+                    f"immutable commit(s) declare {legacy['commit_backends']}; "
+                    "the complete effective GPU contract is not provable from "
+                    "durable evidence, so this run is never silently migrated. "
+                    "The two valid commits and the immutable identity are "
+                    "preserved as forensic evidence; start a NEW run in a NEW "
+                    "output folder to resume the science.",
+                    frozen_backend=legacy["frozen_backend"],
+                    frozen_tile_px=legacy["frozen_tile_px"],
+                    commit_backends=legacy["commit_backends"],
+                    commit_count=legacy["commit_count"],
+                    detail=legacy["detail"],
+                )
         except Exception:
             store.close()
             raise
@@ -793,6 +899,38 @@ class ResumeBootstrap:
     @property
     def expected_cell_ids(self) -> list[str]:
         return list(self.state["expected_cell_ids"])
+
+    def retained_counts(self) -> dict:
+        """Diagnostic counts from the durable commit index (never a re-plan).
+
+        Used by a frozen-capacity refusal so the operator sees what would have
+        been retained: how many expected Cells already have a durable commit and
+        how many would still be pending. Read-only and tolerant of an isolated
+        corrupt attempt (it simply does not count as complete).
+        """
+        complete = 0
+        for cell_id in self.state["expected_cell_ids"]:
+            try:
+                attempts = self.store.attempts(cell_id)
+            except zrs.RunStoreError:
+                attempts = []
+            for attempt in attempts:
+                try:
+                    record = self.store.commit_record(cell_id, attempt)
+                except zrs.RunStoreError:
+                    continue
+                if str(record.status) in (
+                    zrs.STATUS_COMPLETE,
+                    zrs.STATUS_EMPTY_VALIDATED,
+                ):
+                    complete += 1
+                    break
+        total = int(len(self.state["expected_cell_ids"]))
+        return {
+            "expected": total,
+            "complete": int(complete),
+            "pending": int(total - complete),
+        }
 
     @property
     def admission(self) -> dict | None:

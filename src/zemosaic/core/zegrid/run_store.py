@@ -2409,6 +2409,25 @@ class RunCellStore:
             or fingerprint["backend"]
             or "unknown"
         )
+        # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: the durable identity's backend is
+        # the run's ONE execution contract. A commit that declares a DIFFERENT
+        # execution backend would create a mixed result under one identity, so
+        # it is refused BEFORE any payload/object is written. No implicit
+        # parity exemption exists: a backend transition would need an explicit
+        # declared contract, which this schema does not represent.
+        frozen_backend = str(
+            self._identity["science_contract"]["backend"]["backend"]
+        )
+        if (
+            backend_token in ("cpu", "gpu")
+            and backend_token != frozen_backend
+        ):
+            raise StoreFormatError(
+                f"cell {cell_id} declares backend_used={backend_token!r} but "
+                f"the frozen run identity contract is backend={frozen_backend!r}; "
+                "a durable result may never mix execution backends under one "
+                "identity (no cell was written)"
+            )
         created = int(time.time_ns())
         manifest = {
             "schema": COMMIT_SCHEMA,
@@ -2624,6 +2643,13 @@ class RunCellStore:
     def attempts(self, cell_id: str) -> list[str]:
         self._ensure_open()
         return sorted(self._commits.get(str(cell_id), {}))
+
+    def iter_commit_records(self):
+        """Yield every durable commit record (read-only, deterministic order)."""
+        self._ensure_open()
+        for cell_id in sorted(self._commits):
+            for attempt_id in sorted(self._commits[cell_id]):
+                yield self._commits[cell_id][attempt_id]
 
     def commit_record(self, cell_id: str, attempt_id: str | None = None) -> CommitRecord:
         self._ensure_open()

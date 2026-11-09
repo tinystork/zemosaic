@@ -344,7 +344,11 @@ def test_frozen_working_set_class_is_not_re_derived(tmp_path, monkeypatch):
         table.get(int(tile), max(table.values()))
     )
     try:
-        with pytest.raises(zpar_mode_infeasible()) as exc:
+        # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: the frozen class/tile is never
+        # re-derived into external_spool (the old misleading class-mismatch
+        # message). The corrected contract fails with the typed, precise
+        # frozen-capacity refusal that names class/backend/tile and the deficit.
+        with pytest.raises(zres.ResumeFrozenAdmissionUnavailable) as exc:
             zz._build_execution_bundle(
                 canvas, descs, None,
                 raw_available_bytes=2 * 2 ** 30,
@@ -354,7 +358,13 @@ def test_frozen_working_set_class_is_not_re_derived(tmp_path, monkeypatch):
             )
     finally:
         zz._estimate_streaming_bytes = real
-    assert "frozen working-set class" in str(exc.value)
+    message = str(exc.value)
+    assert exc.value.frozen_backend == "cpu"
+    assert exc.value.frozen_tile_px == 16
+    assert "class=ram_tile" in message
+    assert "deficit" in message
+    assert "cannot be re-derived as" not in message
+    assert "external_spool" not in message
 
 
 def zpar_mode_infeasible():

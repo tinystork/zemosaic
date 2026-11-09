@@ -3705,6 +3705,13 @@ def _frozen_permitted_tiles(frozen_admission, permitted_tiles):
     """
     if frozen_admission is None:
         return list(permitted_tiles)
+    if str(frozen_admission["backend"]) == "gpu":
+        # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a GPU-frozen run's execution tile is
+        # a GPU streaming tile, not a CPU ladder rung. The CPU planning bundle is
+        # only a layout/footprint vehicle; freezing its (unrelated) CPU tile to the
+        # GPU tile would be a category error. The GPU lane enforces the frozen
+        # tile itself (``_r55_enforce_frozen_gpu_tile``).
+        return list(permitted_tiles)
     frozen_tile = int(frozen_admission["tile_px"])
     if frozen_tile not in tuple(int(t) for t in CPU_STREAMING_TILE_LADDER):
         raise zres.ResumeFrozenAdmissionUnavailable(
@@ -3731,6 +3738,52 @@ def _frozen_permitted_tiles(frozen_admission, permitted_tiles):
     return [int(frozen_tile)]
 
 
+def _frozen_gpu_admission_refusal(
+    frozen_admission, *, detail, admitted_tile=None, required_bytes=None,
+    available_bytes=None,
+):
+    """Typed refusal when a GPU-frozen run cannot re-execute its own tile."""
+    frozen_tile = int(frozen_admission["tile_px"])
+    admitted = (
+        "unknown" if admitted_tile is None else f"tile_px={int(admitted_tile)}"
+    )
+    required = None if required_bytes is None else int(required_bytes)
+    available = None if available_bytes is None else int(available_bytes)
+    deficit = (
+        None
+        if required is None or available is None
+        else max(0, int(required) - int(available))
+    )
+    message = (
+        "resume refused: the FROZEN GPU admission of this run cannot be "
+        f"honoured on this host — frozen backend=gpu tile_px={frozen_tile}; "
+        f"the current ACTIVE GPU plan admitted {admitted}"
+    )
+    if required is not None:
+        message += f" (required {required} B"
+        if available is not None:
+            message += f", available {available} B"
+            if deficit:
+                message += f", deficit {deficit} B"
+        message += ")"
+    message += (
+        ". The frozen backend/tile is never switched, shrunk or re-derived and "
+        "no fresh run is started silently. Remedy: "
+        f"{zres.ADMISSION_REMEDY}."
+    )
+    if detail:
+        message += f" Planner detail: {detail}"
+    return zres.ResumeFrozenAdmissionUnavailable(
+        message,
+        frozen_backend="gpu",
+        frozen_tile_px=frozen_tile,
+        required_bytes=required,
+        available_bytes=available,
+        deficit_bytes=deficit,
+        detail=None if detail is None else str(detail),
+    )
+
+
 def _frozen_admission_refusal(
     frozen_admission, *, tile_trials, budget_bytes, raw_available_bytes,
     detail=None,
@@ -3738,6 +3791,10 @@ def _frozen_admission_refusal(
     """Build the typed, actionable refusal for an unhonourable frozen tile."""
     frozen_tile = int(frozen_admission["tile_px"])
     frozen_backend = str(frozen_admission["backend"])
+    _frozen_ws = frozen_admission.get("working_set") or {}
+    frozen_class = (
+        "unknown" if not _frozen_ws else str(_frozen_ws.get("class"))
+    )
     worst = 0
     for trial in tile_trials or ():
         if int(trial.get("tile", -1)) != frozen_tile:
@@ -3766,7 +3823,8 @@ def _frozen_admission_refusal(
         )
     message = (
         "resume refused: the FROZEN admission of this run cannot be honoured "
-        f"on this host — frozen tile_px={frozen_tile} backend={frozen_backend} "
+        f"on this host — frozen tile_px={frozen_tile} "
+        f"backend={frozen_backend} class={frozen_class} "
         f"{requirement}; raw available RAM {int(raw_available_bytes)} B. The "
         "frozen tile is never shrunk, the backend is never switched and no "
         "fresh run is started silently. Remedy: "
@@ -6478,6 +6536,11 @@ class ExecutionBundle:
     # that ACTIVE materialization and every external task must reuse unchanged.
     # ``None`` for RAM bundles.
     external_contract: dict | None = None
+    # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: whether this bundle's GPU execution was
+    # produced by a QUALIFIED ACTIVE admission (fresh VRAM qualification with
+    # parity evidence). It is the truthful source of the durable admission's
+    # ``parity_qualified`` flag; it is never inferred from hardware presence.
+    gpu_parity_qualified: bool = False
 
 
 def _r55_margin_raw_ceiling(
@@ -7806,6 +7869,32 @@ def _build_execution_bundle(
                 chosen_tile = int(t)
                 break
 
+        if (
+            plan is None
+            and not _force_external
+            and _frozen_admission is not None
+        ):
+            # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a frozen RAM class/tile that no
+            # longer fits must fail with the precise frozen-capacity refusal
+            # HERE, before the external working-set selector can re-derive a
+            # different class and emit a misleading class-mismatch message.
+            if _frozen_ws_policy is None and _bounded:
+                # Legacy identity with no working-set section: an additive class
+                # switch to the bounded EXTERNAL spool is still forbidden (never
+                # silently become external). A dense profile never reaches the
+                # external selector, so it keeps the frozen-capacity refusal.
+                raise zpar.ModeInfeasible(
+                    "legacy run identity has no working-set section; switching "
+                    "it to the external spool is refused (additive M3 identity). "
+                    "Remedy: start a new run/output folder for the external path."
+                )
+            raise _frozen_admission_refusal(
+                _frozen_admission,
+                tile_trials=tile_trials,
+                budget_bytes=budget_bytes,
+                raw_available_bytes=raw_available_bytes,
+                detail=str(cpu_refusal),
+            )
         if plan is None and _bounded:
             # M3/M4: no in-memory plan and no RAM tile fits. The next class is
             # the external working set (disk spool), priced BEFORE any work. A
@@ -10055,6 +10144,20 @@ def _r55_gpu_host_bound_by_tile(*, max_n, worst_hw, tiles):
     }
 
 
+def _r55_cap_gpu_tile_ladder(tiles, max_gpu_tile):
+    """Apply the no-growth GPU tile ceiling to a declared ladder.
+
+    ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a resumed GPU run may re-admit ONLY at or
+    below its frozen tile. This never enlarges a ladder; it only drops rungs that
+    would silently grow the execution tile.
+    """
+    if max_gpu_tile is None:
+        return tuple(int(t) for t in tiles)
+    return tuple(
+        int(t) for t in tiles if int(t) <= int(max_gpu_tile)
+    )
+
+
 def _r55_active_gpu_decide(
     *,
     bundle,
@@ -10066,6 +10169,7 @@ def _r55_active_gpu_decide(
     frame_ids,
     gpu_probe,
     readiness,
+    max_gpu_tile=None,
 ):
     """Build the ACTIVE GPU decision from explicit integer facts only.
 
@@ -10157,6 +10261,11 @@ def _r55_active_gpu_decide(
         for t in declared_tiles
         if int(declared_device_peaks[int(t)]) <= int(selection_budget)
     )
+    if max_gpu_tile is not None:
+        # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a resumed GPU run may re-admit ONLY
+        # at or below its frozen tile. This never enlarges the ladder; it only
+        # drops rungs that would silently grow the execution tile.
+        gpu_tiles = _r55_cap_gpu_tile_ladder(gpu_tiles, max_gpu_tile)
     if not gpu_tiles:
         raise _R55GpuRefused(
             zgr.REASON_REFUSE_VRAM,
@@ -10794,6 +10903,11 @@ def _r55_active_gpu_apply(
         gpu_streaming_tile=int(tile),
         gpu_streaming_host_peak_bytes=int(per_cell_total),
         gpu_used=True,
+        # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: this bundle is the product of a
+        # fresh, QUALIFIED ACTIVE GPU admission (``qualify_gpu_execution`` with
+        # parity evidence). Record it so the durable identity states the truth
+        # instead of guessing from hardware presence.
+        gpu_parity_qualified=True,
         gpu_pre_execution_fallback=None,
         cell_specs=cell_specs,
         cell_tasks=cell_tasks,
@@ -13686,6 +13800,65 @@ def _r55_sha256_json(value) -> str:
     return hashlib.sha256(zrs.canonical_json(_r55_digest_tree(value))).hexdigest()
 
 
+def _r55_execution_contract_from_bundle(bundle) -> dict:
+    """The TRUE effective execution contract of ONE run-scope bundle.
+
+    ZM-ACTIVE-RESUME-FROZEN-IDENTITY: the durable run identity must describe
+    the bundle that ACTUALLY writes durable Cells (``_run_scope_bundle``), never
+    the provisional CPU planning bundle. A GPU bundle is authoritative only when
+    it is GPU-shaped (``gpu_used`` AND an explicit ``gpu_streaming_tile``); the
+    CPU streaming tile is used otherwise.
+
+    ``parity_qualified`` is reported from the bundle's OWN qualification record
+    (the ACTIVE GPU product path sets ``gpu_parity_qualified`` after a fresh,
+    qualified VRAM admission). It is never inferred from hardware presence, and
+    an unqualified backend never becomes "qualified" here.
+    """
+    gpu_tile = getattr(bundle, "gpu_streaming_tile", None)
+    gpu_used = bool(getattr(bundle, "gpu_used", False)) and gpu_tile is not None
+    if gpu_used:
+        return {
+            "backend": "gpu",
+            "tile_px": int(gpu_tile),
+            "parity_qualified": bool(
+                getattr(bundle, "gpu_parity_qualified", False)
+            ),
+        }
+    return {
+        "backend": "cpu",
+        "tile_px": int(getattr(bundle, "cpu_streaming_tile", 1) or 1),
+        "parity_qualified": False,
+    }
+
+
+def _r55_run_store_working_set(bundle, execution_contract) -> dict:
+    """The TRUTHFUL frozen working-set identity for a run-scope bundle.
+
+    A GPU bundle stages its streaming tiles in HOST RAM, so its durable
+    working-set class is ``ram_tile`` at the GPU streaming tile — never the
+    provisional CPU planning tile and never the CPU-only ``external_spool``
+    class. Every non-GPU class comes from the bundle's own dry-plan block.
+    """
+    if str(execution_contract["backend"]) == "gpu":
+        return {
+            "class": WORKING_SET_RAM_TILE,
+            "tile_px": int(execution_contract["tile_px"]),
+            "column_batch": None,
+        }
+    block = getattr(bundle, "working_set_block", None) or {}
+    return {
+        "class": (
+            None if not block.get("class") else str(block["class"])
+        ),
+        "tile_px": int(block.get("tile_size") or 0),
+        "column_batch": (
+            None
+            if block.get("column_batch") is None
+            else int(block["column_batch"])
+        ),
+    }
+
+
 def _r55_build_run_store_identity(
     *,
     run_id: str,
@@ -13771,10 +13944,13 @@ def _r55_build_run_store_identity(
             }
         ),
     }
+    # The execution contract is resolved ONCE and is the SAME value used by the
+    # backend block below: grid.tile_px can never disagree with backend.tile_px.
+    _execution_contract = _r55_execution_contract_from_bundle(bundle)
     grid_block = {
         "nx": int(layout.get("nx", 0) or 0) or 1,
         "ny": int(layout.get("ny", 0) or 0) or 1,
-        "tile_px": int(getattr(bundle, "cpu_streaming_tile", 1) or 1),
+        "tile_px": int(_execution_contract["tile_px"]),
         "geometry_sha256": _r55_sha256_json(bounds),
         "cell_ids_sha256": _r55_sha256_json(cell_ids),
     }
@@ -13830,13 +14006,10 @@ def _r55_build_run_store_identity(
         ),
         "params": science_params,
     }
-    backend_token = (
-        str(getattr(bundle, "chosen_mode", "") or "") and "cpu"
-    )
     backend_block = {
-        "backend": "cpu",
-        "tile_px": int(getattr(bundle, "cpu_streaming_tile", 1) or 1),
-        "parity_qualified": False,
+        "backend": str(_execution_contract["backend"]),
+        "tile_px": int(_execution_contract["tile_px"]),
+        "parity_qualified": bool(_execution_contract["parity_qualified"]),
     }
     try:
         ram = int(available_memory_bytes())
@@ -14910,11 +15083,29 @@ def _run_single(
         # FAIL CLOSED (never shrink the tile, never switch the backend, never
         # start a fresh run). Nothing was written: release the single-writer
         # lock so no store/lock is left behind by the refusal.
-        _resume_runtime["refusal"] = (
-            f"{type(_frozen_exc).__name__}: {_frozen_exc}"
-        )
+        # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: name what would have been retained
+        # (durable evidence, never a re-plan) so the refusal is actionable.
+        _retained = None
+        if _resume_boot is not None:
+            try:
+                _retained = _resume_boot.retained_counts()
+            except Exception:
+                _retained = None
+        _refusal_message = f"{type(_frozen_exc).__name__}: {_frozen_exc}"
+        _log_message = f"ZeGrid: resume REFUSED — {_frozen_exc}"
+        if _retained is not None:
+            _retained_text = (
+                " retained: expected="
+                f"{int(_retained['expected'])} complete="
+                f"{int(_retained['complete'])} pending="
+                f"{int(_retained['pending'])}"
+            )
+            _refusal_message += _retained_text
+            _log_message += _retained_text
+        _resume_runtime["refusal"] = _refusal_message
+        _resume_runtime["retained"] = _retained
         _emit(
-            f"ZeGrid: resume REFUSED — {_frozen_exc}",
+            _log_message,
             lvl="ERROR",
             callback=progress_callback,
         )
@@ -15034,6 +15225,37 @@ def _run_single(
             # SAME initial request, mirroring the plan/admission fallbacks.
             _r55_readiness = zgr.probe_gpu_readiness_safe()
 
+            def _r55_frozen_gpu_tile_cap():
+                """The frozen GPU ceiling for a resumed run (never a fresh run)."""
+                if _frozen_admission is None:
+                    return None
+                if str(_frozen_admission["backend"]) != "gpu":
+                    return None
+                return int(_frozen_admission["tile_px"])
+
+            def _r55_enforce_frozen_gpu_tile(mapping):
+                """Fail closed if a GPU-frozen resume did not re-admit its tile.
+
+                ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a resume may never switch,
+                grow or silently shrink the frozen execution tile. The ladder
+                is capped at the frozen tile above; this exact check is the
+                final authority on the admitted mapping.
+                """
+                cap = _r55_frozen_gpu_tile_cap()
+                if cap is None:
+                    return
+                got = int(mapping["gpu_streaming_tile"])
+                if got != cap:
+                    raise _frozen_gpu_admission_refusal(
+                        _frozen_admission,
+                        detail=(
+                            "the resumed ACTIVE GPU admission selected "
+                            f"tile_px={got}, but the frozen contract is "
+                            f"tile_px={cap}"
+                        ),
+                        admitted_tile=got,
+                    )
+
             def _r55_gpu_attempt(initial_bundle):
                 """Decide + admit ONE ACTIVE GPU attempt on an initial bundle."""
                 _attempt_decision = _r55_active_gpu_decide(
@@ -15046,6 +15268,7 @@ def _run_single(
                     frame_ids=_r55_frame_ids,
                     gpu_probe=gpu_ctx,
                     readiness=_r55_readiness,
+                    max_gpu_tile=_r55_frozen_gpu_tile_cap(),
                 )
                 return (_attempt_decision,) + _r55_active_gpu_admit(
                     initial_bundle=initial_bundle,
@@ -15054,6 +15277,7 @@ def _run_single(
 
             def _r55_publish_gpu_admission(*, fallback_count):
                 nonlocal _r55_active_preflight_adm, _r55_active_preflight_trail
+                _r55_enforce_frozen_gpu_tile(_r55_active_mapping)
                 _r55_active_preflight_adm = _r55_active_adm
                 _r55_active_preflight_trail = list(_r55_active_trail)
                 _emit(
@@ -15080,6 +15304,20 @@ def _run_single(
             def _r55_record_gpu_cpu_fallback(exc, *, extra=None):
                 nonlocal _r55_gpu_fallback_reason
                 nonlocal _r55_active_gpu_decision, _r55_active_bundle
+                # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a GPU-FROZEN run may never
+                # be continued on CPU. The qualified whole-batch CPU fallback is
+                # legal for a FRESH GPU request only; on resume it is a precise
+                # frozen-capacity refusal (no mixed backend, no silent switch).
+                if _r55_frozen_gpu_tile_cap() is not None:
+                    raise _frozen_gpu_admission_refusal(
+                        _frozen_admission,
+                        detail=(
+                            "the resumed ACTIVE GPU plan fell back to CPU "
+                            f"({getattr(exc, 'reason_code', type(exc).__name__)}: "
+                            f"{getattr(exc, 'detail', exc)}); a GPU-frozen "
+                            "run is never continued on a different backend"
+                        ),
+                    )
                 # Qualified whole-batch CPU fallback from a clean state; the
                 # GPU plan is abandoned entirely (no mixed result).
                 _r55_gpu_fallback_reason = {
@@ -15151,6 +15389,16 @@ def _run_single(
                 )
             except _R55GpuRefused as _r55_gpu_exc:
                 _r55_dense_gpu_refusal = _r55_gpu_exc
+                # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: on a GPU-frozen resume the
+                # refusal is a frozen-capacity fact, never a decline/fallback.
+                if _r55_frozen_gpu_tile_cap() is not None:
+                    raise _frozen_gpu_admission_refusal(
+                        _frozen_admission,
+                        detail=(
+                            f"ACTIVE GPU refusal {_r55_gpu_exc.reason_code}: "
+                            f"{_r55_gpu_exc.detail}"
+                        ),
+                    ) from _r55_gpu_exc
                 # M6 (ZM-ZEGRID-AUTO-EXTERNAL-STREAMING): a PURE device-capacity
                 # refusal is a DEVICE-APPLICABILITY fact, not a run failure. The
                 # GPU workspace model still prices N resident frames, so a large
@@ -19213,7 +19461,9 @@ def _run_single(
                 run_id=str(result_registry.run_id),
                 descs=descs,
                 canvas=canvas,
-                bundle=_initial_bundle,
+                # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: the run-scope bundle is the
+                # ONE execution contract (active GPU/CPU wins, final fallback).
+                bundle=_run_scope_bundle(_r55_active_bundle, _final),
                 halo_px=int(halo_px),
                 halo_provenance=halo_provenance,
                 global_gauge=global_gauge,
@@ -19488,7 +19738,9 @@ def _run_single(
                 run_id=_store_run_id,
                 descs=descs,
                 canvas=canvas,
-                bundle=_initial_bundle,
+                # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: build the durable identity
+                # from the SAME run-scope bundle that writes durable Cells.
+                bundle=_run_scope_bundle(_r55_active_bundle, _final),
                 halo_px=int(halo_px),
                 halo_provenance=halo_provenance,
                 global_gauge=global_gauge,
@@ -19581,11 +19833,18 @@ def _run_single(
                 )
                 # M4: persist the selected working-set class at the FIRST state
                 # write AFTER selection. backend/tile/parity are never rewritten.
+                # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: the frozen class/tile comes
+                # from the SAME run-scope bundle + execution contract as the
+                # identity, so state/identity/working-set cannot disagree.
                 try:
-                    _ws_identity = (
-                        getattr(_run_scope_bundle(_r55_active_bundle, _final), "working_set_block", None)
-                        or getattr(_initial_bundle, "working_set_block", None)
-                        or {}
+                    _ws_scope_bundle = _run_scope_bundle(
+                        _r55_active_bundle, _final
+                    )
+                    _ws_identity = _r55_run_store_working_set(
+                        _ws_scope_bundle,
+                        _r55_execution_contract_from_bundle(
+                            _ws_scope_bundle
+                        ),
                     )
                     if _ws_identity.get("class"):
                         zres.attach_working_set(
@@ -19593,7 +19852,7 @@ def _run_single(
                             {
                                 "class": str(_ws_identity["class"]),
                                 "tile_px": int(
-                                    _ws_identity.get("tile_size") or 0
+                                    _ws_identity.get("tile_px") or 0
                                 ),
                                 "column_batch": (
                                     None

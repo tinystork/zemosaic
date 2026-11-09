@@ -12,6 +12,7 @@ HELPER/coverage probe, not a reproduction of the original orchestration.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -33,9 +34,24 @@ import m4_resume_harness as HARNESS  # noqa: E402
 MIB = 2 ** 20
 
 
+def _gpu_identity(identity):
+    """The same scientific identity under the GPU execution contract.
+
+    ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a durable GPU commit is only legal when
+    the frozen identity says ``backend='gpu'``. These component tests exercise
+    the GPU commit path, so their store fixture must freeze the SAME contract
+    the GPU executor writes (backend gpu, same tile, qualified parity).
+    """
+    clone = json.loads(json.dumps(identity))
+    block = clone["science_contract"]["backend"]
+    block["backend"] = "gpu"
+    block["parity_qualified"] = True
+    return zrs.validate_run_identity(clone)
+
+
 def _store_registry(tmp_path, *, run_id="gpu-commit"):
     rows = HARNESS.ensure_inputs(tmp_path / "in")
-    identity = HARNESS.make_identity(run_id, rows)
+    identity = _gpu_identity(HARNESS.make_identity(run_id, rows))
     root = tmp_path / "store"
     store = zrs.RunCellStore.open(
         root,
