@@ -155,6 +155,7 @@ class ResumeLegacyBackendIdentity(ResumeError):
         commit_backends: Sequence[str] = (),
         commit_count: int = 0,
         detail: str | None = None,
+        reason_code: str | None = None,
     ):
         super().__init__(message)
         self.frozen_backend = str(frozen_backend)
@@ -162,6 +163,8 @@ class ResumeLegacyBackendIdentity(ResumeError):
         self.commit_backends = [str(v) for v in commit_backends]
         self.commit_count = int(commit_count)
         self.detail = detail
+        if reason_code is not None:
+            self.reason_code = str(reason_code)
 
 
 # ---------------------------------------------------------------------------
@@ -723,55 +726,69 @@ def _stat_token(path: Path) -> tuple[int, int]:
 
 
 def detect_legacy_backend_identity(store: zrs.RunCellStore) -> dict | None:
-    """Detect the known bug: CPU-frozen identity + GPU-declaring commits.
+    """Detect pre-fix durable backend inconsistencies (fail-closed diagnosis).
 
-    ZM-ACTIVE-RESUME-FROZEN-IDENTITY: older builds froze the durable identity
-    from the provisional CPU planning bundle while the ACTIVE GPU executor wrote
-    the Cells. Such a store is INTERNALLY INCONSISTENT. The immutable identity is
-    never rewritten and the commits are never modified. Recovery would require
-    the complete effective GPU contract (backend AND execution tile) to be
-    provable from durable evidence; a commit record carries the backend but not
-    the execution tile, so it is NOT provable here.
+    ZM-ACTIVE-RESUME-FROZEN-IDENTITY (REWORK-1): a durable commit is now
+    fail-closed, so every newly written commit matches the frozen identity. A
+    store written by an older build can still hold commits whose backend is
+    ``unknown``/invalid or disagrees with the frozen identity. Such a store is
+    INTERNALLY INCONSISTENT and must be refused explicitly; the immutable
+    identity and every commit are never rewritten.
 
     Returns ``None`` for a consistent store, or a diagnostic dict describing the
-    inconsistency. Never mutates anything.
+    first class of inconsistency. Never mutates anything.
+
+    * ``legacy_unqualified_backend_identity`` — a commit backend is not a valid
+      execution token (``unknown``, empty, malformed, another token).
+    * ``legacy_inconsistent_backend_identity`` — every token is valid but at
+      least one disagrees with the frozen backend (the known real CPU-identity /
+      GPU-commit shape is this class).
     """
     contract = store.identity["science_contract"]["backend"]
     frozen_backend = str(contract["backend"])
-    if frozen_backend != "cpu":
-        return None
     backends: list[str] = []
-    count = 0
     for record in store.iter_commit_records():
-        count += 1
         backends.append(str(record.backend))
-    if count == 0:
+    if not backends:
         return None
-    # Only execution backends carry this meaning; an unknown token is not
-    # evidence of a backend switch.
-    execution = [b for b in backends if b in ("cpu", "gpu")]
-    if not execution:
+
+    invalid = sorted({b for b in backends if b not in ("cpu", "gpu")})
+    mismatched = sorted(
+        {b for b in backends if b in ("cpu", "gpu") and b != frozen_backend}
+    )
+    if not invalid and not mismatched:
         return None
-    gpu = [b for b in execution if b == "gpu"]
-    if not gpu:
-        return None
+
+    if invalid:
+        reason_code = "legacy_unqualified_backend_identity"
+        detail = (
+            "one or more immutable commit records do not declare a valid "
+            f"execution backend {sorted(set(backends))}; the frozen identity "
+            f"declares backend={frozen_backend!r}. The complete effective "
+            "execution contract is not provable from durable evidence, so "
+            "this run stays forensic-only and is never silently migrated"
+        )
+    else:
+        reason_code = "legacy_inconsistent_backend_identity"
+        detail = (
+            "the frozen science identity declares "
+            f"backend={frozen_backend!r} but immutable commit records declare "
+            f"backend(s) {sorted(set(backends))}; the complete effective "
+            "execution contract (backend AND execution tile) is not provable "
+            "from durable evidence, so this run stays forensic-only and is "
+            "never silently migrated"
+        )
     return {
-        "reason_code": "legacy_inconsistent_backend_identity",
+        "reason_code": reason_code,
         "frozen_backend": frozen_backend,
         "frozen_tile_px": int(contract["tile_px"]),
         "parity_qualified": bool(contract["parity_qualified"]),
-        "commit_count": int(count),
-        "commit_backends": sorted(set(execution)),
-        "gpu_commit_count": int(len(gpu)),
-        "cpu_commit_count": int(len(execution) - len(gpu)),
+        "commit_count": int(len(backends)),
+        "commit_backends": sorted(set(backends)),
+        "invalid_backends": invalid,
+        "mismatched_backends": mismatched,
         "recoverable": False,
-        "detail": (
-            "the frozen science identity declares backend='cpu' but immutable "
-            f"commit records declare backend(s) {sorted(set(execution))}; the "
-            "complete effective GPU contract (backend AND execution tile) is "
-            "not provable from durable evidence, so this run stays "
-            "forensic-only and is never silently migrated"
-        ),
+        "detail": detail,
     }
 
 
@@ -860,21 +877,24 @@ class ResumeBootstrap:
             legacy = detect_legacy_backend_identity(store)
             if legacy is not None:
                 raise ResumeLegacyBackendIdentity(
-                    "resume refused: legacy_inconsistent_backend_identity — "
-                    f"the frozen identity declares backend="
-                    f"{legacy['frozen_backend']!r} tile_px="
+                    "resume refused: "
+                    f"{legacy['reason_code']} — the frozen identity declares "
+                    f"backend={legacy['frozen_backend']!r} tile_px="
                     f"{legacy['frozen_tile_px']} while {legacy['commit_count']} "
-                    f"immutable commit(s) declare {legacy['commit_backends']}; "
-                    "the complete effective GPU contract is not provable from "
+                    f"immutable commit(s) declare {legacy['commit_backends']} "
+                    f"(invalid={legacy['invalid_backends']}, "
+                    f"mismatched={legacy['mismatched_backends']}); the complete "
+                    "effective execution contract is not provable from "
                     "durable evidence, so this run is never silently migrated. "
-                    "The two valid commits and the immutable identity are "
-                    "preserved as forensic evidence; start a NEW run in a NEW "
-                    "output folder to resume the science.",
+                    "The immutable identity and every commit are preserved as "
+                    "forensic evidence; start a NEW run in a NEW output folder "
+                    "to resume the science.",
                     frozen_backend=legacy["frozen_backend"],
                     frozen_tile_px=legacy["frozen_tile_px"],
                     commit_backends=legacy["commit_backends"],
                     commit_count=legacy["commit_count"],
                     detail=legacy["detail"],
+                    reason_code=legacy["reason_code"],
                 )
         except Exception:
             store.close()

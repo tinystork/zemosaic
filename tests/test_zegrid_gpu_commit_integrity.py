@@ -71,6 +71,14 @@ def _store_registry(tmp_path, *, run_id="gpu-commit"):
 def _accept(registry, index, *, attempt="gpu-unit"):
     cid = HARNESS.CELL_IDS[index]
     payload = HARNESS.compute_cell(index)
+    # ZM-ACTIVE-RESUME-FROZEN-IDENTITY REWORK-1: a GPU unit must DECLARE the GPU
+    # backend in its payload too. A CPU-labelled payload committed as gpu is
+    # exactly the contradictory metadata the store now refuses.
+    payload = dict(payload)
+    payload["backend_used"] = "gpu"
+    record = dict(payload["record"])
+    record["backend_used"] = "gpu"
+    payload["record"] = record
     receipt = registry.accept(
         payload, backend="gpu", plan_generation=0, attempt_id=f"{attempt}:{cid}"
     )

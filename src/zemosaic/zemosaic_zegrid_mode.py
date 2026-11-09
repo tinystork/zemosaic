@@ -3784,6 +3784,31 @@ def _frozen_gpu_admission_refusal(
     )
 
 
+def _r55_require_frozen_gpu_mapping(frozen_admission, mapping) -> None:
+    """Fail closed unless a GPU mapping re-admits the FROZEN tile exactly.
+
+    ZM-ACTIVE-RESUME-FROZEN-IDENTITY (REWORK-1 L1): a defense-in-depth check
+    owned by the ADMISSION step itself, so the guarantee does not depend on the
+    single publish path calling it. No-op for a fresh run or a CPU freeze.
+    """
+    if frozen_admission is None:
+        return
+    if str(frozen_admission["backend"]) != "gpu":
+        return
+    frozen_tile = int(frozen_admission["tile_px"])
+    got = int(mapping["gpu_streaming_tile"])
+    if got != frozen_tile:
+        raise _frozen_gpu_admission_refusal(
+            frozen_admission,
+            detail=(
+                "the resumed ACTIVE GPU admission selected "
+                f"tile_px={got}, but the frozen contract is "
+                f"tile_px={frozen_tile}"
+            ),
+            admitted_tile=got,
+        )
+
+
 def _frozen_admission_refusal(
     frozen_admission, *, tile_trials, budget_bytes, raw_available_bytes,
     detail=None,
@@ -15241,20 +15266,7 @@ def _run_single(
                 is capped at the frozen tile above; this exact check is the
                 final authority on the admitted mapping.
                 """
-                cap = _r55_frozen_gpu_tile_cap()
-                if cap is None:
-                    return
-                got = int(mapping["gpu_streaming_tile"])
-                if got != cap:
-                    raise _frozen_gpu_admission_refusal(
-                        _frozen_admission,
-                        detail=(
-                            "the resumed ACTIVE GPU admission selected "
-                            f"tile_px={got}, but the frozen contract is "
-                            f"tile_px={cap}"
-                        ),
-                        admitted_tile=got,
-                    )
+                _r55_require_frozen_gpu_mapping(_frozen_admission, mapping)
 
             def _r55_gpu_attempt(initial_bundle):
                 """Decide + admit ONE ACTIVE GPU attempt on an initial bundle."""
@@ -15270,10 +15282,17 @@ def _run_single(
                     readiness=_r55_readiness,
                     max_gpu_tile=_r55_frozen_gpu_tile_cap(),
                 )
-                return (_attempt_decision,) + _r55_active_gpu_admit(
+                _admitted = _r55_active_gpu_admit(
                     initial_bundle=initial_bundle,
                     decision=_attempt_decision,
                 )
+                # L1 defense-in-depth: the ADMISSION step itself refuses a
+                # mapping that does not equal the frozen GPU tile, so no future
+                # publish path can bypass the freeze.
+                _r55_require_frozen_gpu_mapping(
+                    _frozen_admission, _admitted[2]
+                )
+                return (_attempt_decision,) + _admitted
 
             def _r55_publish_gpu_admission(*, fallback_count):
                 nonlocal _r55_active_preflight_adm, _r55_active_preflight_trail

@@ -31,6 +31,7 @@ These tests prove, without a product run or a real corpus:
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -670,7 +671,28 @@ def test_gpu_frozen_resume_with_a_gpu_selects_gpu():
     assert zz._frozen_planning_gpu(frozen, gpu_used=True) is True
 
 
-def test_gpu_tile_cap_never_enlarges_the_resume_ladder():
+def test_frozen_gpu_mapping_guard_is_owned_by_admission():
+    """L1: the admission step itself refuses a non-frozen GPU tile."""
+    frozen = _admission(213, backend="gpu")
+    zz._r55_require_frozen_gpu_mapping(
+        frozen, {"gpu_streaming_tile": 213}
+    )
+    with pytest.raises(zres.ResumeFrozenAdmissionUnavailable) as excinfo:
+        zz._r55_require_frozen_gpu_mapping(
+            frozen, {"gpu_streaming_tile": 128}
+        )
+    assert excinfo.value.frozen_backend == "gpu"
+    assert excinfo.value.frozen_tile_px == 213
+    # No-op for a fresh run or a CPU freeze (never a false refusal).
+    zz._r55_require_frozen_gpu_mapping(
+        None, {"gpu_streaming_tile": 128}
+    )
+    zz._r55_require_frozen_gpu_mapping(
+        _admission(64, backend="cpu"), {"gpu_streaming_tile": 128}
+    )
+
+
+def test_frozen_gpu_tile_cap_never_enlarges_the_resume_ladder():
     """The resume ladder can never grow above the frozen GPU tile."""
     declared = (256, 213, 128, 64)
     assert zz._r55_cap_gpu_tile_ladder(declared, 213) == (213, 128, 64)
@@ -787,3 +809,263 @@ def test_consistent_cpu_store_is_not_flagged_as_legacy(tmp_path):
         assert zres.detect_legacy_backend_identity(store) is None
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# 7 — REWORK-1: commit backend declarations are fail-closed and non-precedential
+# ---------------------------------------------------------------------------
+
+
+def _without_backend(result):
+    clone = dict(result)
+    clone.pop("backend_used", None)
+    record = dict(clone["record"])
+    record.pop("backend_used", None)
+    clone["record"] = record
+    return clone
+
+
+def _with_backend(result, *, top=None, record=None):
+    clone = dict(result)
+    if top is None:
+        clone.pop("backend_used", None)
+    else:
+        clone["backend_used"] = top
+    rec = dict(clone["record"])
+    if record is None:
+        rec.pop("backend_used", None)
+    else:
+        rec["backend_used"] = record
+    clone["record"] = rec
+    return clone
+
+
+def _snapshot_tree(root):
+    root = Path(root)
+    snap = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel == "LOCK" or rel.startswith("tmp/"):
+            continue
+        snap[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return snap
+
+
+def _rewrite_commit_backend(root, backend):
+    path = sorted((Path(root) / "commits").glob("*.json"))[0]
+    manifest = json.loads(path.read_bytes())
+    manifest["backend"] = str(backend)
+    body = {
+        key: value
+        for key, value in manifest.items()
+        if key != "commit_sha256"
+    }
+    manifest["commit_sha256"] = hashlib.sha256(
+        zrs.canonical_json(body)
+    ).hexdigest()
+    path.write_bytes(zrs.canonical_json(manifest))
+    return path
+
+
+def test_commit_without_any_backend_declaration_is_refused(tmp_path):
+    root = tmp_path / "run"
+    store = _open_store(root, make_identity(tile_px=96))
+    try:
+        before = _snapshot_tree(root)
+        with pytest.raises(zrs.StoreFormatError) as excinfo:
+            store.commit_cell(
+                _without_backend(complete_result("r0000c0000")),
+                attempt_id="none-1",
+            )
+        assert "NO backend declaration" in str(excinfo.value)
+        assert _snapshot_tree(root) == before
+        assert store.attempts("r0000c0000") == []
+    finally:
+        store.close()
+
+
+def test_commit_unknown_or_malformed_token_is_refused(tmp_path):
+    root = tmp_path / "run"
+    store = _open_store(root, make_identity(tile_px=96))
+    try:
+        before = _snapshot_tree(root)
+        for token in ("unknown", "tpu", "  "):
+            with pytest.raises(zrs.StoreFormatError) as excinfo:
+                store.commit_cell(
+                    _with_backend(
+                        complete_result("r0000c0001"),
+                        top=token,
+                        record=token,
+                    ),
+                    attempt_id=f"bad-{token!r}",
+                )
+            message = str(excinfo.value)
+            assert (
+                "not a valid execution backend" in message
+                or "is empty" in message
+            )
+        assert _snapshot_tree(root) == before
+        assert store.attempts("r0000c0001") == []
+    finally:
+        store.close()
+
+
+def test_explicit_correct_cannot_hide_a_conflicting_top_level(tmp_path):
+    root = tmp_path / "run"
+    store = _open_store(root, make_identity(tile_px=96))
+    try:
+        before = _snapshot_tree(root)
+        with pytest.raises(zrs.StoreFormatError) as excinfo:
+            store.commit_cell(
+                _with_backend(
+                    complete_result("r0000c0000"),
+                    top="gpu",
+                    record="cpu",
+                ),
+                attempt_id="conflict-1",
+                backend="cpu",
+            )
+        message = str(excinfo.value)
+        assert "CONFLICT" in message
+        assert "argument backend='cpu'" in message
+        assert "result.backend_used='gpu'" in message
+        assert _snapshot_tree(root) == before
+        assert store.attempts("r0000c0000") == []
+    finally:
+        store.close()
+
+
+def test_correct_top_level_cannot_hide_a_conflicting_nested_record(tmp_path):
+    root = tmp_path / "run"
+    store = _open_store(root, make_identity(tile_px=96))
+    try:
+        before = _snapshot_tree(root)
+        with pytest.raises(zrs.StoreFormatError) as excinfo:
+            store.commit_cell(
+                _with_backend(
+                    complete_result("r0000c0000"),
+                    top="cpu",
+                    record="gpu",
+                ),
+                attempt_id="conflict-2",
+            )
+        assert "CONFLICT" in str(excinfo.value)
+        assert "result.record.backend_used='gpu'" in str(excinfo.value)
+        assert _snapshot_tree(root) == before
+        assert store.attempts("r0000c0000") == []
+    finally:
+        store.close()
+
+
+def test_all_declarations_consistent_commit_is_accepted(tmp_path):
+    root = tmp_path / "run"
+    store = _open_store(
+        root, make_identity(tile_px=213, backend="gpu", parity=True)
+    )
+    try:
+        receipt = store.commit_cell(
+            _with_backend(
+                complete_result("r0000c0000", backend="gpu"),
+                top="gpu",
+                record="gpu",
+            ),
+            attempt_id="consistent-1",
+            backend="gpu",
+        )
+        assert receipt.backend == "gpu"
+        assert store.commit_record("r0000c0000", "consistent-1").backend == "gpu"
+    finally:
+        store.close()
+
+
+def test_matching_payload_cannot_launder_a_pre_fix_unknown_commit(tmp_path):
+    root = tmp_path / "run"
+    identity = make_identity(tile_px=96)
+    store = _open_store(root, identity)
+    try:
+        result = complete_result("r0000c0000")
+        store.commit_cell(result, attempt_id="cpu-1", backend="cpu")
+    finally:
+        store.close()
+    _rewrite_commit_backend(root, "unknown")
+
+    store = _open_store(root, identity)
+    try:
+        # The SAME payload/attempt now matches the durable SHA, but the durable
+        # backend is unqualified; an idempotent return must be refused.
+        with pytest.raises(zrs.StoreFormatError) as excinfo:
+            store.commit_cell(
+                complete_result("r0000c0000"),
+                attempt_id="cpu-1",
+                backend="cpu",
+            )
+        assert "already durable" in str(excinfo.value)
+        assert "unknown" in str(excinfo.value)
+    finally:
+        store.close()
+
+
+def test_unknown_durable_record_is_detected_and_lock_is_released(tmp_path):
+    root = tmp_path / "run"
+    identity = make_identity(tile_px=96)
+    store = _open_store(root, identity)
+    try:
+        store.commit_cell(
+            complete_result("r0000c0000"), attempt_id="cpu-1", backend="cpu"
+        )
+    finally:
+        store.close()
+    _rewrite_commit_backend(root, "unknown")
+    # The bootstrap reads the frozen state BEFORE the backend diagnostic; a real
+    # legacy store has one. Write it so the refusal under test is the backend
+    # diagnostic, not a missing-state error.
+    _write_state(
+        root,
+        run_id=str(identity["run_id"]),
+        admission=None,
+    )
+
+    state_before = (root / "state.json").read_bytes() if (
+        root / "state.json"
+    ).exists() else None
+    identity_before = (root / "run.json").read_bytes()
+    commits_before = sorted((root / "commits").iterdir())
+    with pytest.raises(zres.ResumeLegacyBackendIdentity) as excinfo:
+        zres.ResumeBootstrap.open(root)
+    exc = excinfo.value
+    assert exc.reason_code == "legacy_unqualified_backend_identity"
+    assert exc.frozen_backend == "cpu"
+    assert exc.commit_backends == ["unknown"]
+    assert (root / "run.json").read_bytes() == identity_before
+    if state_before is not None:
+        assert (root / "state.json").read_bytes() == state_before
+    assert sorted((root / "commits").iterdir()) == commits_before
+    # Lock released by the refusal: the store reopens immediately.
+    again = zrs.RunCellStore.open(root, identity=None)
+    again.close()
+
+
+def test_gpu_identity_with_a_cpu_commit_is_detected_as_legacy(tmp_path):
+    root = tmp_path / "run"
+    identity = make_identity(tile_px=213, backend="gpu", parity=True)
+    store = _open_store(root, identity)
+    try:
+        store.commit_cell(
+            complete_result("r0000c0000", backend="gpu"),
+            attempt_id="gpu-1",
+            backend="gpu",
+        )
+    finally:
+        store.close()
+    _rewrite_commit_backend(root, "cpu")
+
+    store = zrs.RunCellStore.open(root, identity=None, budget=_budget())
+    try:
+        report = zres.detect_legacy_backend_identity(store)
+    finally:
+        store.close()
+    assert report["reason_code"] == "legacy_inconsistent_backend_identity"
+    assert report["frozen_backend"] == "gpu"
+    assert report["mismatched_backends"] == ["cpu"]

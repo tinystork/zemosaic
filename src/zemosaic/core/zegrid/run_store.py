@@ -2269,6 +2269,102 @@ class RunCellStore:
         }
 
     # -- commit ----------------------------------------------------------
+    def _require_consistent_commit_backend(
+        self,
+        result: Mapping[str, Any],
+        *,
+        backend: str | None,
+        fingerprint: Mapping[str, Any],
+    ) -> str:
+        """Resolve and validate the ONE execution backend of a durable commit.
+
+        ZM-ACTIVE-RESUME-FROZEN-IDENTITY REWORK-1: the durable identity declares
+        a known execution backend (``cpu`` or ``gpu``). A commit is fail-closed:
+        it is refused BEFORE any object/manifest/index write unless every
+        available declaration is a valid execution token, all declarations
+        agree, and the agreed token IS the frozen backend.
+
+        Declarations are collected independently (never by precedence):
+        the explicit argument, ``result.backend_used``, the nested
+        ``result.record.backend_used`` and the fingerprint's derived echo. A
+        missing/empty/unknown/malformed token or any disagreement refuses; an
+        explicit correct value can never hide a conflicting payload value.
+        """
+        frozen = str(self._identity["science_contract"]["backend"]["backend"])
+        if frozen not in ("cpu", "gpu"):
+            raise StoreFormatError(
+                "the frozen run identity declares an unsupported execution "
+                f"backend {frozen!r}; refusing every durable commit"
+            )
+
+        record = result.get("record")
+        record_map = record if isinstance(record, Mapping) else {}
+        declarations: list[tuple[str, str]] = []
+
+        def _add(label: str, value: Any) -> None:
+            if value is None:
+                return
+            if not isinstance(value, str):
+                raise StoreFormatError(
+                    f"cell backend declaration {label} must be a string, got "
+                    f"{type(value).__name__}; refusing the durable commit "
+                    "(no cell was written)"
+                )
+            token = value.strip()
+            if not token:
+                raise StoreFormatError(
+                    f"cell backend declaration {label} is empty; the frozen "
+                    f"identity requires backend={frozen!r} "
+                    "(no cell was written)"
+                )
+            if token not in ("cpu", "gpu"):
+                raise StoreFormatError(
+                    f"cell backend declaration {label}={value!r} is not a "
+                    "valid execution backend (cpu|gpu); the frozen identity "
+                    f"requires backend={frozen!r} (no cell was written)"
+                )
+            declarations.append((label, token))
+
+        _add("argument backend", backend)
+        _add("result.backend_used", result.get("backend_used"))
+        _add("result.record.backend_used", record_map.get("backend_used"))
+        if not declarations:
+            raise StoreFormatError(
+                "cell has NO backend declaration (argument, result.backend_used "
+                "and result.record.backend_used are all absent); the frozen "
+                f"identity requires backend={frozen!r} "
+                "(no cell was written)"
+            )
+        tokens = {token for _label, token in declarations}
+        if len(tokens) != 1:
+            detail = ", ".join(
+                f"{label}={token!r}" for label, token in declarations
+            )
+            raise StoreFormatError(
+                "cell backend declarations CONFLICT ("
+                f"{detail}); a durable result may never mix execution "
+                "backends under one identity (no cell was written)"
+            )
+        token = next(iter(tokens))
+        if token != frozen:
+            raise StoreFormatError(
+                f"cell declares backend_used={token!r} but the frozen run "
+                f"identity contract is backend={frozen!r}; a durable result "
+                "may never mix execution backends under one identity "
+                "(no cell was written)"
+            )
+        # The fingerprint echo is DERIVED from the result/record pair above;
+        # ``unknown`` there means "no payload declaration" (the explicit
+        # argument covered it). A valid echo must agree with the resolved token.
+        echo = str(fingerprint.get("backend", "unknown"))
+        if echo != "unknown" and echo != token:
+            raise StoreFormatError(
+                "cell fingerprint backend echo "
+                f"{echo!r} disagrees with the resolved declaration "
+                f"{token!r} (no cell was written)"
+            )
+        return token
+
     def commit_cell(
         self,
         result: Mapping[str, Any],
@@ -2320,11 +2416,30 @@ class RunCellStore:
                 "gauge_status"
             )
         payload_sha = str(fingerprint["payload_sha256"])
+        # ZM-ACTIVE-RESUME-FROZEN-IDENTITY REWORK-1: resolve the backend BEFORE
+        # idempotence or any write. A missing/empty/unknown/malformed token, a
+        # disagreement, or a non-frozen backend refuses fail-closed.
+        backend_token = self._require_consistent_commit_backend(
+            result, backend=backend, fingerprint=fingerprint
+        )
 
         # -- idempotence check BEFORE any write ---------------------------
         existing = self._commits.get(cell_id, {}).get(attempt)
         if existing is not None:
             if existing.payload_sha256 == payload_sha:
+                # REWORK-1: an idempotent return is allowed ONLY when the
+                # EXISTING durable backend is itself the frozen contract. A
+                # matching payload must never launder a contradictory or
+                # pre-fix unqualified declaration.
+                existing_backend = str(existing.backend)
+                if existing_backend != backend_token:
+                    raise StoreFormatError(
+                        f"cell {cell_id} attempt {attempt!r} is already durable "
+                        f"with backend={existing_backend!r}, but this commit "
+                        f"declares backend={backend_token!r}; refusing an "
+                        "idempotent return that would hide a mixed backend "
+                        "(no cell was written)"
+                    )
                 verified = self.verify_cell(cell_id, attempt)
                 if not verified["valid"]:
                     raise StoreIntegrityError(
@@ -2402,32 +2517,6 @@ class RunCellStore:
                     f"with the run contract {tokens}"
                 )
 
-        backend_token = str(
-            backend
-            or result.get("backend_used")
-            or payload_meta.get("backend_used")
-            or fingerprint["backend"]
-            or "unknown"
-        )
-        # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: the durable identity's backend is
-        # the run's ONE execution contract. A commit that declares a DIFFERENT
-        # execution backend would create a mixed result under one identity, so
-        # it is refused BEFORE any payload/object is written. No implicit
-        # parity exemption exists: a backend transition would need an explicit
-        # declared contract, which this schema does not represent.
-        frozen_backend = str(
-            self._identity["science_contract"]["backend"]["backend"]
-        )
-        if (
-            backend_token in ("cpu", "gpu")
-            and backend_token != frozen_backend
-        ):
-            raise StoreFormatError(
-                f"cell {cell_id} declares backend_used={backend_token!r} but "
-                f"the frozen run identity contract is backend={frozen_backend!r}; "
-                "a durable result may never mix execution backends under one "
-                "identity (no cell was written)"
-            )
         created = int(time.time_ns())
         manifest = {
             "schema": COMMIT_SCHEMA,
