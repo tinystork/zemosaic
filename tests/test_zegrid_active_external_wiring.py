@@ -861,6 +861,486 @@ def test_run_zegrid_mode_auto_external_gpu_host_ram_declines_to_cpu(
 
 
 @pytest.mark.slow
+def test_run_zegrid_mode_auto_bounded_stream_gpu_host_ram_declines_to_cpu(
+    tmp_path, monkeypatch
+):
+    """ZM-ACTIVE-BOUNDED-STREAM-GPU-HOSTRAM — the missing bounded-stream gate.
+
+    Real product witness (byte-identical runtime):
+
+    * AUTO dense REFUSES host RAM at plan_layout and consumes the ONE
+      dense->bounded profile transition;
+    * the bounded initial bundle is the RAM STREAM class (NOT external);
+    * the ACTIVE GPU planner refuses ``R55_REFUSE_HOST_RAM`` BEFORE any
+      gauge/stack/work;
+    * the consumed profile retry must NOT be fatal: the GPU is declined and
+      the SAME bundle/pin is revalidated by the CPU ACTIVE gate, which admits
+      the SAME ``stream@128`` plan. No second profile switch, no forced
+      external.
+    """
+    inp = _write_e2e_corpus(tmp_path)
+    ref_out = tmp_path / "ref"
+    out = tmp_path / "out"
+
+    # Reference: the SAME corpus/config on bounded RAM stream.
+    zz.run_zegrid_mode(
+        str(inp), str(ref_out), zconfig=_e2e_config(),
+        storage_profile="bounded", cell_gauge_mode="per_cell",
+    )
+    ref_manifest = json.loads((ref_out / "zegrid_manifest.json").read_text())
+    assert ref_manifest["stack_working_set"] == zz.WORKING_SET_RAM_TILE
+
+    gauge_calls = []
+    real_gauge = zz.zphot.compute_global_gauge
+
+    def _gauge_spy(*args, **kwargs):
+        gauge_calls.append(1)
+        return real_gauge(*args, **kwargs)
+
+    gpu_attempts = []
+    cpu_decisions = []
+    real_cpu_decide = zz._r55_active_decide
+
+    def _decline_host_ram(**kwargs):
+        bundle = kwargs["bundle"]
+        gpu_attempts.append(
+            {
+                "profile": zz._STORAGE_EFFECTIVE,
+                "fallback_count": int(zz._STORAGE_FALLBACK_COUNT),
+                "working_set": str(bundle.stack_working_set),
+                "mode": str(bundle.chosen_mode),
+                "layout": tuple(int(v) for v in bundle.envelope.layout),
+                "refinement_rank": int(bundle.envelope.refinement_rank),
+                "cell_ids": tuple(
+                    sorted(
+                        str(c.cell_id)
+                        for (_r, _c, c, _p, _m) in bundle.cell_ctxs
+                    )
+                ),
+                "gauge_calls_at_refusal": len(gauge_calls),
+            }
+        )
+        # EXACT witness typing: the minimum margin-applied host peak of the
+        # resident GPU rung exceeds the run's B_plan. Nothing has executed.
+        raise zz._R55GpuRefused(
+            renv.REASON_REFUSE_HOST_RAM,
+            "bounded resident GPU host peak exceeds B_plan before any work",
+            record={"b_plan_bytes": int(bundle.envelope.budget_bytes)},
+        )
+
+    def _cpu_decide(**kwargs):
+        bundle = kwargs["bundle"]
+        cpu_decisions.append(
+            {
+                "working_set": str(bundle.stack_working_set),
+                "mode": str(bundle.chosen_mode),
+                "layout": tuple(int(v) for v in bundle.envelope.layout),
+                "refinement_rank": int(bundle.envelope.refinement_rank),
+                "cell_ids": tuple(
+                    sorted(
+                        str(c.cell_id)
+                        for (_r, _c, c, _p, _m) in bundle.cell_ctxs
+                    )
+                ),
+            }
+        )
+        return real_cpu_decide(**kwargs)
+
+    messages = []
+
+    def _cb(msg, _cur, lvl, **_kw):
+        messages.append((str(lvl), str(msg)))
+
+    def _stream(n, hw, tile=zz.STREAM_TILE_SIZE, channels=3,
+                storage_profile=None):
+        # Dense must refuse host RAM (consuming the ONE profile transition);
+        # the bounded stream plan fits the SAME 512 MiB observation.
+        if str(storage_profile) == "bounded":
+            return 300 * MIB
+        return 6 * GIB
+
+    with monkeypatch.context() as m:
+        m.setattr(zz, "available_memory_bytes", lambda: 512 * MIB)
+        m.setattr(zz, "_estimate_streaming_bytes", _stream)
+        m.setattr(
+            zz, "_r55_resolve_gpu_probe",
+            lambda *_a, **_k: (
+                True,
+                "synthetic",
+                {
+                    "available": True,
+                    "device": "synthetic-gpu",
+                    "cupy_version": "n/a",
+                    "vram_total_bytes": 2 * GIB,
+                    "vram_free_bytes": 2 * GIB,
+                    "reason": None,
+                },
+                1 * GIB,
+            ),
+        )
+        m.setattr(zz, "_r55_active_gpu_decide", _decline_host_ram)
+        m.setattr(zz, "_r55_active_decide", _cpu_decide)
+        m.setattr(zz.zphot, "compute_global_gauge", _gauge_spy)
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=_e2e_config(),
+            storage_profile="auto", use_gpu=True,
+            cell_gauge_mode="per_cell", progress_callback=_cb,
+        )
+
+    # ---- the exact pre-state: ONE consumed dense->bounded transition ----
+    snap = zz._storage_policy_snapshot()
+    assert snap["requested"] == "auto"
+    assert snap["effective"] == "bounded"
+    assert snap["fallback_count"] == 1
+    assert len(snap["transitions"]) == 1
+    assert snap["transitions"][0]["from"] == "dense"
+    assert snap["transitions"][0]["to"] == "bounded"
+    assert snap["transitions"][0]["phase"] == "plan_layout"
+    assert snap["transitions"][0]["reason_code"] == (
+        renv.REASON_REFUSE_HOST_RAM
+    )
+
+    # ---- GPU requested on the bounded RAM/stream bundle, refused pre-work ----
+    assert len(gpu_attempts) == 1
+    attempt = gpu_attempts[0]
+    assert attempt["profile"] == "bounded"
+    assert attempt["fallback_count"] == 1
+    assert attempt["working_set"] == zz.WORKING_SET_RAM_TILE
+    assert attempt["mode"] == "stream"
+    assert attempt["gauge_calls_at_refusal"] == 0
+
+    # NO second profile switch, NO external forced: exactly ONE CPU decision on
+    # the SAME class/pin.
+    assert len(zz._STORAGE_TRANSITIONS) == 1
+    assert int(zz._STORAGE_FALLBACK_COUNT) == 1
+    assert len(cpu_decisions) == 1
+    cpu = cpu_decisions[0]
+    assert cpu["working_set"] == zz.WORKING_SET_RAM_TILE
+    assert cpu["mode"] == "stream"
+    assert cpu["layout"] == attempt["layout"]
+    assert cpu["refinement_rank"] == attempt["refinement_rank"]
+    assert cpu["cell_ids"] == attempt["cell_ids"]
+
+    # The refusal is explicit, typed and ordered BEFORE the gauge.
+    decline_idx = next(
+        i for i, (_lvl, msg) in enumerate(messages)
+        if "ACTIVE GPU declined before the gauge/stack" in msg
+    )
+    gauge_idx = next(
+        i for i, (_lvl, msg) in enumerate(messages)
+        if "computing global photometric gauge" in msg
+    )
+    assert decline_idx < gauge_idx
+    assert any(
+        renv.REASON_REFUSE_HOST_RAM in msg
+        for _lvl, msg in messages
+        if "ACTIVE GPU declined before the gauge/stack" in msg
+    )
+    assert gauge_calls == [1]
+
+    # ---- the SAME CPU stream plan really executed ----
+    man = json.loads((out / "zegrid_manifest.json").read_text())
+    assert (out / "mosaic_grid.fits").exists()
+    assert man["stack_working_set"] == zz.WORKING_SET_RAM_TILE
+    assert man["storage"]["effective"] == "bounded"
+    assert man["storage"]["fallback_count"] == 1
+    assert len(man["storage"]["transitions"]) == 1
+    scheduler = man["r55_scheduler"]
+    assert scheduler["mode"] == "active"
+    mapping = scheduler["mapping"]
+    assert mapping["cell_task_mode"] == "stream"
+    assert mapping["backend"] == "cpu"
+    assert mapping["storage"]["profile"] == "bounded"
+    assert int(mapping["cpu_streaming_tile"]) > 0
+
+    # Same FrozenIdentity: layout/rank/cells match the GPU-refused bundle.
+    identity = scheduler["identity"]
+    assert tuple(identity["layout"]) == attempt["layout"]
+    assert int(identity["refinement_rank"]) == attempt["refinement_rank"]
+    assert tuple(identity["cell_ids"]) == attempt["cell_ids"]
+    assert int(identity["halo_px"]) == int(_e2e_config().zegrid_halo_px)
+    assert len(identity["frame_ids"]) == 6
+
+    # ---- truthful GPU provenance: declined, never effective ----
+    gpu = man["gpu"]
+    assert gpu["requested"] is True
+    assert gpu["available"] is True
+    assert gpu["used"] is False
+    assert gpu["effective"] is False
+    assert gpu["actually_used"] is False
+    assert gpu["final_backend"] == "cpu"
+    assert gpu["fallback_reason"] == renv.REASON_REFUSE_HOST_RAM
+    pre = gpu["pre_execution_fallback"]
+    assert pre["reason_code"] == renv.REASON_REFUSE_HOST_RAM
+    assert pre["working_set_class"] == zz.WORKING_SET_RAM_TILE
+    assert pre["storage_profile"] == "bounded"
+    assert pre["decline"] == "decline_gpu_then_cpu_active"
+    assert pre["action"] == "decline_gpu_then_cpu_active"
+    fallback = scheduler["gpu_fallback"]
+    assert fallback["reason_code"] == renv.REASON_REFUSE_HOST_RAM
+    assert fallback["working_set_class"] == zz.WORKING_SET_RAM_TILE
+    assert fallback["storage_profile"] == "bounded"
+    assert fallback["decline"] == "decline_gpu_then_cpu_active"
+    assert fallback["action"] == "decline_gpu_then_cpu_active"
+
+    # No cell was ever externalised.
+    assert all(
+        (c.get("storage") or {}).get("working_set") != zz.WORKING_SET_EXTERNAL
+        for c in man.get("cells", [])
+    )
+
+    # ---- same science/coverage as the bounded RAM reference ----
+    for name in ("mosaic_grid.fits", "mosaic_grid_coverage.fits"):
+        np.testing.assert_array_equal(
+            _fits_array(ref_out / name), _fits_array(out / name),
+            err_msg=name,
+        )
+    ref_cells = [
+        (c["row"], c["col"], c["n_contributors"])
+        for c in ref_manifest.get("cells", [])
+    ]
+    out_cells = [
+        (c["row"], c["col"], c["n_contributors"])
+        for c in man.get("cells", [])
+    ]
+    assert out_cells == ref_cells
+
+
+@pytest.mark.slow
+def test_run_zegrid_mode_bounded_stream_gpu_host_ram_then_cpu_stream_refusal(
+    tmp_path, monkeypatch
+):
+    """Same seam, CPU ACTIVE stream ALSO misses HOST RAM.
+
+    The GPU is declined under the bounded condition; the CPU ACTIVE gate then
+    refuses the SAME stream bundle with a typed host-RAM miss. The EXISTING CPU
+    admission path (not the GPU catch) must select the external class at the
+    SAME FrozenIdentity — one profile transition only.
+    """
+    inp = _write_e2e_corpus(tmp_path)
+    out = tmp_path / "out"
+
+    external_calls = []
+    real_external = zz.zext.run_cell_streaming_external
+
+    def _spy(*args, **kwargs):
+        external_calls.append(kwargs.get("cell_id"))
+        return real_external(*args, **kwargs)
+
+    gpu_attempts = []
+    cpu_decisions = []
+    real_cpu_decide = zz._r55_active_decide
+
+    def _decline_host_ram(**kwargs):
+        bundle = kwargs["bundle"]
+        gpu_attempts.append(
+            {
+                "working_set": str(bundle.stack_working_set),
+                "layout": tuple(int(v) for v in bundle.envelope.layout),
+                "refinement_rank": int(bundle.envelope.refinement_rank),
+                "cell_ids": tuple(
+                    sorted(
+                        str(c.cell_id)
+                        for (_r, _c, c, _p, _m) in bundle.cell_ctxs
+                    )
+                ),
+            }
+        )
+        raise zz._R55GpuRefused(
+            renv.REASON_REFUSE_HOST_RAM,
+            "bounded resident GPU host peak exceeds B_plan before any work",
+            record={},
+        )
+
+    def _cpu_decide(**kwargs):
+        bundle = kwargs["bundle"]
+        cpu_decisions.append(
+            {
+                "working_set": str(bundle.stack_working_set),
+                "mode": str(bundle.chosen_mode),
+                "layout": tuple(int(v) for v in bundle.envelope.layout),
+                "refinement_rank": int(bundle.envelope.refinement_rank),
+                "cell_ids": tuple(
+                    sorted(
+                        str(c.cell_id)
+                        for (_r, _c, c, _p, _m) in bundle.cell_ctxs
+                    )
+                ),
+            }
+        )
+        if str(bundle.stack_working_set) != zz.WORKING_SET_EXTERNAL:
+            # Typed ACTIVE stream host-RAM miss at the real production seam.
+            raise zsched.PlanRefused(
+                renv.REASON_REFUSE_HOST_RAM,
+                "ACTIVE stream host peak exceeds the fresh margin ceiling",
+            )
+        return real_cpu_decide(**kwargs)
+
+    def _stream(n, hw, tile=zz.STREAM_TILE_SIZE, channels=3,
+                storage_profile=None):
+        if str(storage_profile) == "bounded":
+            return 300 * MIB
+        return 6 * GIB
+
+    with monkeypatch.context() as m:
+        m.setattr(zz, "available_memory_bytes", lambda: 512 * MIB)
+        m.setattr(zz, "_estimate_streaming_bytes", _stream)
+        m.setattr(
+            zz, "_r55_resolve_gpu_probe",
+            lambda *_a, **_k: (
+                True,
+                "synthetic",
+                {
+                    "available": True,
+                    "device": "synthetic-gpu",
+                    "cupy_version": "n/a",
+                    "vram_total_bytes": 2 * GIB,
+                    "vram_free_bytes": 2 * GIB,
+                    "reason": None,
+                },
+                1 * GIB,
+            ),
+        )
+        m.setattr(zz, "_r55_active_gpu_decide", _decline_host_ram)
+        m.setattr(zz, "_r55_active_decide", _cpu_decide)
+        m.setattr(zz.zext, "run_cell_streaming_external", _spy)
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=_e2e_config(),
+            storage_profile="auto", use_gpu=True,
+            cell_gauge_mode="per_cell",
+        )
+
+    # ONE dense->bounded transition, consumed during planning; none added here.
+    snap = zz._storage_policy_snapshot()
+    assert snap["effective"] == "bounded"
+    assert snap["fallback_count"] == 1
+    assert len(snap["transitions"]) == 1
+    assert len(zz._STORAGE_TRANSITIONS) == 1
+
+    # GPU declined on the RAM/stream bundle; CPU stream revalidated and refused.
+    assert len(gpu_attempts) == 1
+    assert gpu_attempts[0]["working_set"] == zz.WORKING_SET_RAM_TILE
+    assert len(cpu_decisions) == 2
+    stream_cpu, external_cpu = cpu_decisions
+    assert stream_cpu["working_set"] == zz.WORKING_SET_RAM_TILE
+    assert stream_cpu["mode"] == "stream"
+    assert external_cpu["working_set"] == zz.WORKING_SET_EXTERNAL
+    assert external_cpu["mode"] == "external"
+
+    # The external class was selected at the SAME pin, by the CPU path.
+    assert external_cpu["layout"] == gpu_attempts[0]["layout"]
+    assert external_cpu["refinement_rank"] == gpu_attempts[0]["refinement_rank"]
+    assert external_cpu["cell_ids"] == gpu_attempts[0]["cell_ids"]
+    assert stream_cpu["layout"] == external_cpu["layout"]
+    assert stream_cpu["cell_ids"] == external_cpu["cell_ids"]
+
+    # ---- the external executor REALLY ran; no stubbed success ----
+    man = json.loads((out / "zegrid_manifest.json").read_text())
+    assert (out / "mosaic_grid.fits").exists()
+    assert man["stack_working_set"] == zz.WORKING_SET_EXTERNAL
+    assert man["working_set"]["class"] == zz.WORKING_SET_EXTERNAL
+    scheduler = man["r55_scheduler"]
+    assert scheduler["mode"] == "active"
+    mapping = scheduler["mapping"]
+    assert mapping["cell_task_mode"] == "external"
+    assert mapping["working_set_class"] == zz.WORKING_SET_EXTERNAL
+    assert mapping["backend"] == "cpu"
+    assert mapping["storage"]["profile"] == "bounded"
+    identity = scheduler["identity"]
+    assert tuple(identity["layout"]) == gpu_attempts[0]["layout"]
+    assert int(identity["refinement_rank"]) == gpu_attempts[0]["refinement_rank"]
+    assert tuple(identity["cell_ids"]) == gpu_attempts[0]["cell_ids"]
+
+    ext_cells = [c for c in man.get("cells", []) if c.get("storage")]
+    assert ext_cells
+    assert external_calls and len(external_calls) == len(ext_cells)
+    for cell in ext_cells:
+        assert cell["storage"]["working_set"] == zz.WORKING_SET_EXTERNAL
+        assert cell["storage"]["profile"] == "bounded"
+
+    # ---- truthful GPU provenance: declined on the initial RAM class ----
+    gpu = man["gpu"]
+    assert gpu["used"] is False
+    assert gpu["effective"] is False
+    assert gpu["final_backend"] == "cpu"
+    fallback = scheduler["gpu_fallback"]
+    assert fallback["reason_code"] == renv.REASON_REFUSE_HOST_RAM
+    assert fallback["working_set_class"] == zz.WORKING_SET_RAM_TILE
+    assert fallback["storage_profile"] == "bounded"
+    assert fallback["decline"] == "decline_gpu_then_cpu_active"
+    assert fallback["action"] == "decline_gpu_then_cpu_active"
+
+
+@pytest.mark.slow
+def test_run_zegrid_mode_bounded_stream_gpu_non_host_ram_stays_terminal(
+    tmp_path, monkeypatch
+):
+    """A NON host-RAM GPU refusal stays fail-closed (no CPU decline)."""
+    inp = _write_e2e_corpus(tmp_path)
+    out = tmp_path / "out"
+
+    gauge_calls = []
+    real_gauge = zz.zphot.compute_global_gauge
+
+    def _gauge_spy(*args, **kwargs):
+        gauge_calls.append(1)
+        return real_gauge(*args, **kwargs)
+
+    gpu_attempts = []
+
+    def _decline_disk(**kwargs):
+        bundle = kwargs["bundle"]
+        gpu_attempts.append(str(bundle.stack_working_set))
+        raise zz._R55GpuRefused(
+            renv.REASON_REFUSE_DISK,
+            "GPU qualification refused for a non host-RAM reason",
+            record={},
+        )
+
+    def _stream(n, hw, tile=zz.STREAM_TILE_SIZE, channels=3,
+                storage_profile=None):
+        if str(storage_profile) == "bounded":
+            return 300 * MIB
+        return 6 * GIB
+
+    with monkeypatch.context() as m:
+        m.setattr(zz, "available_memory_bytes", lambda: 512 * MIB)
+        m.setattr(zz, "_estimate_streaming_bytes", _stream)
+        m.setattr(
+            zz, "_r55_resolve_gpu_probe",
+            lambda *_a, **_k: (
+                True,
+                "synthetic",
+                {
+                    "available": True,
+                    "device": "synthetic-gpu",
+                    "cupy_version": "n/a",
+                    "vram_total_bytes": 2 * GIB,
+                    "vram_free_bytes": 2 * GIB,
+                    "reason": None,
+                },
+                1 * GIB,
+            ),
+        )
+        m.setattr(zz, "_r55_active_gpu_decide", _decline_disk)
+        m.setattr(zz.zphot, "compute_global_gauge", _gauge_spy)
+        with pytest.raises(RuntimeError) as exc:
+            zz.run_zegrid_mode(
+                str(inp), str(out), zconfig=_e2e_config(),
+                storage_profile="auto", use_gpu=True,
+                cell_gauge_mode="per_cell",
+            )
+
+    assert gpu_attempts == [zz.WORKING_SET_RAM_TILE]
+    assert "active GPU refused before the gauge/stack" in str(exc.value)
+    assert renv.REASON_REFUSE_DISK in str(exc.value)
+    assert gauge_calls == []
+    assert not (out / "mosaic_grid.fits").exists()
+    # The planning transition stays the ONLY profile switch.
+    assert len(zz._STORAGE_TRANSITIONS) == 1
+
+
+@pytest.mark.slow
 def test_run_zegrid_mode_external_disk_shortfall_refuses_before_gauge(
     tmp_path, monkeypatch
 ):
