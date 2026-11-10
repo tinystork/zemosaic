@@ -177,6 +177,14 @@ def test_complete_gpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
     assert diag["durable_replay_seconds"] >= 0.0
     assert manifest["timings"]["per_cell_stack"] == 0.0
     assert manifest["timings"]["durable_replay"] >= 0.0
+    # REWORK-2 L3: ONE explicit assertion locks the complete-replay triplet
+    # together: zero current cache work, zero current stack work, and a real
+    # (strictly positive) durable-replay wall time.
+    assert (
+        diag["cache_build_cpu_sum_s"],
+        diag["stack_cpu_sum_s"],
+        diag["durable_replay_seconds"] > 0.0,
+    ) == (0.0, 0.0, True)
 
     # REWORK-1 F1: the current aggregate RSS excludes every restored worker
     # peak; the historical worker evidence is additive and separate.
@@ -251,6 +259,12 @@ def test_complete_cpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
     assert diag["durable_replay_seconds"] >= 0.0
     assert manifest["timings"]["per_cell_stack"] == 0.0
     assert manifest["timings"]["durable_replay"] >= 0.0
+    # REWORK-2 L3: the same zero-cache / zero-stack / positive-replay triplet.
+    assert (
+        diag["cache_build_cpu_sum_s"],
+        diag["stack_cpu_sum_s"],
+        diag["durable_replay_seconds"] > 0.0,
+    ) == (0.0, 0.0, True)
     assert diag["aggregate_peak_rss_kib_historical_restored"] > 0
     assert (
         manifest["aggregate_peak_rss_kib"]
