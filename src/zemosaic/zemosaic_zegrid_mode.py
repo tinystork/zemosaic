@@ -6410,6 +6410,7 @@ def _write_run_log(
     finishing_info=None,
     gpu_context=None,
     aggregate_peak_rss_kib=None,
+    aggregate_peak_rss_kib_historical_restored=None,
     halo_provenance=None,
 ):
     """Append the run-log SUMMARY into the output folder.
@@ -6559,6 +6560,13 @@ def _write_run_log(
             f"cache_build_cpu_sum_s: {pcd.get('cache_build_cpu_sum_s')}  "
             f"stack_cpu_sum_s: {pcd.get('stack_cpu_sum_s')}"
             + (f" fallback_reason={pcd.get('fallback_reason')}" if pcd.get('fallback_reason') else "")
+            + (
+                # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: the REAL replay wall time
+                # is named explicitly (it is NOT cell stacking).
+                f"  durable_replay_seconds: {pcd.get('durable_replay_seconds')}"
+                if pcd.get("durable_replay_seconds") is not None
+                else ""
+            )
         )
     else:
         lines.append("  (no per-cell concurrency diagnostics recorded)")
@@ -6632,8 +6640,16 @@ def _write_run_log(
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
     lines.append(
         f"aggregate_peak_rss_kib: {aggregate_peak_rss_kib if aggregate_peak_rss_kib is not None else 'n/a'} "
-        "(parent + cell workers, UPPER BOUND incl. per-worker import baseline)"
+        "(parent + cell workers of THIS attempt, UPPER BOUND incl. per-worker "
+        "import baseline)"
     )
+    if aggregate_peak_rss_kib_historical_restored is not None:
+        lines.append(
+            "aggregate_peak_rss_kib_historical_restored: "
+            f"{aggregate_peak_rss_kib_historical_restored} "
+            "(sum of RESTORED durable Cells' worker peaks, historical "
+            "evidence; not workers this attempt ran)"
+        )
     lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
     lines.append(f"photometric_gauge.global_reference_frame_id: {global_reference_frame_id}")
     text = "\n".join(lines) + "\n"
@@ -16572,7 +16588,20 @@ def _run_single(
     # onto the canonical 0/9 cell stage or fed to the ETA estimator.
     _cache_rep = _reporter(emit_stage=False)
     _stack_rep = _reporter()
-    _stack_rep.start("per_cell_stack", total=total_cells, unit="cells")
+    # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: the canonical per-cell stacking phase
+    # is opened LAZILY, only once the resume plan is known and this attempt
+    # really stacks Cells. A COMPLETE durable replay and a finalized verified
+    # no-op open no stacking phase at all (no START/PROGRESS/END that could be
+    # read as newly executed stacking); the textual resume-plan / ALREADY
+    # COMPLETE messages keep carrying the run-level coverage.
+    _stack_phase_state = {"opened": False}
+
+    def _stack_phase_open():
+        if _stack_phase_state["opened"] or _resume_complete_replay:
+            return
+        _stack_phase_state["opened"] = True
+        _stack_rep.start("per_cell_stack", total=total_cells, unit="cells")
+
     # ZM-ZEGRID-ACTIVE-RESUME-PARITY r3: RUN-level progress accounting.
     # ``offset`` = cells already committed when this process started (0 for a
     # fresh run); every per-cell report adds it so the displayed counter is the
@@ -16581,7 +16610,12 @@ def _run_single(
     _stack_progress = {"offset": 0, "pending": None}
 
     def _stack_report(processed, cid, *, force=False):
+        # A COMPLETE durable replay executed zero stacks: no progress sample of
+        # the canonical stacking phase may be emitted for replayed Cells.
+        if _resume_complete_replay:
+            return
         try:
+            _stack_phase_open()
             _done = int(_stack_progress["offset"]) + int(processed)
             _stack_progress["last_done"] = _done
             _stack_rep.progress(_done, item_id=cid, force=force)
@@ -19883,12 +19917,17 @@ def _run_single(
             ),
             callback=progress_callback,
         )
-        _stack_report(
-            0,
-            _stack_accounting["pending"][0]
-            if _stack_accounting["pending"] else None,
-            force=True,
-        )
+        # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: only a plan with REAL pending
+        # Cells opens the stacking phase. A COMPLETE plan (non-finalized replay
+        # or finalized no-op) never emits a stacking progress sample; the R3
+        # run-level coverage stays in the resume-plan/ALREADY COMPLETE lines.
+        if not _resume_plan["is_complete"]:
+            _stack_report(
+                0,
+                _stack_accounting["pending"][0]
+                if _stack_accounting["pending"] else None,
+                force=True,
+            )
         if _resume_plan["is_complete"]:
             _emit(
                 "ZeGrid: resumed run is ALREADY COMPLETE — verified no-op: no "
@@ -20331,6 +20370,11 @@ def _run_single(
             )
             raise RuntimeError(_resume_runtime["refusal"])
     _r55_gpu_retained = None
+    if not _resume_complete_replay:
+        # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: the canonical per-cell stacking
+        # phase is opened HERE, after the resume plan and only when this attempt
+        # really stacks Cells (fresh: all; partial: the sparse pending set).
+        _stack_phase_open()
     if _resume_complete_replay:
         # ZM-RESUME-COMPLETE-GPU-RERUN: the ONE explicit COMPLETE-resume
         # execution boundary. A run whose every expected cell is already
@@ -21038,15 +21082,6 @@ def _run_single(
     )
     _vram_hw_sampler = None
     per_cell_diagnostics["vram_high_water"] = dict(_vram_hw_record)
-    _telemetry_stats(
-        phase_name="Per-cell stacking",
-        phase_index=3,
-        tiles_done=total_cells,
-        tiles_total=total_cells,
-        extra=_vram_high_water_telemetry_fields(
-            _vram_hw_record, _vram_hw_reservation_final
-        ),
-    )
 
     # ZM-RESUME-TELEMETRY-TRUTH: ONE authoritative attribution of the result
     # records for THIS attempt, computed from the ACTUAL cell identity (the
@@ -21065,6 +21100,40 @@ def _run_single(
     _restored_records = [
         _rec for _rec in results if not _cell_in_attempt(_rec.get("cell_id"))
     ]
+
+    # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: the resource-telemetry sample describes
+    # the units THIS attempt really stacked. Fresh = all Cells; PARTIAL resume =
+    # only the pending Cells; COMPLETE replay = zero current stack units (its own
+    # durable-replay label, with the restored count reported separately). The
+    # canonical RUN-level progress stays in the per_cell_stack reporter/plan
+    # lines and is never redefined here.
+    _telemetry_extra = _vram_high_water_telemetry_fields(
+        _vram_hw_record, _vram_hw_reservation_final
+    )
+    _current_stack_units = int(len(_current_records))
+    if _resume_complete_replay:
+        _telemetry_stats(
+            phase_name="Durable replay",
+            phase_index=3,
+            tiles_done=0,
+            tiles_total=0,
+            extra={
+                **_telemetry_extra,
+                "executed_this_attempt": 0,
+                "restored_durable_cells": int(len(_restored_records)),
+            },
+        )
+    else:
+        _telemetry_stats(
+            phase_name="Per-cell stacking",
+            phase_index=3,
+            tiles_done=_current_stack_units,
+            tiles_total=_current_stack_units,
+            extra={
+                **_telemetry_extra,
+                "historical_restored_cells": int(len(_restored_records)),
+            },
+        )
 
     # H2: actual backend EVIDENCE from the executed cells (never the selection).
     # `used=true` only when a successful cell actually ran the GPU canonical and
@@ -21220,8 +21289,19 @@ def _run_single(
                 "and the assembly consumed the immutable commits only."
             ),
         }
-    per_cell_diagnostics["seconds"] = block_wall
-    per_cell_diagnostics["seconds_per_unit"] = block_wall / max(1, len(cell_tasks))
+    # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: a COMPLETE durable replay stacks
+    # nothing, so it must not label commit verification/view construction as
+    # cell stacking. Current stack seconds are 0, there is no per-unit stack
+    # timing, and the REAL replay wall time is reported explicitly.
+    if _resume_complete_replay:
+        per_cell_diagnostics["seconds"] = 0.0
+        per_cell_diagnostics["seconds_per_unit"] = None
+        per_cell_diagnostics["durable_replay_seconds"] = round(block_wall, 6)
+    else:
+        per_cell_diagnostics["seconds"] = block_wall
+        per_cell_diagnostics["seconds_per_unit"] = (
+            block_wall / max(1, len(cell_tasks))
+        )
     per_cell_diagnostics["fallback"] = bool(per_cell_meta.get("fallback"))
     if per_cell_meta.get("fallback_reason"):
         per_cell_diagnostics["fallback_reason"] = per_cell_meta["fallback_reason"]
@@ -21302,7 +21382,14 @@ def _run_single(
     # R20: cache build is FUSED into the concurrent per-cell phase (bounded disk
     # requires the cache to be built+deleted inside each cell worker), so the
     # phase's wall-clock is recorded under per_cell_stack; cache_build is 0 here.
-    timings.add("per_cell_stack", block_wall)
+    # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: a COMPLETE replay records ZERO current
+    # stacking seconds and its real wall time under the explicit durable_replay
+    # timing (accounted once; never counted as cell stacking).
+    if _resume_complete_replay:
+        timings.add("per_cell_stack", 0.0)
+        timings.add("durable_replay", block_wall)
+    else:
+        timings.add("per_cell_stack", block_wall)
     timings.add("cache_build", 0.0)
 
     # M5-A: with a durable store the coordinator receives metadata descriptors
@@ -21385,14 +21472,16 @@ def _run_single(
         _cache_rep.end(
             throughput=_fmt_throughput(cache_total_frames, timings.get("cache_build"), "frames/s")
         )
-    # A replay executed zero Cells: no fabricated cells/s throughput claim.
-    _stack_rep.end(
-        throughput=(
-            None
-            if _resume_complete_replay
-            else _fmt_throughput(total_cells, timings.get("per_cell_stack"), "cells/s")
+    # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: a COMPLETE replay executed zero Cells,
+    # so the canonical stacking phase was never opened: no START/END lines and
+    # no fabricated cells/s throughput. Fresh/partial runs close normally.
+    if not _resume_complete_replay:
+        _stack_phase_open()
+        _stack_rep.end(
+            throughput=_fmt_throughput(
+                total_cells, timings.get("per_cell_stack"), "cells/s"
+            )
         )
-    )
 
     # ZM-ZEGRID-COMMIT-INTEGRITY: the end-of-stacking durable counter (ONE line),
     # then a fail-fast guard BEFORE assembly: a run with expected cells and ZERO
@@ -21532,9 +21621,22 @@ def _run_single(
     # ZM-ZEGRID-R22 honesty fix: peak_rss_kib is a SINGLE process's peak. Report
     # the batch aggregate (parent + all cell workers) as a clearly-labelled UPPER
     # bound alongside it, so the manifest no longer under-states parallel memory.
+    # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: the aggregate is a CURRENT-ATTEMPT
+    # upper bound (only Cells stacked by THIS attempt contribute worker peaks).
+    # Restored durable Cells' peaks are historical evidence and are reported
+    # separately, never as workers this attempt ran.
     aggregate_peak_rss_kib = zsw.aggregate_peak_rss_kib(
-        zsw.peak_rss_kib(), [r.get("peak_rss_kib", 0) for r in results]
+        zsw.peak_rss_kib(), [r.get("peak_rss_kib", 0) for r in _current_records]
     )
+    aggregate_peak_rss_kib_historical_restored = (
+        zsw.aggregate_peak_rss_kib(
+            0, [r.get("peak_rss_kib", 0) for r in _restored_records]
+        )
+        if _restored_records else None
+    )
+    per_cell_diagnostics[
+        "aggregate_peak_rss_kib_historical_restored"
+    ] = aggregate_peak_rss_kib_historical_restored
     _assembly_rep.end(
         throughput=_fmt_throughput(len(assembled.complete_cells), timings.get("assembly"), "cells/s")
     )
@@ -22089,6 +22191,9 @@ def _run_single(
             fin_uint16=fin_uint16,
             gpu_context=gpu_ctx,
             aggregate_peak_rss_kib=aggregate_peak_rss_kib,
+            aggregate_peak_rss_kib_historical_restored=(
+                aggregate_peak_rss_kib_historical_restored
+            ),
             raw_science_path=raw_science_path,
             raw_science=raw_science,
             aesthetic_path=aesthetic_path if export_aesthetic else None,
@@ -22122,6 +22227,9 @@ def _run_single(
             finishing_info=finishing_info,
             gpu_context=gpu_ctx,
             aggregate_peak_rss_kib=aggregate_peak_rss_kib,
+            aggregate_peak_rss_kib_historical_restored=(
+                aggregate_peak_rss_kib_historical_restored
+            ),
             halo_provenance=_halo_provenance_pass,
         )
 
@@ -22915,6 +23023,7 @@ def _write_outputs(
     finished_science=None, finishing_info=None, fin_uint16=None,
     gpu_context=None,
     aggregate_peak_rss_kib=None,
+    aggregate_peak_rss_kib_historical_restored=None,
     raw_science_path=None,
     raw_science=None,
     aesthetic_path=None,
@@ -23376,9 +23485,19 @@ def _write_outputs(
         ),
         "aggregate_peak_rss_kib": aggregate_peak_rss_kib,
         "aggregate_peak_rss_kib_note": (
-            "parent + sum of cell-worker peak RSS (UPPER BOUND: each worker includes "
-            "its own ~340 MiB import baseline; shared/copy-on-write pages are not "
-            "deduplicated)"
+            "parent + sum of THIS attempt's cell-worker peak RSS (UPPER BOUND: "
+            "each worker includes its own ~340 MiB import baseline; "
+            "shared/copy-on-write pages are not deduplicated). Restored durable "
+            "Cells' peaks are reported separately under "
+            "aggregate_peak_rss_kib_historical_restored."
+        ),
+        "aggregate_peak_rss_kib_historical_restored": (
+            aggregate_peak_rss_kib_historical_restored
+        ),
+        "aggregate_peak_rss_kib_historical_restored_note": (
+            "sum of the RESTORED durable Cells' committed worker peak RSS "
+            "(historical evidence from an earlier attempt; NOT workers this "
+            "attempt ran). None when nothing was restored."
         ),
         "outputs": {
             "science": raw_science_path.name,

@@ -50,6 +50,38 @@ def _progress_samples(log_text: str, phase: str) -> list[tuple[int, int]]:
     ]
 
 
+class _TelemetryRecorder:
+    """Record every resource-telemetry sample the product publishes."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def maybe_emit_stats(self, ctx) -> None:
+        self.calls.append(dict(ctx))
+
+
+def _run_with_telemetry(tmp_path, monkeypatch, *, use_gpu, resume_mode="never",
+                        telemetry=None, progress=None):
+    """Same product run as ``RERUN._run``, with an optional telemetry sink."""
+    if use_gpu:
+        RERUN.R55._fake_gpu_available(monkeypatch)
+    corpus = RERUN._corpus(tmp_path)
+    out = tmp_path / "out"
+    store = out / "zegrid-durable"
+    RERUN.zz.run_zegrid_mode(
+        str(corpus), str(out), progress,
+        zconfig=RERUN._zconfig(store, resume_mode),
+        zegrid_halo_px=8,
+        use_gpu=bool(use_gpu),
+        telemetry=telemetry,
+    )
+    return out, store
+
+
+def _phase3(recorder: _TelemetryRecorder) -> list[dict]:
+    return [c for c in recorder.calls if int(c.get("phase_index", -1)) == 3]
+
+
 # ---------------------------------------------------------------------------
 # 1 — COMPLETE GPU-frozen replay: zero current telemetry, no cache rebuild
 # ---------------------------------------------------------------------------
@@ -71,20 +103,27 @@ def test_complete_gpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
 
     RERUN._break_finalization(out, store)
     resumed_lines: list[str] = []
-    _out, _store = RERUN._run(
+    recorder = _TelemetryRecorder()
+    _out, _store = _run_with_telemetry(
         tmp_path, monkeypatch, use_gpu=True, resume_mode="auto",
+        telemetry=recorder,
         progress=lambda msg, *a, **k: resumed_lines.append(str(msg)),
     )
     text = "\n".join(resumed_lines)
     assert "executed_this_attempt=0" in text
     assert "durable replay assembly" in text
+    # The run-level resume coverage stays explicit in the plan line.
+    assert "resume plan" in text
 
     log = RERUN._log(out)
     # NO cache rebuild progress/start may be claimed by a replay.
     assert _CACHE_START not in log, log[-3000:]
     assert _CACHE_PROGRESS not in log, log[-3000:]
     assert _progress_samples(log, "cache_build") == []
-    # ... and no newly completed stacking claim either.
+    # ... and no canonical stacking phase either (REWORK-1 F4).
+    assert _progress_samples(log, "per_cell_stack") == []
+    assert "phase START: per_cell_stack" not in log
+    assert "phase END: per_cell_stack" not in log
     assert "per-cell stacking complete" not in log
 
     manifest = RERUN._published_manifest(out)
@@ -131,6 +170,36 @@ def test_complete_gpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
     assert cache_attr["historical_restored"]["cells_count"] == total
     assert cache_attr["historical_restored"]["source"] == "durable_commits"
 
+    # REWORK-1 F2: no cell-stacking time or per-unit stack timing is claimed for
+    # a zero-stack replay; the real replay wall time is explicit instead.
+    assert diag["seconds"] == 0.0
+    assert diag["seconds_per_unit"] is None
+    assert diag["durable_replay_seconds"] >= 0.0
+    assert manifest["timings"]["per_cell_stack"] == 0.0
+    assert manifest["timings"]["durable_replay"] >= 0.0
+
+    # REWORK-1 F1: the current aggregate RSS excludes every restored worker
+    # peak; the historical worker evidence is additive and separate.
+    restored_aggregate = diag[
+        "aggregate_peak_rss_kib_historical_restored"
+    ]
+    assert restored_aggregate is not None and restored_aggregate > 0
+    assert manifest[
+        "aggregate_peak_rss_kib_historical_restored"
+    ] == restored_aggregate
+    assert manifest["aggregate_peak_rss_kib"] < restored_aggregate
+
+    # REWORK-1 F3: the resource sample describes zero current stack units and
+    # labels itself as durable replay, carrying the restored count separately.
+    samples3 = _phase3(recorder)
+    assert samples3, recorder.calls
+    final3 = samples3[-1]
+    assert final3["phase_name"] == "Durable replay"
+    assert final3["tiles_done"] == 0
+    assert final3["tiles_total"] == 0
+    assert final3["executed_this_attempt"] == 0
+    assert final3["restored_durable_cells"] == total
+
 
 # ---------------------------------------------------------------------------
 # 2 — COMPLETE CPU-frozen replay: same truth, CPU backend evidence
@@ -143,8 +212,10 @@ def test_complete_cpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
     assert total == 4
     RERUN._break_finalization(out, store)
     resumed_lines: list[str] = []
-    _out, _store = RERUN._run(
+    recorder = _TelemetryRecorder()
+    _out, _store = _run_with_telemetry(
         tmp_path, monkeypatch, use_gpu=False, resume_mode="auto",
+        telemetry=recorder,
         progress=lambda msg, *a, **k: resumed_lines.append(str(msg)),
     )
     text = "\n".join(resumed_lines)
@@ -154,6 +225,8 @@ def test_complete_cpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
     log = RERUN._log(out)
     assert _CACHE_START not in log
     assert _CACHE_PROGRESS not in log
+    assert "phase START: per_cell_stack" not in log
+    assert "phase END: per_cell_stack" not in log
 
     manifest = RERUN._published_manifest(out)
     diag = manifest["per_cell_diagnostics"]
@@ -172,6 +245,21 @@ def test_complete_cpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
     assert manifest["cache"]["attribution"]["historical_restored"][
         "cells_count"
     ] == total
+    # REWORK-1 F1/F2/F3 on the CPU replay.
+    assert diag["seconds"] == 0.0
+    assert diag["seconds_per_unit"] is None
+    assert diag["durable_replay_seconds"] >= 0.0
+    assert manifest["timings"]["per_cell_stack"] == 0.0
+    assert manifest["timings"]["durable_replay"] >= 0.0
+    assert diag["aggregate_peak_rss_kib_historical_restored"] > 0
+    assert (
+        manifest["aggregate_peak_rss_kib"]
+        < manifest["aggregate_peak_rss_kib_historical_restored"]
+    )
+    final3 = _phase3(recorder)[-1]
+    assert final3["phase_name"] == "Durable replay"
+    assert (final3["tiles_done"], final3["tiles_total"]) == (0, 0)
+    assert final3["restored_durable_cells"] == total
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +292,13 @@ def test_partial_resume_splits_pending_and_restored(tmp_path, monkeypatch):
     # Only the pending Cells' frames are counted: never the whole run.
     assert partial_total_frames == expected_pending_frames
     assert samples[-1][0] == partial_total_frames
+    # REWORK-1 F4: a PARTIAL resume still opens the canonical stacking phase
+    # with the RUN-level coverage (monotonic, no overrun).
+    stack_samples = _progress_samples(log, "per_cell_stack")
+    assert stack_samples and stack_samples[-1] == (4, 4)
+    assert 5 not in [done for done, _total in stack_samples]
+    assert "phase START: per_cell_stack" in log
+    assert "phase END: per_cell_stack" in log
 
     manifest = RERUN._published_manifest(out)
     diag = manifest["per_cell_diagnostics"]
@@ -225,6 +320,17 @@ def test_partial_resume_splits_pending_and_restored(tmp_path, monkeypatch):
     assert restored["source"] == "durable_commits"
     # No complete-replay claim on a partial resume.
     assert "durable_replay" not in diag
+    assert diag["seconds"] > 0.0
+    assert diag["seconds_per_unit"] is not None
+    assert "durable_replay_seconds" not in diag
+    assert manifest["timings"]["per_cell_stack"] > 0.0
+    assert "durable_replay" not in manifest["timings"]
+    # Current aggregate RSS covers the parent + pending workers only, while the
+    # restored workers' peaks are additive historical evidence.
+    assert diag["aggregate_peak_rss_kib_historical_restored"] > 0
+    assert manifest["aggregate_peak_rss_kib_historical_restored"] == diag[
+        "aggregate_peak_rss_kib_historical_restored"
+    ]
     assert manifest["gpu"]["executed_this_attempt"] == 2
     historical = manifest["gpu"]["durable_historical_execution"]
     assert historical["cells"] == 2
@@ -240,8 +346,9 @@ def test_fresh_run_keeps_current_attribution_and_cache_progress(
     tmp_path, monkeypatch
 ):
     lines: list[str] = []
-    out, store = RERUN._run(
-        tmp_path, monkeypatch, use_gpu=True,
+    recorder = _TelemetryRecorder()
+    out, store = _run_with_telemetry(
+        tmp_path, monkeypatch, use_gpu=True, telemetry=recorder,
         progress=lambda msg, *a, **k: lines.append(str(msg)),
     )
     text = "\n".join(lines)
@@ -252,6 +359,11 @@ def test_fresh_run_keeps_current_attribution_and_cache_progress(
     samples = _progress_samples(log, "cache_build")
     assert samples and samples[-1][0] == samples[-1][1]
     assert "per-cell stacking complete" in text
+    # The canonical stacking phase keeps its normal START/PROGRESS/END.
+    stack_samples = _progress_samples(log, "per_cell_stack")
+    assert stack_samples and stack_samples[-1] == (total, total)
+    assert "phase START: per_cell_stack" in log
+    assert "phase END: per_cell_stack" in log
 
     manifest = RERUN._published_manifest(out)
     diag = manifest["per_cell_diagnostics"]
@@ -273,3 +385,15 @@ def test_fresh_run_keeps_current_attribution_and_cache_progress(
     assert gpu["actually_used"] is True
     assert gpu["executed_this_attempt"] == total
     assert gpu["durable_historical_execution"] is None
+    # REWORK-1: fresh current timing/telemetry/RSS reporting is unchanged.
+    assert diag["seconds"] > 0.0
+    assert diag["seconds_per_unit"] is not None
+    assert "durable_replay_seconds" not in diag
+    assert manifest["timings"]["per_cell_stack"] > 0.0
+    assert "durable_replay" not in manifest["timings"]
+    assert diag["aggregate_peak_rss_kib_historical_restored"] is None
+    assert manifest["aggregate_peak_rss_kib_historical_restored"] is None
+    final3 = _phase3(recorder)[-1]
+    assert final3["phase_name"] == "Per-cell stacking"
+    assert (final3["tiles_done"], final3["tiles_total"]) == (total, total)
+    assert final3["historical_restored_cells"] == 0

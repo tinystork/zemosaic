@@ -269,11 +269,15 @@ def test_complete_gpu_frozen_resume_executes_zero_stacks(tmp_path, monkeypatch):
     assert "done" in text.lower()
 
     log = _log(out)
+    # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: a COMPLETE non-finalized replay
+    # executes zero stacks, so the canonical per_cell_stack phase is never
+    # opened: no START/PROGRESS/END and no 21/20-style overrun is possible. The
+    # run-level coverage stays in the resume-plan/ALREADY COMPLETE lines above.
     samples = _samples(log, total)
-    assert samples, log[-2000:]
-    assert max(samples) == total <= total
-    assert total + 1 not in samples
-    assert f"per_cell_stack {total}/{total}" in log
+    assert samples == [], samples
+    assert "phase START: per_cell_stack" not in log
+    assert "phase PROGRESS: per_cell_stack" not in log
+    assert "phase END: per_cell_stack" not in log
 
     manifest = _published_manifest(out)
     gpu = manifest["gpu"]
@@ -328,9 +332,10 @@ def test_complete_cpu_frozen_resume_executes_zero_stacks(tmp_path, monkeypatch):
     text = "\n".join(resumed_lines)
     assert "executed_this_attempt=0" in text
     log = _log(out)
-    samples = _samples(log, total)
-    assert max(samples) == total
-    assert total + 1 not in samples
+    # A complete replay never opens the per-cell stacking phase (REWORK-1).
+    assert _samples(log, total) == []
+    assert "phase START: per_cell_stack" not in log
+    assert "phase END: per_cell_stack" not in log
     manifest = _published_manifest(out)
     assert manifest["per_cell_diagnostics"]["executed_this_attempt"] == 0
     assert manifest["per_cell_diagnostics"]["reused_durable_cells"] == total
@@ -449,3 +454,7 @@ def test_finalized_complete_resume_is_a_verified_noop(tmp_path, monkeypatch):
     text = "\n".join(lines)
     assert "verified no-op" in text
     assert "executed_this_attempt=0" not in text
+    # REWORK-1 F4: a finalized verified no-op opens no stacking phase at all.
+    log = _log(out)
+    assert "phase START: per_cell_stack" not in log
+    assert _samples(log, len(_commits(store))) == []
