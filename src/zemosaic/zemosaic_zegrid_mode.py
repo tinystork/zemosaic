@@ -6346,6 +6346,9 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
         "actually_used": actually_used,
         "final_backend": final_backend,
         "gpu_executed_cells": ctx.get("gpu_executed_cells"),
+        # ZM-RESUME-COMPLETE-GPU-RERUN: cells actually stacked in THIS attempt
+        # (0 on a COMPLETE resume that assembled immutable commits only).
+        "executed_this_attempt": ctx.get("executed_this_attempt"),
         "device": ctx.get("device"),
         "cupy_version": ctx.get("cupy_version"),
         "vram_total_bytes": ctx.get("vram_total_bytes"),
@@ -14327,6 +14330,57 @@ def _bounded_store_results(store, cell_ids, *, store_state=None):
     return access.results(list(cell_ids))
 
 
+def _complete_resume_replay_results(store_state, cell_ids, *, emit=None):
+    """ZM-RESUME-COMPLETE-GPU-RERUN: a COMPLETE resume executes ZERO stacks.
+
+    Every expected cell is already durably committed, so the per-cell outcome
+    of this attempt is the bounded, read-only store view in CANONICAL cell
+    order. Coverage is validated first with the SAME commit contract the
+    assembly uses (``_r55_durable_cell_coverage``), so a missing or ambiguous
+    cell is an explicit refusal instead of a partial assembly.
+
+    Returns ``(results, per_cell_meta)``. ``per_cell_meta`` states the truth of
+    THIS attempt: ``executed_this_attempt=0`` and every cell reused from an
+    immutable commit. No cache is rebuilt, no commit is written and no stack
+    executor is ever admitted.
+    """
+    canonical = [str(cid) for cid in cell_ids]
+    if not canonical:
+        raise _R55DurableStoreUnavailable(
+            "a COMPLETE resumed run has no canonical cell order to assemble "
+            "from; refusing any cell restack. Every file on disk is preserved."
+        )
+    store = _r55_durable_cell_coverage(
+        store_state, canonical, context="complete resume replay"
+    )
+    if store is None:
+        raise _R55DurableStoreUnavailable(
+            "a COMPLETE resumed run has no durable store to assemble from; "
+            "refusing any cell restack. Every file on disk is preserved."
+        )
+    results = _bounded_store_results(store, canonical, store_state=store_state)
+    meta = {
+        "executor": "durable_replay",
+        "parent_daemon": False,
+        "workers": 0,
+        "tasks": 0,
+        "fallback": False,
+        # The resumed ATTEMPT executed nothing: the backend evidence of the run
+        # stays the frozen admission, never a fresh stack claim.
+        "executed_this_attempt": 0,
+        "reused_durable_cells": int(len(canonical)),
+        "source": "durable_commits",
+    }
+    if emit is not None:
+        emit(
+            "ZeGrid: COMPLETE resume replay — executed_this_attempt=0, "
+            f"reusing {len(canonical)} immutable durable commit(s) from "
+            f"store={store.root} run_id={store.run_id}; proceeding directly "
+            "to bounded assembly/publication"
+        )
+    return results, meta
+
+
 def _bounded_assembly_available_bytes():
     """Fresh host availability under the canonical admission margin.
 
@@ -14700,6 +14754,13 @@ def _run_single(
     _resume_boot = None
     _resume_plan = None
     _resume_pending_ids = None
+    # ZM-RESUME-COMPLETE-GPU-RERUN: an explicit COMPLETE, non-finalized durable
+    # resume replay. Set ONLY by the resume plan when every expected cell is
+    # already committed and no verified publication exists yet; it selects the
+    # zero-stack assembly path at the execution boundary and must never fall
+    # through to a generic GPU/CPU batch.
+    _resume_complete_replay = False
+    _resume_complete_cids: list[str] = []
     _resume_gauge = None
     _resume_geometry = None
     _resume_store_dir = (
@@ -19953,6 +20014,17 @@ def _run_single(
                 "publishing a NEW generation (no restack of valid cells)",
                 callback=progress_callback,
             )
+            # ZM-RESUME-COMPLETE-GPU-RERUN: this is the ONE shape that must
+            # execute ZERO cell stacks. Arm the explicit complete-resume
+            # replay and the exact canonical cell order it assembles from.
+            # Clearing the GPU decision below is NOT sufficient: with a
+            # GPU-frozen admission and no ACTIVE decision, control used to
+            # fall through to the generic ``elif gpu_used:`` batch and
+            # recomputed every cell (progress 21/20).
+            _resume_complete_replay = True
+            _resume_complete_cids = [
+                str(task[0].cell_id) for task in _final.cell_tasks
+            ]
     elif _store_dir and result_registry is not None:
         _store_error = None
         _store_stage = "identity_build"
@@ -20218,7 +20290,23 @@ def _run_single(
             )
             raise RuntimeError(_resume_runtime["refusal"])
     _r55_gpu_retained = None
-    if scheduler_mode == zsched.MODE_ACTIVE and _r55_active_gpu_decision is not None:
+    if _resume_complete_replay:
+        # ZM-RESUME-COMPLETE-GPU-RERUN: the ONE explicit COMPLETE-resume
+        # execution boundary. A run whose every expected cell is already
+        # durably committed and whose publication is not yet verified must NOT
+        # admit any stack executor: assembling from the immutable commits is
+        # the entire remaining work. Placing this branch FIRST makes the
+        # fall-through impossible for every frozen backend (GPU-frozen runs
+        # used to reach the generic ``elif gpu_used:`` batch because the GPU
+        # decision is legitimately cleared for an empty pending set).
+        results, per_cell_meta = _complete_resume_replay_results(
+            _store_state,
+            _resume_complete_cids,
+            emit=lambda _msg: _emit(
+                _msg, callback=progress_callback
+            ),
+        )
+    elif scheduler_mode == zsched.MODE_ACTIVE and _r55_active_gpu_decision is not None:
         # ZM-WIN-GPUPROBE: a qualified ACTIVE GPU run is SINGLE-OWNER, so the
         # number of units in flight during the per-cell stack is exactly 1.
         # Publish it honestly instead of a mute null (observability only).
@@ -20922,16 +21010,33 @@ def _run_single(
     # H2: actual backend EVIDENCE from the executed cells (never the selection).
     # `used=true` only when a successful cell actually ran the GPU canonical and
     # no whole-batch CPU rerun replaced it.
-    gpu_executed_cells = sum(
-        1 for r in results
-        if r.get("status") == "complete" and r.get("backend_used") == "gpu"
-    )
+    # ZM-RESUME-COMPLETE-GPU-RERUN: ``actually_used`` describes THIS attempt.
+    # A COMPLETE resume executed no cell at all, so reused durable descriptors
+    # must never be reported as fresh GPU execution; the frozen admission stays
+    # visible as the run's backend contract.
+    if _resume_complete_replay:
+        gpu_executed_cells = 0
+    else:
+        gpu_executed_cells = sum(
+            1 for r in results
+            if r.get("status") == "complete" and r.get("backend_used") == "gpu"
+        )
     actually_used_gpu = bool(gpu_executed_cells > 0 and runtime_gpu_fallback is None)
     gpu_ctx = dict(gpu_ctx)
     gpu_ctx["gpu_executed_cells"] = int(gpu_executed_cells)
     gpu_ctx["actually_used"] = bool(actually_used_gpu)
     gpu_ctx["final_backend"] = "gpu" if actually_used_gpu else "cpu"
     gpu_ctx["final_effective"] = bool(actually_used_gpu)
+    # The number of cells this ATTEMPT actually stacked (0 on a complete
+    # resume, the sparse pending set on a partial one, every cell on a fresh
+    # run). Reported separately from the reused durable commits.
+    if "executed_this_attempt" in per_cell_meta:
+        _executed_this_attempt = int(per_cell_meta["executed_this_attempt"])
+    elif _resume_pending_ids is not None:
+        _executed_this_attempt = int(len(_resume_pending_ids))
+    else:
+        _executed_this_attempt = int(len(results))
+    gpu_ctx["executed_this_attempt"] = int(_executed_this_attempt)
     # R55-E11: keep BOTH budgets distinguishable forever. Up to R55-E10 the
     # manifest's ``gpu.vram_budget_bytes`` was the legacy 50 % probe value even
     # when the ACTIVE 70 % policy executed the GPU. The legacy value is retained
@@ -20997,6 +21102,25 @@ def _run_single(
     per_cell_diagnostics["parent_daemon"] = bool(per_cell_meta.get("parent_daemon"))
     per_cell_diagnostics["workers"] = int(per_cell_meta.get("workers", cells_in_flight))
     per_cell_diagnostics["tasks"] = int(per_cell_meta.get("tasks", len(cell_tasks)))
+    # ZM-RESUME-COMPLETE-GPU-RERUN: truthful per-attempt accounting, separate
+    # from the durable cells reused from immutable commits.
+    per_cell_diagnostics["executed_this_attempt"] = int(
+        _executed_this_attempt
+    )
+    per_cell_diagnostics["reused_durable_cells"] = max(
+        0, int(len(results)) - int(_executed_this_attempt)
+    )
+    if _resume_complete_replay:
+        per_cell_diagnostics["durable_replay"] = {
+            "executed_this_attempt": 0,
+            "reused_durable_cells": int(len(results)),
+            "source": "durable_commits",
+            "note": (
+                "COMPLETE non-finalized resume: every expected cell was "
+                "already durably committed, so no cell stack was admitted "
+                "and the assembly consumed the immutable commits only."
+            ),
+        }
     per_cell_diagnostics["seconds"] = block_wall
     per_cell_diagnostics["seconds_per_unit"] = block_wall / max(1, len(cell_tasks))
     per_cell_diagnostics["fallback"] = bool(per_cell_meta.get("fallback"))
