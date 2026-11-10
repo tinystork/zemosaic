@@ -6349,6 +6349,13 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
         # ZM-RESUME-COMPLETE-GPU-RERUN: cells actually stacked in THIS attempt
         # (0 on a COMPLETE resume that assembled immutable commits only).
         "executed_this_attempt": ctx.get("executed_this_attempt"),
+        # ZM-RESUME-TELEMETRY-TRUTH: additive HISTORICAL evidence of the backend
+        # that produced the durable restored Cells (None on a run that restored
+        # nothing). It never redefines actually_used/used, which stay the truth
+        # of THIS attempt (false when a complete replay executed zero Cells).
+        "durable_historical_execution": ctx.get(
+            "durable_historical_execution"
+        ),
         "device": ctx.get("device"),
         "cupy_version": ctx.get("cupy_version"),
         "vram_total_bytes": ctx.get("vram_total_bytes"),
@@ -6439,6 +6446,21 @@ def _write_run_log(
         f"final_backend: {_gctx.get('final_backend')}  "
         f"gpu_executed_cells: {_gctx.get('gpu_executed_cells')}"
     )
+    lines.append(
+        "  executed_this_attempt: "
+        f"{_gctx.get('executed_this_attempt')} (cells stacked by THIS attempt)"
+    )
+    _hist_exec = _gctx.get("durable_historical_execution")
+    if isinstance(_hist_exec, dict):
+        _hist_counts = _hist_exec.get("backend_counts") or {}
+        lines.append(
+            "  durable_historical_execution (historical_restored): "
+            f"cells={_hist_exec.get('cells')} "
+            f"backend={_hist_exec.get('backend')} "
+            f"gpu={_hist_counts.get('gpu')} cpu={_hist_counts.get('cpu')} "
+            f"unknown={_hist_counts.get('unknown')} "
+            f"source={_hist_exec.get('source')}"
+        )
     if _gctx.get("device"):
         lines.append(
             f"  device: {_gctx.get('device')}  cupy={_gctx.get('cupy_version')}  "
@@ -14761,6 +14783,22 @@ def _run_single(
     # through to a generic GPU/CPU batch.
     _resume_complete_replay = False
     _resume_complete_cids: list[str] = []
+
+    def _current_attempt_cell_ids():
+        """ZM-RESUME-TELEMETRY-TRUTH: identities STACKED in THIS attempt.
+
+        - COMPLETE durable replay: the empty set (zero stacks were executed);
+        - PARTIAL resume: exactly the sparse resume pending set;
+        - fresh run: ``None``, meaning every assembled cell is current.
+
+        Observability only: never used for execution, admission or ordering.
+        """
+        if _resume_complete_replay:
+            return set()
+        if _resume_pending_ids is not None:
+            return {str(_cid) for _cid in _resume_pending_ids}
+        return None
+
     _resume_gauge = None
     _resume_geometry = None
     _resume_store_dir = (
@@ -16523,14 +16561,17 @@ def _run_single(
     # ZM-ZEGRID-R14: intra-phase progress for the two long per-cell phases.
     # cache_build reports FRAMES done/total (cumulative reprojected frames across
     # cells); per_cell_stack reports CELLS done/total.
-    cache_total_frames = sum(len(mem.patch_ids) for (_r, _c, _ce, _p, mem) in cell_ctxs if mem.patch_ids)
+    # ZM-RESUME-TELEMETRY-TRUTH: cache_build is a CURRENT-ATTEMPT counter, so
+    # its total and its START are deferred to the accounting loop below (the
+    # resume plan is not known yet here). A COMPLETE durable replay rebuilds
+    # zero frames and never opens the phase at all.
+    cache_total_frames = 0
     cache_frames_done = 0
     # cache_build counts FRAMES; per_cell_stack counts CELLS. Keep the cache
     # reporter diagnostics-only so a 0/1751 frame counter can never be mapped
     # onto the canonical 0/9 cell stage or fed to the ETA estimator.
     _cache_rep = _reporter(emit_stage=False)
     _stack_rep = _reporter()
-    _cache_rep.start("cache_build", total=cache_total_frames, unit="frames")
     _stack_rep.start("per_cell_stack", total=total_cells, unit="cells")
     # ZM-ZEGRID-ACTIVE-RESUME-PARITY r3: RUN-level progress accounting.
     # ``offset`` = cells already committed when this process started (0 for a
@@ -21007,6 +21048,24 @@ def _run_single(
         ),
     )
 
+    # ZM-RESUME-TELEMETRY-TRUTH: ONE authoritative attribution of the result
+    # records for THIS attempt, computed from the ACTUAL cell identity (the
+    # resume pending set / complete-replay empty set / every cell on a fresh
+    # run). Every downstream current-versus-historical telemetry block below
+    # consumes this split, so cache/stack/reprojection/backend evidence can
+    # never be summed into one misleading "current" number.
+    _attempt_ids = _current_attempt_cell_ids()
+
+    def _cell_in_attempt(_cid):
+        return True if _attempt_ids is None else str(_cid) in _attempt_ids
+
+    _current_records = [
+        _rec for _rec in results if _cell_in_attempt(_rec.get("cell_id"))
+    ]
+    _restored_records = [
+        _rec for _rec in results if not _cell_in_attempt(_rec.get("cell_id"))
+    ]
+
     # H2: actual backend EVIDENCE from the executed cells (never the selection).
     # `used=true` only when a successful cell actually ran the GPU canonical and
     # no whole-batch CPU rerun replaced it.
@@ -21037,6 +21096,46 @@ def _run_single(
     else:
         _executed_this_attempt = int(len(results))
     gpu_ctx["executed_this_attempt"] = int(_executed_this_attempt)
+    # ZM-RESUME-TELEMETRY-TRUTH: the backend evidence of the RESTORED durable
+    # commits is additive and explicitly HISTORICAL. A COMPLETE replay executed
+    # zero GPU cells (``actually_used=false`` above is the truth of THIS
+    # attempt), yet the run's restored Cells were produced by a frozen backend;
+    # that evidence must stay visible without masquerading as current work.
+    if _restored_records:
+        _hist_backend = {"gpu": 0, "cpu": 0, "unknown": 0}
+        for _rec in _restored_records:
+            _token = str(_rec.get("backend_used") or "").strip().lower()
+            _hist_backend[
+                _token if _token in ("gpu", "cpu") else "unknown"
+            ] += 1
+        if _hist_backend["gpu"] and _hist_backend["cpu"]:
+            _hist_mode = "mixed"
+        elif _hist_backend["gpu"]:
+            _hist_mode = "gpu"
+        elif _hist_backend["cpu"]:
+            _hist_mode = "cpu"
+        else:
+            _hist_mode = "unknown"
+        gpu_ctx["durable_historical_execution"] = {
+            "attribution": "historical_restored",
+            "source": "durable_commits",
+            "cells": int(len(_restored_records)),
+            "backend": str(_hist_mode),
+            "backend_counts": {
+                "gpu": int(_hist_backend["gpu"]),
+                "cpu": int(_hist_backend["cpu"]),
+                "unknown": int(_hist_backend["unknown"]),
+            },
+            "executed_this_attempt": 0,
+            "note": (
+                "backend evidence read from durable restored commits. These "
+                "cells were stacked by an earlier attempt; they are NOT work "
+                "executed by this attempt and are never added to its "
+                "actually_used/executed_this_attempt evidence."
+            ),
+        }
+    else:
+        gpu_ctx["durable_historical_execution"] = None
     # R55-E11: keep BOTH budgets distinguishable forever. Up to R55-E10 the
     # manifest's ``gpu.vram_budget_bytes`` was the legacy 50 % probe value even
     # when the ACTIVE 70 % policy executed the GPU. The legacy value is retained
@@ -21126,12 +21225,37 @@ def _run_single(
     per_cell_diagnostics["fallback"] = bool(per_cell_meta.get("fallback"))
     if per_cell_meta.get("fallback_reason"):
         per_cell_diagnostics["fallback_reason"] = per_cell_meta["fallback_reason"]
+    # ZM-RESUME-TELEMETRY-TRUTH: the unsuffixed per-cell sums are CURRENT-
+    # ATTEMPT measurements only (cells executed in this attempt). Restored
+    # durable descriptors keep their own additive, explicitly historical sums;
+    # the two are never added into a field presented as current work.
     per_cell_diagnostics["cache_build_cpu_sum_s"] = round(
-        sum(r.get("cache_build_s", 0.0) for r in results), 6
+        sum(r.get("cache_build_s", 0.0) for r in _current_records), 6
     )
     per_cell_diagnostics["stack_cpu_sum_s"] = round(
-        sum(r.get("stack_s", 0.0) for r in results), 6
+        sum(r.get("stack_s", 0.0) for r in _current_records), 6
     )
+    per_cell_diagnostics["cache_build_historical_restored_sum_s"] = round(
+        sum(r.get("cache_build_s", 0.0) for r in _restored_records), 6
+    )
+    per_cell_diagnostics["stack_historical_restored_sum_s"] = round(
+        sum(r.get("stack_s", 0.0) for r in _restored_records), 6
+    )
+    per_cell_diagnostics["work_attribution"] = {
+        "basis": "cell_identity_current_attempt",
+        "cells_total": int(len(results)),
+        "current_cells": int(len(_current_records)),
+        "historical_restored_cells": int(len(_restored_records)),
+        "historical_source": (
+            "durable_commits" if _restored_records else None
+        ),
+        "note": (
+            "current_* = cells stacked in THIS attempt (resume pending set, or "
+            "every cell on a fresh run). *_historical_restored_* = evidence "
+            "read from durable restored commits and never added to current "
+            "work. A COMPLETE non-finalized replay executes zero cells here."
+        ),
+    }
     # ZM-STACK-INSTRUMENTATION REWORK-1: attribution by ACTUAL cell identity.
     # On a resume, only the pending cells launched in THIS attempt are current;
     # every other result is a durable restored cell. A fresh run makes every
@@ -21140,8 +21264,8 @@ def _run_single(
     if _STACK_PHASE_PROFILING:
         _current_agg, _historical_agg = zspp.aggregate_records(
             results,
-            current_ids=(_resume_pending_ids or ()),
-            all_current=not bool(_resume_runtime.get("resumed")),
+            current_ids=(_attempt_ids or ()),
+            all_current=_attempt_ids is None,
         )
         per_cell_diagnostics["stack_phase_profile"] = {
             "schema": zspp.STACK_PHASE_PROFILE_SCHEMA,
@@ -21158,9 +21282,22 @@ def _run_single(
         }
     # ZM-ZEGRID-R21: which reprojection path the per-cell cache build took,
     # aggregated over every cell worker (each reports its process-local stats).
+    # ZM-RESUME-TELEMETRY-TRUTH: only cells ACTUALLY reprojected in this
+    # attempt contribute; a COMPLETE replay therefore reports the truthful
+    # empty/``unused`` current aggregate, and the restored durable counters are
+    # published separately under their own historical key.
     per_cell_diagnostics["reprojection"] = zxe.merge_reproject_stats(
-        *(r.get("reproject") for r in results)
+        *(r.get("reproject") for r in _current_records)
     )
+    if _restored_records:
+        per_cell_diagnostics["reprojection_historical_restored"] = (
+            zxe.merge_reproject_stats(
+                *(r.get("reproject") for r in _restored_records)
+            )
+        )
+        per_cell_diagnostics["reprojection_historical_restored"][
+            "attribution"
+        ] = "historical_restored"
 
     # R20: cache build is FUSED into the concurrent per-cell phase (bounded disk
     # requires the cache to be built+deleted inside each cell worker), so the
@@ -21177,6 +21314,35 @@ def _run_single(
     else:
         result_by_cid = {r["cell_id"]: r for r in results}
 
+    # ZM-RESUME-TELEMETRY-TRUTH: the cache_build counter is opened ONLY for
+    # frames REBUILT in THIS attempt (the same cell-identity attribution the
+    # per-cell diagnostics use). A COMPLETE durable replay rebuilds zero frames
+    # and never opens the phase, so the log can no longer show a frame counter
+    # advancing over replayed Cells.
+    cache_total_frames = sum(
+        len(mem.patch_ids)
+        for (_r, _c, _ce, _p, mem) in cell_ctxs
+        if mem.patch_ids and _cell_in_attempt(_ce.cell_id)
+    )
+    if _resume_complete_replay:
+        _emit(
+            "ZeGrid: cache_build not started — a COMPLETE durable replay "
+            "rebuilds 0 cache frames and reprojects 0 frames; the assembly "
+            "reads the immutable durable commits only",
+            callback=progress_callback,
+        )
+    else:
+        _cache_rep.start("cache_build", total=cache_total_frames, unit="frames")
+
+    # Historical (durable restored) cache evidence is additive and separate: it
+    # is NEVER added to the current-attempt cache counters above.
+    _restored_cache_total_bytes = 0
+    _restored_cache_n_frames = 0
+    _restored_cache_peak_bytes = 0
+    _restored_peak_rss_kib = 0
+    _rebuilt_cells: list[str] = []
+    _durable_reused_cells: list[str] = []
+
     # Ordered (row-major) accounting + records, empty cells interleaved exactly
     # as the serial loop emits them.
     for (row, col, cell, patch, mem) in cell_ctxs:
@@ -21188,25 +21354,44 @@ def _run_single(
                   callback=progress_callback)
             cell_records.append(r["record"])
             continue
-        cache_frames_done += r["n_frames"]
-        _cache_rep.progress(cache_frames_done, item_id=cid)
-        cache_total_bytes += r["total_bytes"]
-        cache_n_frames += r["n_frames"]
-        cache_peak_bytes = max(cache_peak_bytes, r["total_bytes"])
         if not _store_backed_results:
             cores[cid] = r["core"]
-        peak_rss_kib = max(peak_rss_kib, r["peak_rss_kib"])
-        if r["cleanup_failed"]:
-            cleanup_failures.append(r["cache_dir"])
-            _emit(f"ZeGrid: cell {cid} cache cleanup failed (non-fatal)", lvl="WARN",
-                  callback=progress_callback)
+        if _cell_in_attempt(cid):
+            cache_frames_done += r["n_frames"]
+            _cache_rep.progress(cache_frames_done, item_id=cid)
+            cache_total_bytes += r["total_bytes"]
+            cache_n_frames += r["n_frames"]
+            cache_peak_bytes = max(cache_peak_bytes, r["total_bytes"])
+            peak_rss_kib = max(peak_rss_kib, r["peak_rss_kib"])
+            _rebuilt_cells.append(str(cid))
+            if r["cleanup_failed"]:
+                cleanup_failures.append(r["cache_dir"])
+                _emit(f"ZeGrid: cell {cid} cache cleanup failed (non-fatal)", lvl="WARN",
+                      callback=progress_callback)
+        else:
+            # Durable restored Cell: HISTORICAL evidence, never current work.
+            _restored_cache_total_bytes += int(r["total_bytes"])
+            _restored_cache_n_frames += int(r["n_frames"])
+            _restored_cache_peak_bytes = max(
+                _restored_cache_peak_bytes, int(r["total_bytes"])
+            )
+            _restored_peak_rss_kib = max(
+                _restored_peak_rss_kib, int(r["peak_rss_kib"])
+            )
+            _durable_reused_cells.append(str(cid))
         cell_records.append(r["record"])
 
-    _cache_rep.end(
-        throughput=_fmt_throughput(cache_total_frames, timings.get("cache_build"), "frames/s")
-    )
+    if not _resume_complete_replay:
+        _cache_rep.end(
+            throughput=_fmt_throughput(cache_total_frames, timings.get("cache_build"), "frames/s")
+        )
+    # A replay executed zero Cells: no fabricated cells/s throughput claim.
     _stack_rep.end(
-        throughput=_fmt_throughput(total_cells, timings.get("per_cell_stack"), "cells/s")
+        throughput=(
+            None
+            if _resume_complete_replay
+            else _fmt_throughput(total_cells, timings.get("per_cell_stack"), "cells/s")
+        )
     )
 
     # ZM-ZEGRID-COMMIT-INTEGRITY: the end-of-stacking durable counter (ONE line),
@@ -21219,11 +21404,24 @@ def _run_single(
             expected_cells=int(total_cells),
             log_done=int(_stack_progress.get("last_done") or 0),
         )
-        _emit(
-            f"ZeGrid: per-cell stacking complete — durable_commits="
-            f"{_durable_attempts} (cells={int(total_cells)})",
-            callback=progress_callback,
-        )
+        # ZM-RESUME-TELEMETRY-TRUTH: a COMPLETE durable replay stacked nothing,
+        # so it must never claim "per-cell stacking complete". The durable-commit
+        # guard above stays identical (fail-closed) on every path.
+        if _resume_complete_replay:
+            _emit(
+                "ZeGrid: durable replay assembly — this attempt executed 0 "
+                f"cell stacks (reused_durable_cells={int(total_cells)}, "
+                f"durable_commits={_durable_attempts}); no cache was rebuilt "
+                "and no commit was written. Proceeding to assembly from the "
+                "immutable commits.",
+                callback=progress_callback,
+            )
+        else:
+            _emit(
+                f"ZeGrid: per-cell stacking complete — durable_commits="
+                f"{_durable_attempts} (cells={int(total_cells)})",
+                callback=progress_callback,
+            )
 
     # ASSEMBLY.
     _gauge_mode = getattr(science_config, "cell_gauge_mode", "global")
@@ -21372,14 +21570,49 @@ def _run_single(
         _halo_provenance_pass, science_config, feather_info
     )
 
+    # ZM-RESUME-TELEMETRY-TRUTH: only Cells whose cache THIS attempt built
+    # are "rebuilt"; a COMPLETE durable replay rebuilds none. On a fresh run
+    # every assembled Cell is current, so the legacy value is preserved exactly.
+    _rebuilt_set = {str(_cid) for _cid in _rebuilt_cells}
+    _rebuilt_current = [
+        _cid for _cid in assembled.complete_cells
+        if str(_cid) in _rebuilt_set
+    ]
     cache_report = {
         "reused": [],
-        "rebuilt": assembled.complete_cells,
+        "rebuilt": list(_rebuilt_current),
         "total_bytes": cache_total_bytes,
         "peak_cell_bytes": cache_peak_bytes,
         "n_frame_entries": cache_n_frames,
         "retention": "per-cell temporary (deleted after stacking); gauge cache deleted after use",
         "cleanup_failures": cleanup_failures,
+        "attribution": {
+            "basis": "cell_identity_current_attempt",
+            "current_attempt": {
+                "cells": list(_rebuilt_current),
+                "cells_count": int(len(_rebuilt_current)),
+                "total_bytes": int(cache_total_bytes),
+                "peak_cell_bytes": int(cache_peak_bytes),
+                "n_frame_entries": int(cache_n_frames),
+            },
+            "historical_restored": {
+                "cells": list(_durable_reused_cells),
+                "cells_count": int(len(_durable_reused_cells)),
+                "total_bytes": int(_restored_cache_total_bytes),
+                "peak_cell_bytes": int(_restored_cache_peak_bytes),
+                "n_frame_entries": int(_restored_cache_n_frames),
+                "peak_rss_kib": int(_restored_peak_rss_kib),
+                "source": (
+                    "durable_commits" if _durable_reused_cells else None
+                ),
+                "note": (
+                    "cache accounting read from durable restored commits. "
+                    "Those Cells were cached/stacked by an earlier attempt; "
+                    "their bytes/frames are NEVER added to the current "
+                    "attempt's cache totals."
+                ),
+            },
+        },
     }
 
     # ZM-ZEGRID-R23 rework-3 (H1): resolve the Classic-compatible output naming
@@ -22148,13 +22381,26 @@ def _run_single(
         except Exception:
             pass
 
+        # ZM-RESUME-TELEMETRY-TRUTH: cache_total/cache_peak above are THIS
+        # attempt's cache work only. When durable Cells were restored, their
+        # historical cache evidence is named explicitly on the same line and
+        # never folded into the current figures.
+        _cache_attribution_log = ""
+        if _durable_reused_cells:
+            _cache_attribution_log = (
+                f" executed_this_attempt={int(_executed_this_attempt)}"
+                f" reused_durable_cells={int(len(_durable_reused_cells))}"
+                f" cache_historical_restored="
+                f"{_restored_cache_total_bytes / 2**20:.0f}MiB"
+            )
         _emit(
             f"ZeGrid: done — science={raw_science_path.name} "
             f"aesthetic={aesthetic_path.name if (export_aesthetic and aesthetic_path is not None) else 'n/a'} "
             f"({assembled.science.shape}) + coverage + run log, "
             f"complete={len(assembled.complete_cells)} incomplete={len(assembled.incomplete_cells)} "
             f"holes={assembled.hole_pixels}px peak_rss={peak_rss_kib}KiB "
-            f"cache_total={cache_total_bytes / 2**20:.0f}MiB cache_peak={cache_peak_bytes / 2**20:.0f}MiB",
+            f"cache_total={cache_total_bytes / 2**20:.0f}MiB cache_peak={cache_peak_bytes / 2**20:.0f}MiB"
+            f"{_cache_attribution_log}",
             lvl="SUCCESS",
             callback=progress_callback,
         )
@@ -23031,7 +23277,11 @@ def _write_outputs(
                       "paths": list((cache_report or {}).get("cleanup_failures", [])),
                   },
                   "reused_cells": (cache_report or {}).get("reused", []),
-                  "rebuilt_cells": (cache_report or {}).get("rebuilt", [])},
+                  "rebuilt_cells": (cache_report or {}).get("rebuilt", []),
+                  # ZM-RESUME-TELEMETRY-TRUTH: the top-level cache figures above
+                  # are CURRENT-ATTEMPT cache work only; restored durable Cells
+                  # are reported separately here and are never summed with them.
+                  "attribution": (cache_report or {}).get("attribution")},
         "timings": (timings.to_dict() if timings is not None else {}),
         "gpu": _manifest_gpu_block(gpu_used, gpu_context),
         "ignored_settings": (ignored_settings or {}),
