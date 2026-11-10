@@ -2675,3 +2675,52 @@ def test_nested_store_tolerates_global_wcs_pair_at_output_root(
     ok, reason = win._zegrid_output_preflight(out, str(store))
     assert ok is False
     assert reason and "not a ZeGrid publication" in reason
+
+
+def test_nested_store_still_refuses_publication_beside_it_integration(
+    tmp_path, monkeypatch
+):
+    """REWORK-1: the global-WCS pair is the ONLY extra the nested-store subtree
+    check may tolerate. A publication beside a nested store stays foreign.
+
+    This exercises `_zegrid_precise_foreign` (the integration path), not just
+    the static helper, because passing the full owned-name list here would
+    silently accept an unrelated publication.
+    """
+    win = _window(tmp_path, monkeypatch, {})
+
+    # A publication directly beside the first store-chain ancestor: already
+    # publication evidence before any subtree consideration.
+    out_a = tmp_path / "out-a"
+    store_a = out_a / "a" / "b" / "store"
+    store_a.mkdir(parents=True)
+    (out_a / "a" / "zegrid_publications").mkdir()
+    before_a = _tree_digest(tmp_path / "out-a")
+    ok, reason = win._zegrid_output_preflight(out_a, str(store_a))
+    assert ok is False
+    assert reason and "previous ZeGrid publication" in reason
+    assert _tree_digest(tmp_path / "out-a") == before_a
+
+    # A publication beside the STORE itself (deeper in the ancestor chain): the
+    # subtree check must reject it, so the ancestor stays foreign.
+    out_b = tmp_path / "out-b"
+    store_b = out_b / "a" / "b" / "store"
+    store_b.mkdir(parents=True)
+    (out_b / "a" / "b" / "zegrid_publications").mkdir()
+    before_b = _tree_digest(tmp_path / "out-b")
+    ok, reason = win._zegrid_output_preflight(out_b, str(store_b))
+    assert ok is False
+    assert reason and "not a ZeGrid publication" in reason
+    assert "a" in reason
+    assert _tree_digest(tmp_path / "out-b") == before_b
+
+    # The same nested store WITHOUT that publication remains a safe fresh
+    # target even with the WCS pair at the output root.
+    out_c = tmp_path / "out-c"
+    store_c = out_c / "a" / "b" / "store"
+    store_c.mkdir(parents=True)
+    _write_wcs_pair(out_c)
+    before_c = _tree_digest(out_c)
+    ok, reason = win._zegrid_output_preflight(out_c, str(store_c))
+    assert ok is True, reason
+    assert _tree_digest(out_c) == before_c

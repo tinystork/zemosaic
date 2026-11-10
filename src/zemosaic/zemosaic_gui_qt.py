@@ -3687,22 +3687,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "__zegrid_cache__",
         ]
         # ZM-ZEGRID-OUTPUT-OWN-ARTIFACTS-20261110: ZeMosaic's own global-WCS
-        # descriptor (fits + its .json sibling) is derived from the configured
-        # ``global_wcs_output_path`` with the writer's exact naming rule. It is
-        # product metadata, never foreign user content, and never deleted.
-        try:
-            from .zemosaic_utils import global_wcs_owned_output_names
-
-            names.extend(
-                global_wcs_owned_output_names(
-                    output_dir,
-                    self.config.get(
-                        "global_wcs_output_path", "global_mosaic_wcs.fits"
-                    ),
-                )
-            )
-        except Exception:
-            pass
+        # descriptor (fits + its .json sibling) is product metadata, never
+        # foreign user content, and never deleted.
+        names.extend(self._zegrid_global_wcs_owned_names(output_dir))
         if output_dir and store_root:
             try:
                 rel = Path(store_root).expanduser().resolve().relative_to(
@@ -3719,6 +3706,27 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 if len(parts) == 1:
                     names.append(parts[0])
         return names
+
+    def _zegrid_global_wcs_owned_names(self, output_dir: Any) -> list[str]:
+        """Exact basenames of our global-WCS pair directly in ``output_dir``.
+
+        Derived from the configured ``global_wcs_output_path`` through the
+        writer's own resolver (``fits.with_suffix(".json")``). Empty on any
+        error, and empty for a configured path outside this output. These names
+        are product metadata; they are the ONLY extras the nested-store subtree
+        check may tolerate (never a publication or the rest of the GUI list).
+        """
+        try:
+            from .zemosaic_utils import global_wcs_owned_output_names
+
+            return global_wcs_owned_output_names(
+                output_dir,
+                self.config.get(
+                    "global_wcs_output_path", "global_mosaic_wcs.fits"
+                ),
+            )
+        except Exception:
+            return []
 
     @staticmethod
     def _zegrid_subtree_only_store(
@@ -3788,7 +3796,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 and self._zegrid_subtree_only_store(
                     out_path / name,
                     tuple(store_rel.parts[1:]),
-                    self._zegrid_owned_output_names(out_path, None),
+                    # ONLY product metadata safe beside a nested store. Passing
+                    # the full owned list here would tolerate a publication
+                    # beside the store, which this strict check excludes.
+                    self._zegrid_global_wcs_owned_names(out_path),
                 )
             ):
                 continue
