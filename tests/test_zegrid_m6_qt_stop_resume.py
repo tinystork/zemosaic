@@ -2578,3 +2578,100 @@ def test_markerless_residue_with_unreadable_tmp_is_refused(tmp_path, monkeypatch
     info = zpub.inspect_same_run_staging(out, run_id)
     assert info["ok"] is False
     assert "cannot be inspected" in info["reason"]
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-OUTPUT-OWN-ARTIFACTS-20261110: ZeMosaic's own global-WCS descriptor
+# pair is product metadata, not foreign user content.
+# ---------------------------------------------------------------------------
+
+
+def _write_wcs_pair(out: Path, fits_name: str = "global_mosaic_wcs.fits") -> None:
+    fits_path = out / fits_name
+    fits_path.write_bytes(b"NAXIS=0 descriptor")
+    fits_path.with_suffix(".json").write_text(
+        json.dumps({"engine": "zemosaic", "centre": [0.0, 0.0]}),
+        encoding="utf-8",
+    )
+
+
+def test_fresh_launch_tolerates_own_default_global_wcs_pair(tmp_path, monkeypatch):
+    win = _window(tmp_path, monkeypatch, {})
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_wcs_pair(out)
+    before = _tree_digest(tmp_path)
+
+    ok, reason = win._zegrid_output_preflight(out, None)
+    assert ok is True, reason
+    assert reason is None
+
+    # The real launch path accepts too (fresh generation, nothing overwritten).
+    ok, calls = _prepare_fresh(win, monkeypatch, enabled=True)
+    assert ok is True, calls
+    assert _tree_digest(tmp_path) == before, "a preflight check modified files"
+
+
+def test_fresh_launch_tolerates_renamed_global_wcs_pair(tmp_path, monkeypatch):
+    win = _window(tmp_path, monkeypatch, {})
+    win.config["global_wcs_output_path"] = "my_mosaic_wcs.fits"
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_wcs_pair(out, "my_mosaic_wcs.fits")
+    before = _tree_digest(tmp_path)
+
+    ok, reason = win._zegrid_output_preflight(out, None)
+    assert ok is True, reason
+    assert _tree_digest(tmp_path) == before
+
+    # Under the DEFAULT configuration the very same pair is unrelated content.
+    win2 = _window(tmp_path, monkeypatch, {})
+    ok, reason = win2._zegrid_output_preflight(out, None)
+    assert ok is False
+    assert reason and "not a ZeGrid publication" in reason
+    assert "my_mosaic_wcs.fits" in reason and "my_mosaic_wcs.json" in reason
+
+
+def test_fresh_launch_still_refuses_foreign_beside_global_wcs_pair(
+    tmp_path, monkeypatch
+):
+    win = _window(tmp_path, monkeypatch, {})
+    out = tmp_path / "out"
+    out.mkdir()
+    _write_wcs_pair(out)
+    (out / "notes.txt").write_text("mine", encoding="utf-8")
+    before = _tree_digest(tmp_path)
+
+    ok, reason = win._zegrid_output_preflight(out, None)
+    assert ok is False
+    assert reason and "not a ZeGrid publication" in reason
+    assert "notes.txt" in reason
+    # Our own pair is never named as the offending content.
+    assert "global_mosaic_wcs" not in reason
+    assert _tree_digest(tmp_path) == before
+
+    ok, calls = _prepare_fresh(win, monkeypatch, enabled=True)
+    assert ok is False and calls
+    assert (out / "notes.txt").read_text(encoding="utf-8") == "mine"
+    assert _tree_digest(tmp_path) == before
+
+
+def test_nested_store_tolerates_global_wcs_pair_at_output_root(
+    tmp_path, monkeypatch
+):
+    win = _window(tmp_path, monkeypatch, {})
+    out = tmp_path / "out"
+    store = out / "a" / "b" / "store"
+    store.mkdir(parents=True)
+    _write_wcs_pair(out)
+    before = _tree_digest(tmp_path)
+
+    ok, reason = win._zegrid_output_preflight(out, str(store))
+    assert ok is True, reason
+    assert _tree_digest(tmp_path) == before
+
+    # A genuinely foreign sibling still makes the ancestor chain foreign.
+    (out / "a" / "foreign.txt").write_text("mine", encoding="utf-8")
+    ok, reason = win._zegrid_output_preflight(out, str(store))
+    assert ok is False
+    assert reason and "not a ZeGrid publication" in reason

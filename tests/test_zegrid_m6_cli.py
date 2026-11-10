@@ -415,3 +415,74 @@ def test_store_overwrite_publishes_a_distinct_generation(tmp_path):
     assert first_generation_dir.is_dir()
     assert _generation_digests(first_generation_dir) == first_generation
 
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-OUTPUT-OWN-ARTIFACTS-20261110: the CLI's own global-WCS descriptor
+# pair is never foreign content, while a real foreign file still refuses.
+# ---------------------------------------------------------------------------
+
+
+def _digest_tree(root: Path) -> dict[str, str]:
+    import hashlib
+
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _validate(corpus: Path, out: Path, extra=()):
+    args = cli.build_parser().parse_args(
+        ["--input", str(corpus), "--output", str(out), *extra]
+    )
+    return cli.validate_options(args)
+
+
+def _wcs_pair(root: Path) -> None:
+    fits_path = root / "global_mosaic_wcs.fits"
+    fits_path.write_bytes(b"NAXIS=0 descriptor")
+    fits_path.with_suffix(".json").write_text(
+        json.dumps({"engine": "zemosaic"}), encoding="utf-8"
+    )
+
+
+def test_overwrite_accepts_own_global_wcs_pair_without_mutation(tmp_path):
+    corpus = tmp_path / "in"
+    corpus.mkdir()
+    (corpus / "frame_0001.fits").write_bytes(b"frame")
+    out = tmp_path / "out"
+    out.mkdir()
+    _wcs_pair(out)
+    before = _digest_tree(out)
+
+    resolved = _validate(corpus, out, ["--overwrite"])
+    assert resolved["output_dir"] == out
+    assert _digest_tree(out) == before
+
+    # Also accepted without --overwrite: no previous publication exists and
+    # the pair is not counted as foreign content of any kind.
+    plain = _validate(corpus, out)
+    assert plain["previous"]["found"] is False
+    assert plain["previous"]["foreign"] == []
+    assert _digest_tree(out) == before
+
+
+def test_overwrite_still_refuses_foreign_beside_own_global_wcs_pair(tmp_path):
+    corpus = tmp_path / "in"
+    corpus.mkdir()
+    (corpus / "frame_0001.fits").write_bytes(b"frame")
+    out = tmp_path / "out"
+    out.mkdir()
+    _wcs_pair(out)
+    (out / "notes.txt").write_text("not ours\n", encoding="utf-8")
+    before = _digest_tree(out)
+
+    with pytest.raises(cli.RefusedOption) as excinfo:
+        _validate(corpus, out, ["--overwrite"])
+    assert "not ours to destroy" in str(excinfo.value)
+    assert "notes.txt" in str(excinfo.value)
+    assert "global_mosaic_wcs" not in str(excinfo.value)
+    assert _digest_tree(out) == before
+    assert (out / "notes.txt").read_text(encoding="utf-8") == "not ours\n"

@@ -791,6 +791,45 @@ def resolve_global_wcs_output_paths(output_dir: str | Path, configured_path: Opt
     return str(fits_abs), str(json_path)
 
 
+def global_wcs_owned_output_names(
+    output_dir: str | Path, configured_path: Optional[str]
+) -> list[str]:
+    """Basenames of the global-WCS pair this product may write in ``output_dir``.
+
+    ZM-ZEGRID-OUTPUT-OWN-ARTIFACTS-20261110: the global-WCS descriptor is a
+    ZeMosaic product artifact, not foreign user content. The writer
+    (``resolve_global_wcs_output_paths`` / ``write_global_wcs_files``) puts the
+    FITS and its ``with_suffix(".json")`` sibling at the resolved paths, so the
+    same resolver is reused here instead of re-deriving the naming rule.
+
+    Callers use this as an exact-name ignore list for their own output safety
+    checks. Only names that resolve DIRECTLY inside ``output_dir`` are
+    returned: an absolute configured path (or one escaping the folder through
+    ``..``) names a file outside this output, so nothing there is "ours" to
+    ignore. Nothing is created, read or deleted here.
+    """
+
+    try:
+        root = Path(str(output_dir)).expanduser().resolve(strict=False)
+        fits_abs, json_abs = resolve_global_wcs_output_paths(
+            output_dir, configured_path
+        )
+    except Exception:
+        return []
+    names: list[str] = []
+    for raw in (fits_abs, json_abs):
+        try:
+            path = Path(str(raw))
+            if path.parent != root:
+                continue
+        except Exception:
+            continue
+        name = path.name
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def _build_file_records(entries: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collect (path, mtime, size) metadata for each unique file."""
 

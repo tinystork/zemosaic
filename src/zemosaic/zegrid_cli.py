@@ -241,10 +241,32 @@ def _detect_previous_publication(output_dir: Path) -> dict:
     """Detect a previous ZeGrid publication and foreign content.
 
     Delegates to the shared neutral helper in ``core.zegrid.run_publication``
-    (the same code the Qt GUI preflight uses). CLI semantics are unchanged: no
-    ignore list, no implicit overwrite, foreign files are never ours to destroy.
+    (the same code the Qt GUI preflight uses). No implicit overwrite and
+    foreign files are never ours to destroy.
+
+    ZM-ZEGRID-OUTPUT-OWN-ARTIFACTS-20261110: ZeMosaic's own global-WCS
+    descriptor pair is product metadata, not foreign content, so its exact
+    resolved names are passed as the caller's ignore list. The CLI exposes no
+    ``--global-wcs-output-path`` option, so the effective value is the
+    documented product default from ``zemosaic_config.DEFAULT_CONFIG`` (the
+    same default ``_build_config`` starts from).
     """
-    return zpub.detect_previous_publication(output_dir)
+    return zpub.detect_previous_publication(
+        output_dir, ignore_names=_global_wcs_owned_names(output_dir)
+    )
+
+
+def _global_wcs_owned_names(output_dir: Path) -> list[str]:
+    """Exact basenames of the product's own global-WCS pair in ``output_dir``."""
+    try:
+        from .zemosaic_config import DEFAULT_CONFIG
+        from .zemosaic_utils import global_wcs_owned_output_names
+
+        return global_wcs_owned_output_names(
+            output_dir, DEFAULT_CONFIG.get("global_wcs_output_path")
+        )
+    except Exception:
+        return []
 
 
 def validate_options(args) -> dict:

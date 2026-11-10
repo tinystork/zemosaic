@@ -3686,6 +3686,23 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "zegrid-cache",
             "__zegrid_cache__",
         ]
+        # ZM-ZEGRID-OUTPUT-OWN-ARTIFACTS-20261110: ZeMosaic's own global-WCS
+        # descriptor (fits + its .json sibling) is derived from the configured
+        # ``global_wcs_output_path`` with the writer's exact naming rule. It is
+        # product metadata, never foreign user content, and never deleted.
+        try:
+            from .zemosaic_utils import global_wcs_owned_output_names
+
+            names.extend(
+                global_wcs_owned_output_names(
+                    output_dir,
+                    self.config.get(
+                        "global_wcs_output_path", "global_mosaic_wcs.fits"
+                    ),
+                )
+            )
+        except Exception:
+            pass
         if output_dir and store_root:
             try:
                 rel = Path(store_root).expanduser().resolve().relative_to(
@@ -3704,11 +3721,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
         return names
 
     @staticmethod
-    def _zegrid_subtree_only_store(directory: Path, parts: tuple[str, ...]) -> bool:
+    def _zegrid_subtree_only_store(
+        directory: Path,
+        parts: tuple[str, ...],
+        extra_owned: Iterable[str] = (),
+    ) -> bool:
         """True only when ``directory`` contains exactly the store chain.
 
         GUI-owned artifacts are tolerated at each level; ANY unrelated sibling
         (a file, a publication, another folder) makes the ancestor foreign.
+        ``extra_owned`` lets the caller declare additional exact names that are
+        product-owned metadata (e.g. the global-WCS descriptor pair); it never
+        widens matching beyond those exact names.
         """
         owned = {
             "resource_telemetry.csv",
@@ -3724,6 +3748,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             # A PUBLICATION beside a nested store is NOT part of the store
             # chain (it stays unrelated content for this strict subtree check).
         }
+        if extra_owned:
+            owned = owned | {str(name) for name in extra_owned}
         current = directory
         for index, part in enumerate(parts):
             try:
@@ -3760,7 +3786,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 and len(store_rel.parts) > 1
                 and name == store_rel.parts[0]
                 and self._zegrid_subtree_only_store(
-                    out_path / name, tuple(store_rel.parts[1:])
+                    out_path / name,
+                    tuple(store_rel.parts[1:]),
+                    self._zegrid_owned_output_names(out_path, None),
                 )
             ):
                 continue
