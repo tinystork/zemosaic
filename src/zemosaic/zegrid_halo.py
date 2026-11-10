@@ -44,8 +44,10 @@ __all__ = [
     "ZEGRID_HALO_UNITS",
     "ZeGridHaloError",
     "build_halo_provenance",
+    "coerce_halo_user_selected",
     "halo_overhead_policy_for_source",
     "normalize_halo_overhead_policy",
+    "resolve_halo_user_selected",
     "resolve_zegrid_halo_px",
     "resolve_run_halo_provenance",
 ]
@@ -219,23 +221,126 @@ def build_halo_provenance(
     }
 
 
-def resolve_run_halo_provenance(explicit_value, config_value) -> dict:
+def coerce_halo_user_selected(value):
+    """Normalize a persisted/transported user-selection flag.
+
+    Returns ``True``/``False`` for a usable boolean and ``None`` when the value
+    carries no usable metadata (absent, invalid or out of contract). ``None`` is
+    NEVER treated as a claim of user intent: the caller migrates by value.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        ivalue = int(value)
+        if ivalue in (0, 1):
+            return bool(ivalue)
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off"):
+            return False
+    return None
+
+
+def resolve_halo_user_selected(raw_intent, halo_value, *, intent_persisted):
+    """Resolve the persisted GUI/CLI user-selection signal (migration seam).
+
+    * usable metadata wins, EXCEPT a ``False`` contradicting a non-default width:
+      a non-default width is user intent by the migration contract, so the flag
+      is normalized UP (the value proves the selection);
+    * no usable metadata: a non-default width migrates to ``True`` (legacy user
+      intent), while the default 64 migrates to ``False`` (untouched default).
+
+    ``intent_persisted`` documents whether the raw key existed at all; the
+    decision itself never invents intent beyond the persisted width.
+    """
+    intent = coerce_halo_user_selected(raw_intent)
+    try:
+        value = resolve_zegrid_halo_px(halo_value)
+    except ZeGridHaloError:
+        # An invalid width blocks the start elsewhere; never claim intent from it.
+        return False if intent is None else bool(intent)
+    if intent is not None:
+        if intent is False and value != int(ZEGRID_HALO_DEFAULT_PX):
+            return True
+        return bool(intent)
+    return bool(value != int(ZEGRID_HALO_DEFAULT_PX))
+
+
+def resolve_run_halo_provenance(
+    explicit_value, config_value, *, explicit_intent=None, config_intent=None
+) -> dict:
     """Resolve the ONE run-level provenance from explicit > config > default.
 
-    ``explicit_value is None`` means "not supplied". ``config_value`` is the raw
-    value read ONCE from the effective config object by the caller (never re-read
-    later). No mutable global is written.
+    ``explicit_value is None`` means "not supplied" and ``config_value`` is the
+    raw value read ONCE from the effective config object by the caller (never
+    re-read later). No mutable global is written.
+
+    ZM-HALO-EXECUTION-DECOUPLING REWORK-1: ``explicit_intent`` /
+    ``config_intent`` carry the PERSISTED user-selection signal from the GUI
+    (``zegrid_halo_px_user_selected``). The value alone cannot distinguish the
+    untouched product default 64 from a user who explicitly selected 64, so
+    intent is an independent, additive input:
+
+    * intent ``True``  -> the value is a USER REQUEST (``explicit_argument`` /
+      ``config``), whatever the width, including 64;
+    * intent ``False`` -> NOT a user request. Only the product default is
+      truthful there; a non-default width is a contradictory transport and
+      fails closed (callers normalize persisted contradictions separately);
+    * intent ``None``  -> legacy/direct call. An explicit keyword keeps the
+      historical "explicit argument" semantics (advisory); a legacy config
+      value is advisory when it differs from the default and resolves to the
+      product default when it equals it.
     """
+    _default = int(ZEGRID_HALO_DEFAULT_PX)
+    _explicit_intent = coerce_halo_user_selected(explicit_intent)
+    _config_intent = coerce_halo_user_selected(config_intent)
+
     if explicit_value is not None:
         effective = resolve_zegrid_halo_px(explicit_value)
+        if _explicit_intent is False:
+            if effective != _default:
+                raise ZeGridHaloError(
+                    "contradictory halo intent: zegrid_halo_px_user_selected="
+                    f"False with non-default halo {effective} px; refusing to "
+                    "claim or silently discard user intent"
+                )
+            return build_halo_provenance(
+                None, effective, ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT
+            )
+        # True (user request) and None (legacy/direct explicit keyword) are both
+        # explicit-argument provenance; only the overhead policy differs later.
         return build_halo_provenance(
             effective, effective, ZEGRID_HALO_SOURCE_EXPLICIT
         )
+
     if config_value is not None:
         effective = resolve_zegrid_halo_px(config_value)
+        if _config_intent is False and effective != _default:
+            # Persisted metadata contradicted a non-default value. Non-default
+            # widths are user intent by the migration contract, so honour the
+            # value as config provenance instead of refusing the run.
+            return build_halo_provenance(
+                effective, effective, ZEGRID_HALO_SOURCE_CONFIG
+            )
+        if _config_intent is False:
+            return build_halo_provenance(
+                None, effective, ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT
+            )
+        if _config_intent is None and effective == _default:
+            # Legacy/default 64 with NO intent metadata = untouched product
+            # default (historical hard floor).
+            return build_halo_provenance(
+                None, effective, ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT
+            )
         return build_halo_provenance(
             effective, effective, ZEGRID_HALO_SOURCE_CONFIG
         )
+
     effective = resolve_zegrid_halo_px(None)
     return build_halo_provenance(
         None, effective, ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT

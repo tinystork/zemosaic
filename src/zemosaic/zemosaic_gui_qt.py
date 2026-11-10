@@ -82,6 +82,7 @@ from .zegrid_halo import ZEGRID_HALO_DEFAULT_PX
 from .zegrid_halo import (
     ZEGRID_HALO_ALLOWED_PX,
     ZeGridHaloError,
+    resolve_halo_user_selected,
     resolve_zegrid_halo_px,
 )
 from .core.zegrid import scheduler as zsched
@@ -4298,6 +4299,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         except (ZeGridHaloError, TypeError, ValueError):
             return
         self.config["zegrid_halo_px"] = int(value)
+        # ZM-HALO-EXECUTION-DECOUPLING REWORK-1: a REAL combo selection (including
+        # 64) is user intent. The sync helpers block signals, so this only fires
+        # for a genuine user/programmatic selection, never for a config load.
+        self.config["zegrid_halo_px_user_selected"] = True
         combo.setProperty("zegrid_halo_invalid", False)
         self._apply_zegrid_halo_control_state()
 
@@ -7074,6 +7079,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "use_existing_master_tiles": False,
             "zegrid_mode_enabled": False,
             "zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX,
+            "zegrid_halo_px_user_selected": False,
             "zegrid_scheduler_mode": zsched.DEFAULT_MODE,
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
@@ -7382,6 +7388,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     },
                 )
             )
+
+        # ZM-HALO-EXECUTION-DECOUPLING REWORK-1: resolve the halo USER-SELECTION
+        # intent HERE, from the loader output (``config_data``) rather than from
+        # ``merged_config`` (which already carries the default). The real loader
+        # migrates it; a minimal/stub loader may omit the key, in which case the
+        # value-based migration applies (non-default -> user intent; default 64 ->
+        # untouched product default).
+        merged_config["zegrid_halo_px_user_selected"] = resolve_halo_user_selected(
+            merged_config.get("zegrid_halo_px_user_selected"),
+            merged_config.get("zegrid_halo_px"),
+            intent_persisted=("zegrid_halo_px_user_selected" in config_data),
+        )
 
         canonical_gpu_pref: Any = merged_config.get("use_gpu_phase5")
         if canonical_gpu_pref in (None, ""):

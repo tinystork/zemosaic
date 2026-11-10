@@ -23089,6 +23089,11 @@ def run_zegrid_mode(
     workers: int | None = None,
     cell_gauge_mode: str | None = None,
     zegrid_halo_px: int | str | None = None,
+    # ZM-HALO-EXECUTION-DECOUPLING REWORK-1: additive USER-SELECTION intent for
+    # the halo. ``False`` = untouched GUI product default (historical hard-floor
+    # policy); ``True`` = the user selected the width (advisory, including 64);
+    # ``None`` = legacy/direct caller (explicit keyword semantics).
+    zegrid_halo_px_user_selected: bool | None = None,
     zegrid_scheduler_mode: str | None = None,
     frames_info: Sequence | None = None,
     selection_paths: Sequence[str] | None = None,
@@ -23197,9 +23202,19 @@ def run_zegrid_mode(
         getattr(zconfig, ZEGRID_HALO_CONFIG_KEY, None)
         if zconfig is not None else None
     )
+    # REWORK-1: the persisted user-selection intent travels with the config, so a
+    # config-only caller (CLI/no explicit keyword) is still distinguishable from
+    # an untouched product default.
+    _halo_config_intent = (
+        getattr(zconfig, "zegrid_halo_px_user_selected", None)
+        if zconfig is not None else None
+    )
     try:
         halo_provenance = resolve_run_halo_provenance(
-            zegrid_halo_px, _halo_config_value
+            zegrid_halo_px,
+            _halo_config_value,
+            explicit_intent=zegrid_halo_px_user_selected,
+            config_intent=_halo_config_intent,
         )
     except ZeGridHaloError as exc:
         _emit(f"ZeGrid: {exc}", lvl="ERROR", callback=progress_callback)

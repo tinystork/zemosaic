@@ -31096,6 +31096,12 @@ def run_hierarchical_mosaic(
     # callers keep their current behavior; the value still comes from the
     # persisted config when this argument is absent.
     zegrid_halo_px: int | str | None = None,
+    # ZM-HALO-EXECUTION-DECOUPLING REWORK-1: additive GUI -> worker transport of
+    # the USER-SELECTION intent for the halo. ``False`` = untouched product
+    # default (hard-floor policy), ``True`` = the user selected the width
+    # (advisory policy, including an explicit 64). Absent (``None``) keeps the
+    # persisted-config value, which the config loader already migrated.
+    zegrid_halo_px_user_selected: bool | None = None,
     # ZM-ZEGRID-R55-B: explicit GUI/settings -> engine transport of the scheduler
     # mode. Absent -> the persisted config value; ``None`` there -> legacy.
     zegrid_scheduler_mode: str | None = None,
@@ -31162,6 +31168,22 @@ def run_hierarchical_mosaic(
         worker_config_cache["zegrid_halo_px"] = zegrid_halo_px
         try:
             setattr(zconfig, "zegrid_halo_px", zegrid_halo_px)
+        except Exception:
+            pass
+
+    # ZM-HALO-EXECUTION-DECOUPLING REWORK-1: the intent crosses the boundary with
+    # the value. An explicit ``False`` is a real signal (untouched default), so
+    # only ``None`` means "absent".
+    if zegrid_halo_px_user_selected is not None:
+        worker_config_cache["zegrid_halo_px_user_selected"] = bool(
+            zegrid_halo_px_user_selected
+        )
+        try:
+            setattr(
+                zconfig,
+                "zegrid_halo_px_user_selected",
+                bool(zegrid_halo_px_user_selected),
+            )
         except Exception:
             pass
 
@@ -31434,6 +31456,9 @@ def run_hierarchical_mosaic(
                     grid_rgb_equalize=grid_rgb_equalize_flag,
                     use_gpu=_grid_gpu_requested,
                     zegrid_halo_px=(worker_config_cache or {}).get("zegrid_halo_px"),
+                    zegrid_halo_px_user_selected=(worker_config_cache or {}).get(
+                        "zegrid_halo_px_user_selected"
+                    ),
                     zegrid_scheduler_mode=(worker_config_cache or {}).get(
                         "zegrid_scheduler_mode"
                     ),

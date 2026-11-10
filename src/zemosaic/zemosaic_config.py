@@ -55,9 +55,9 @@ from typing import Any, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 try:
-    from .zegrid_halo import ZEGRID_HALO_DEFAULT_PX
+    from .zegrid_halo import ZEGRID_HALO_DEFAULT_PX, resolve_halo_user_selected
 except ImportError:  # pragma: no cover - `python zemosaic_config.py` (no package)
-    from zegrid_halo import ZEGRID_HALO_DEFAULT_PX
+    from zegrid_halo import ZEGRID_HALO_DEFAULT_PX, resolve_halo_user_selected
 
 try:
     from .zemosaic_utils import ensure_user_config_dir, get_user_config_dir
@@ -127,6 +127,12 @@ DEFAULT_CONFIG = {
     # Product default 64 (256 is experimental). The engine validates this value
     # strictly (see zemosaic/zegrid_halo.py); it is not a mutable global.
     "zegrid_halo_px": ZEGRID_HALO_DEFAULT_PX,
+    # ZM-HALO-EXECUTION-DECOUPLING REWORK-1: additive USER-SELECTION intent for
+    # the halo. ``False`` (default) means "untouched product default" and keeps
+    # the historical hard-floor overhead policy; ``True`` means the user
+    # selected the width (including an explicit selection of 64) and makes the
+    # overhead ratio advisory. Migrated conservatively by the loader.
+    "zegrid_halo_px_user_selected": False,
     # ZM-ZEGRID-R55-B/E3/R56: "active" (default since the bounded 5,000-image
     # Windows/GPU qualification: the R55 plan grants execution authority; GPU
     # still requires the separate GPU toggle), "observe" (records a predicted
@@ -1160,6 +1166,17 @@ def load_config(config_path=None):
             print(f"ERROR: {msg_title} - {msg_text}")
     # else:
         # print(f"Config file not found at {config_path}. Using default configuration.")
+    # ZM-HALO-EXECUTION-DECOUPLING REWORK-1: resolve the persisted USER-SELECTION
+    # intent for the halo ONCE, at the persistence boundary. ``loaded_keys`` is
+    # read BEFORE the DEFAULT_CONFIG merge, so an untouched default is
+    # distinguishable from a user who selected 64. Non-default widths without
+    # metadata migrate to user intent; default 64 without metadata stays the
+    # untouched product default (historical hard-floor policy).
+    current_config["zegrid_halo_px_user_selected"] = resolve_halo_user_selected(
+        current_config.get("zegrid_halo_px_user_selected"),
+        current_config.get("zegrid_halo_px"),
+        intent_persisted=("zegrid_halo_px_user_selected" in loaded_keys),
+    )
     current_config.setdefault("crop_follow_signal", False)
     current_config.setdefault("cache_retention", "run_end")
     for key in (
