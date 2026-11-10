@@ -74,6 +74,8 @@ from . import progress_contract as zprogress
 from . import zemosaic_config as zconf
 from . import zemosaic_stack_plan as _stack_plan
 from .zegrid_halo import (
+    HALO_OVERHEAD_POLICY_ADVISORY,
+    HALO_OVERHEAD_POLICY_HARD_FLOOR,
     ZEGRID_HALO_CONFIG_KEY,
     ZEGRID_HALO_DEFAULT_PX,
     ZEGRID_HALO_SOURCE_EXPLICIT,
@@ -81,6 +83,8 @@ from .zegrid_halo import (
     ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT,
     ZeGridHaloError,
     build_halo_provenance,
+    halo_overhead_policy_for_source,
+    normalize_halo_overhead_policy,
     resolve_run_halo_provenance,
     resolve_zegrid_halo_px,
 )
@@ -2079,6 +2083,67 @@ def _selected_admissible_bound(inmem_ok, inmem_worst, selected_tile, stream_wors
     return min(bounds) if bounds else int(legacy_fallback)
 
 
+# ZM-HALO-EXECUTION-DECOUPLING: a fixed-width halo makes the patch area
+# asymptote to ``(2H + 1)^2`` as logical Cells get finer. Scanning far past that
+# plateau cannot meaningfully lower the modelled per-cell peak (the patch is
+# almost entirely halo) while it multiplies the Cell count; the physical
+# working set (tile / column batch / external spool) is the next lever. The
+# advisory scan therefore stops at 2x the irreducible halo-only patch area,
+# AFTER evaluating that candidate. The hard-floor path is untouched.
+_ADVISORY_HALO_PLATEAU_FACTOR = 2
+
+
+def _halo_plateau_reached(min_patch_area, halo_px) -> bool:
+    """True when logical refinement is halo-dominated (no more peak reduction)."""
+    _floor_area = (2 * int(halo_px) + 1) ** 2
+    return int(min_patch_area) <= _ADVISORY_HALO_PLATEAU_FACTOR * _floor_area
+
+
+def _halo_state(halo_ok: bool, advisory: bool) -> str:
+    """Machine token for the ``max_halo_overhead`` diagnostic state."""
+    if halo_ok:
+        return "within_threshold"
+    return (
+        "exceeded_advisory_accepted" if advisory else "exceeded_hard_floor"
+    )
+
+
+def _halo_advisory_block(policy, halo_px, value, threshold) -> dict:
+    """Public, JSON-native halo-overhead ADVISORY provenance.
+
+    Published only under the advisory policy so a hard-floor run keeps its
+    historical layout-dict shape byte for byte. The exact requested halo, the
+    observed ratio, the historical threshold and the policy token are all
+    explicit: an exceedance is a cost signal that never changed geometry.
+    """
+    _ok = float(value) <= float(threshold)
+    return {
+        "policy": str(policy),
+        "halo_px": int(halo_px),
+        "value": round(float(value), 6),
+        "threshold": float(threshold),
+        "state": "within_threshold" if _ok else "exceeded_advisory_accepted",
+        "exceeded": (not _ok),
+        "geometry_changed": False,
+    }
+
+
+def _run_halo_overhead_policy(halo_provenance) -> str:
+    """Derive the halo-overhead policy from a run-level provenance object.
+
+    Missing provenance (direct/internal call) and out-of-contract synthetic
+    sources both resolve to the conservative historical HARD FLOOR; only the
+    product sources (explicit keyword / config value) become advisory.
+    """
+    _source = str(
+        (halo_provenance or {}).get("source") or ZEGRID_HALO_SOURCE_INTERNAL_ONLY
+    )
+    try:
+        return halo_overhead_policy_for_source(_source)
+    except ZeGridHaloError:
+        return HALO_OVERHEAD_POLICY_HARD_FLOOR
+
+
 def _choose_layout_mode_aware(
     canvas,
     frames,
@@ -2103,6 +2168,7 @@ def _choose_layout_mode_aware(
     max_refinement_rank=None,
     allow_external=False,
     enforce_joint=True,
+    halo_policy=None,
 ):
     """MODE-AWARE RAM-aware layout: coarsest candidate whose cheaper mode fits.
 
@@ -2120,6 +2186,15 @@ def _choose_layout_mode_aware(
     passes the validated effective value explicitly; the default (``sweep.
     HALO_PX``) is only the historical low-level helper default for direct/unit
     calls, never a product default.
+
+    ``halo_policy`` (ZM-HALO-EXECUTION-DECOUPLING) decides what a
+    ``max_halo_overhead`` exceedance MEANS. ``None`` keeps the historical
+    ``hard_floor`` behaviour for every direct/unit caller. The product passes
+    :data:`zegrid_halo.HALO_OVERHEAD_POLICY_ADVISORY` for a user-requested halo:
+    the exact halo is honoured, the ratio is reported as a diagnostic, and no
+    layout is rejected or coarsened solely because of it. Memory admission, the
+    patch-area floor, the contributor floor and the joint envelope stay
+    fail-closed under BOTH policies.
 
     ``emit`` (optional) is ``callable(message, lvl="INFO")``: when supplied, the
     scan is EXPLAINED live (ZM-ZEGRID-R14) — each candidate ``(nx, ny)``, why it
@@ -2185,6 +2260,8 @@ def _choose_layout_mode_aware(
                 pass
 
     floors = floors or zal.ScientificFloors()
+    _halo_policy = normalize_halo_overhead_policy(halo_policy)
+    _halo_advisory = _halo_policy == HALO_OVERHEAD_POLICY_ADVISORY
     n_frames = len(frames)
     if footprints_in is None and observer is not None:
         observer.start(
@@ -2266,18 +2343,31 @@ def _choose_layout_mode_aware(
         geom = zal._nominal_geometry(canvas, nx, ny, halo_px)
         patch_ok = geom["min_patch_area"] >= floors.min_patch_area_px
         halo_ok = geom["halo_overhead"] <= floors.max_halo_overhead
-        if not (patch_ok and halo_ok):
+        # ZM-HALO-EXECUTION-DECOUPLING: under the ADVISORY policy an explicit
+        # user halo is honoured exactly. Its overhead ratio is reported as a
+        # cost signal but cannot refuse the pinned geometry on its own; the
+        # patch-area floor and every resource envelope below stay fail-closed.
+        _halo_violation = (not halo_ok) and not _halo_advisory
+        if (not halo_ok) and _halo_advisory:
+            _log(
+                f"halo overhead policy: ADVISORY — pinned halo {int(halo_px)}px "
+                f"overhead {geom['halo_overhead']:.4f} > "
+                f"{floors.max_halo_overhead} is a cost signal, not a feasibility "
+                "floor; exact geometry and halo preserved",
+                "WARN",
+            )
+        if not (patch_ok and (halo_ok or _halo_advisory)):
             # ZM-ZEGRID-R55-E6: the pinned geometry is NEVER changed, but the
             # advice must be truthful. Halo overhead grows with refinement, so
             # "pin FINER" is the wrong direction for a halo-floor conflict.
-            if not halo_ok and patch_ok:
+            if _halo_violation and patch_ok:
                 _dir = (
                     "Lower the anti-checkerboard halo (e.g. "
                     f"{halo_px} -> {max(1, int(halo_px) // 2)} px) or increase the "
                     "core/cell size; a FINER layout raises halo overhead and cannot "
                     "fix this."
                 )
-            elif not patch_ok and halo_ok:
+            elif not patch_ok:
                 _dir = (
                     "Increase the core/cell size (coarser layout) or the halo-free "
                     "core geometry; a FINER layout reduces patch area and cannot fix "
@@ -2288,10 +2378,16 @@ def _choose_layout_mode_aware(
                     "Both floors are violated: increase the core/cell size and/or "
                     "lower the anti-checkerboard halo."
                 )
+            _halo_detail = (
+                f"halo_overhead={geom['halo_overhead']:.4f} "
+                f"(limit {floors.max_halo_overhead}"
+                + ("; ADVISORY — not a feasibility floor" if _halo_advisory else "")
+                + "). "
+            )
             msg = (
                 f"pinned layout {nx}x{ny} violates scientific floors: "
                 f"min_patch_area={geom['min_patch_area']} (limit {floors.min_patch_area_px}), "
-                f"halo_overhead={geom['halo_overhead']:.4f} (limit {floors.max_halo_overhead}). "
+                + _halo_detail
                 + _dir
             )
             _log(msg, "ERROR")
@@ -2401,6 +2497,12 @@ def _choose_layout_mode_aware(
                 raise zal.LayoutInfeasible(msg)
         contrib_ok = max_n >= floors.min_contributors
         warnings = []
+        if _halo_advisory and not halo_ok:
+            warnings.append(
+                f"MAX_HALO_OVERHEAD_ADVISORY: halo {int(halo_px)}px overhead "
+                f"{geom['halo_overhead']:.4f} exceeds {floors.max_halo_overhead}; "
+                "the explicit halo is preserved and the pinned geometry is kept"
+            )
         if not contrib_ok:
             warnings.append(
                 f"deepest cell has {max_n} contributors < min_contributors "
@@ -2429,6 +2531,10 @@ def _choose_layout_mode_aware(
             "cells": cells,
             "layout_source": "pinned",
             "layout_origin": "pinned",
+            "halo_overhead_policy": _halo_policy,
+            **({"halo_overhead_advisory": _halo_advisory_block(
+                _halo_policy, halo_px, geom["halo_overhead"], floors.max_halo_overhead
+            )} if _halo_advisory else {}),
             "cpu_streaming": _cpu_streaming_block(
                 selected_tile, trials, sel_reason, stream_worst_by_tile, inmem_worst, ram_budget
             ),
@@ -2436,7 +2542,9 @@ def _choose_layout_mode_aware(
                 "min_patch_area_px": {"value": geom["min_patch_area"],
                                        "limit": floors.min_patch_area_px, "ok": patch_ok},
                 "max_halo_overhead": {"value": round(geom["halo_overhead"], 6),
-                                       "limit": floors.max_halo_overhead, "ok": halo_ok},
+                                       "limit": floors.max_halo_overhead, "ok": halo_ok,
+                                       "policy": _halo_policy,
+                                       "state": _halo_state(halo_ok, _halo_advisory)},
                 "min_contributors": {"value": max_n, "limit": floors.min_contributors, "ok": contrib_ok},
             },
         }
@@ -2454,6 +2562,7 @@ def _choose_layout_mode_aware(
     # trigger for the bounded coarser rescue; every ordinary run leaves it None.
     halo_conflict = None
     halo_floor_stopped = None
+    refinement_plateau = None
     for factor in zal.REFINEMENT_FACTORS:
         nx = max(1, int(math.ceil(canvas.width / (mw / factor))))
         ny = max(1, int(math.ceil(canvas.height / (mh / factor))))
@@ -2472,16 +2581,33 @@ def _choose_layout_mode_aware(
         if max_refinement_rank is not None and _rank > int(max_refinement_rank):
             break
         geom = zal._nominal_geometry(canvas, nx, ny, halo_px)
-        if not (geom["min_patch_area"] >= floors.min_patch_area_px and
-                geom["halo_overhead"] <= floors.max_halo_overhead):
+        _patch_ok = geom["min_patch_area"] >= floors.min_patch_area_px
+        _halo_ok = geom["halo_overhead"] <= floors.max_halo_overhead
+        if not _patch_ok:
             # Explain WHICH floor blocked this candidate (ZM-ZEGRID-R14).
-            if geom["min_patch_area"] < floors.min_patch_area_px:
+            _log(
+                f"layout scan: candidate {nx}x{ny} REJECTED — "
+                f"min_patch_area floor: {geom['min_patch_area']} px < "
+                f"{floors.min_patch_area_px} px"
+            )
+            if not _halo_ok:
                 _log(
-                    f"layout scan: candidate {nx}x{ny} REJECTED — "
-                    f"min_patch_area floor: {geom['min_patch_area']} px < "
-                    f"{floors.min_patch_area_px} px"
+                    f"layout scan: candidate {nx}x{ny} — "
+                    f"max_halo_overhead {geom['halo_overhead']:.4f} > "
+                    f"{floors.max_halo_overhead}"
+                    + (
+                        " (ADVISORY — explicit halo preserved; not the reason "
+                        "for stopping)"
+                        if _halo_advisory else ""
+                    )
                 )
-            if geom["halo_overhead"] > floors.max_halo_overhead:
+            _log("layout scan: floors are monotonic in refinement — stopping")
+            break  # min_patch_area is monotonic in refinement
+        if not _halo_ok:
+            if not _halo_advisory:
+                # ZM-HALO-EXECUTION-DECOUPLING: historical HARD FLOOR. Only a
+                # product-default / internal halo reaches this branch; a
+                # user-requested halo is advisory and never coarsened for it.
                 _log(
                     f"layout scan: candidate {nx}x{ny} REJECTED — "
                     f"max_halo_overhead floor: {geom['halo_overhead']:.4f} > "
@@ -2490,16 +2616,23 @@ def _choose_layout_mode_aware(
                 halo_floor_stopped = {
                     "nx": nx, "ny": ny, "factor": factor, "geom": geom,
                 }
-            if (
-                not candidates
-                and geom["min_patch_area"] >= floors.min_patch_area_px
-                and geom["halo_overhead"] > floors.max_halo_overhead
-            ):
-                halo_conflict = {
-                    "nx": nx, "ny": ny, "factor": factor, "geom": geom,
-                }
-            _log("layout scan: floors are monotonic in refinement — stopping")
-            break  # floors are monotonic in refinement
+                if not candidates:
+                    halo_conflict = {
+                        "nx": nx, "ny": ny, "factor": factor, "geom": geom,
+                    }
+                _log("layout scan: floors are monotonic in refinement — stopping")
+                break  # floors are monotonic in refinement
+            # ZM-HALO-EXECUTION-DECOUPLING: ADVISORY. The exact explicit halo is
+            # preserved and this ratio is a cost signal, so the scan CONTINUES
+            # to memory-evaluate this and every finer candidate. The bounded
+            # coarser rescue is never armed here.
+            _log(
+                f"layout scan: candidate {nx}x{ny} — halo_overhead "
+                f"{geom['halo_overhead']:.4f} > {floors.max_halo_overhead} "
+                "(ADVISORY: explicit halo preserved; not a feasibility floor) — "
+                "continuing to evaluate memory",
+                "WARN",
+            )
         worst = _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
         selected_tile, trials, sel_reason = _select_cpu_streaming_tile(
             worst["stream_worst_by_tile"], ram_budget
@@ -2589,6 +2722,28 @@ def _choose_layout_mode_aware(
             # ZM-ZEGRID-R28: the returned choice is the FIRST floor-feasible +
             # memory + JOINT admissible candidate. Stop the production scan here
             # rather than evaluating finer candidates that are never used.
+            break
+        if _halo_advisory and _halo_plateau_reached(
+            geom["min_patch_area"], halo_px
+        ):
+            # ZM-HALO-EXECUTION-DECOUPLING: the patch is now essentially the
+            # fixed halo band. Further logical refinement cannot meaningfully
+            # lower the per-cell peak, so the physical working set must absorb
+            # the remainder. Deterministic, advisory-only, AFTER this candidate.
+            refinement_plateau = {
+                "nx": nx, "ny": ny,
+                "min_patch_area": int(geom["min_patch_area"]),
+                "halo_only_area": (2 * int(halo_px) + 1) ** 2,
+            }
+            _log(
+                f"layout scan: refinement PLATEAU — patch area "
+                f"{geom['min_patch_area']} px is within "
+                f"{_ADVISORY_HALO_PLATEAU_FACTOR}x the irreducible halo-only "
+                f"area ({(2 * int(halo_px) + 1) ** 2} px) at {nx}x{ny}; further "
+                "logical refinement cannot meaningfully lower the per-cell peak "
+                "— stopping (physical chunking must absorb the remainder)",
+                "WARN",
+            )
             break
 
     chosen = None
@@ -2909,11 +3064,26 @@ def _choose_layout_mode_aware(
                 f"{finest['joint'].get('detail')}"
             )
         reasons.append(
-            f"min_patch_area floor ({floors.min_patch_area_px} px) / "
-            f"max_halo_overhead floor ({floors.max_halo_overhead}) cannot be satisfied "
-            f"together with the budget (mode-aware, adaptive CPU streaming tile down to "
+            f"min_patch_area floor ({floors.min_patch_area_px} px)"
+            + (
+                ""
+                if _halo_advisory
+                else f" / max_halo_overhead floor ({floors.max_halo_overhead})"
+            )
+            + " cannot be satisfied together with the budget (mode-aware, "
+            "adaptive CPU streaming tile down to "
             f"{CPU_STREAMING_TILE_MINIMUM})"
         )
+        if refinement_plateau is not None:
+            reasons.append(
+                "the advisory scan stopped at the HALO-DOMINATED refinement "
+                f"plateau ({refinement_plateau['nx']}x{refinement_plateau['ny']}, "
+                f"patch area {refinement_plateau['min_patch_area']} px vs "
+                f"halo-only {refinement_plateau['halo_only_area']} px): further "
+                "logical refinement cannot meaningfully lower the per-cell peak, "
+                "so a physical working-set class (external spool / smaller "
+                "tile) is the remaining lever"
+            )
         if halo_floor_stopped is not None:
             # The finer direction is blocked by the halo floor, so never advise it.
             _finest_dir = (
@@ -2972,6 +3142,15 @@ def _choose_layout_mode_aware(
     max_n = max((c["n"] for c in cells), default=0)
     contrib_ok = max_n >= floors.min_contributors
     warnings = []
+    if _halo_advisory and (
+        chosen["geom"]["halo_overhead"] > floors.max_halo_overhead
+    ):
+        warnings.append(
+            f"MAX_HALO_OVERHEAD_ADVISORY: halo {int(halo_px)}px overhead "
+            f"{chosen['geom']['halo_overhead']:.4f} exceeds "
+            f"{floors.max_halo_overhead}; the explicit halo and the chosen "
+            "logical layout are preserved"
+        )
     if not contrib_ok:
         warnings.append(
             f"deepest cell has {max_n} contributors < min_contributors "
@@ -3021,6 +3200,11 @@ def _choose_layout_mode_aware(
         "cells": cells,
         "layout_source": "auto",
         "layout_origin": _origin,
+        "halo_overhead_policy": _halo_policy,
+        **({"halo_overhead_advisory": _halo_advisory_block(
+            _halo_policy, halo_px, chosen["geom"]["halo_overhead"],
+            floors.max_halo_overhead
+        )} if _halo_advisory else {}),
         "cpu_streaming": _cpu_streaming_block(
             chosen["selected_tile"], chosen["trials"], chosen["selection_reason"],
             chosen["worst_cell"]["stream_worst_by_tile"],
@@ -3032,7 +3216,12 @@ def _choose_layout_mode_aware(
                                    "ok": chosen["geom"]["min_patch_area"] >= floors.min_patch_area_px},
             "max_halo_overhead": {"value": round(chosen["geom"]["halo_overhead"], 6),
                                    "limit": floors.max_halo_overhead,
-                                   "ok": chosen["geom"]["halo_overhead"] <= floors.max_halo_overhead},
+                                   "ok": chosen["geom"]["halo_overhead"] <= floors.max_halo_overhead,
+                                   "policy": _halo_policy,
+                                   "state": _halo_state(
+                                       chosen["geom"]["halo_overhead"] <= floors.max_halo_overhead,
+                                       _halo_advisory,
+                                   )},
             "min_contributors": {"value": max_n, "limit": floors.min_contributors, "ok": contrib_ok},
         },
         **({"layout_rescue": rescue_record} if rescue_record is not None else {}),
@@ -7397,6 +7586,7 @@ def _build_execution_bundle(
     equalize_rgb=False,
     rejection="winsorized_sigma_clip",
     combine="mean",
+    halo_policy=None,
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -7430,8 +7620,15 @@ def _build_execution_bundle(
     worker payload of ONE run. ``None`` keeps the historical low-level helper
     default (``sweep.HALO_PX``) for direct/unit calls only; the product path
     always passes the validated value.
+
+    ``halo_policy`` (ZM-HALO-EXECUTION-DECOUPLING) is threaded VERBATIM into
+    :func:`_choose_layout_mode_aware`. ``None`` = historical hard floor, so every
+    direct/unit caller is unchanged; the product passes the policy derived from
+    the halo provenance (explicit/config -> advisory). It never changes the halo
+    width, the memberships or the resource arithmetic.
     """
     _halo = int(zsw.HALO_PX if halo_px is None else halo_px)
+    _halo_policy = normalize_halo_overhead_policy(halo_policy)
     # ZM-ZEGRID-ACTIVE-RESUME-PARITY: the frozen admission is validated before
     # any planning. A backend that cannot be honoured is refused here; the CPU
     # tile then comes from the ladder restriction below, never from free RAM.
@@ -7515,6 +7712,7 @@ def _build_execution_bundle(
                     min_refinement_rank=rank_floor,
                     max_refinement_rank=rank_ceiling,
                     halo_px=_halo,
+                    halo_policy=_halo_policy,
                     # F4: the external (disk spool) working set is a valid
                     # admission class whenever the bounded profile is active,
                     # INDEPENDENTLY of GPU detection. A GPU may be present and
@@ -15072,6 +15270,13 @@ def _run_single(
         vram_budget_bytes=(gpu_ctx or {}).get("vram_budget_bytes"),
         cache_root=cache_root,
         halo_px=int(halo_px),
+        # ZM-HALO-EXECUTION-DECOUPLING: ONE policy decision per pass, derived
+        # from the run-level halo PROVENANCE (never re-read elsewhere). A pass
+        # without provenance is an internal/direct call -> historical hard
+        # floor, byte-for-byte unchanged. An out-of-contract synthetic source
+        # (only reachable from direct/unit calls; the product provenance is
+        # validated at resolution) also keeps the conservative hard floor.
+        halo_policy=_run_halo_overhead_policy(halo_provenance),
         # Request-aware external HOST pricing: the effective science request
         # must reach the selector (equalization overlap, batch live-set bound).
         equalize_rgb=bool(getattr(science_config, "equalize_rgb", False)),
@@ -22263,6 +22468,17 @@ def _manifest_layout_block(nx, ny, layout):
         "max_contributors": layout["max_contributors"],
         "predicted_bound_bytes": layout["predicted_bound_bytes"],
         "layout_origin": layout.get("layout_origin", "auto_refinement"),
+        # ZM-HALO-EXECUTION-DECOUPLING: published ONLY when the run resolved the
+        # advisory policy, so a hard-floor run keeps its exact historical shape.
+        **(
+            {
+                "halo_overhead_policy": layout["halo_overhead_policy"],
+                "halo_overhead_advisory": dict(layout["halo_overhead_advisory"]),
+            }
+            if layout.get("halo_overhead_policy") == HALO_OVERHEAD_POLICY_ADVISORY
+            and layout.get("halo_overhead_advisory") is not None
+            else {}
+        ),
         **({"layout_rescue": layout["layout_rescue"]}
            if layout.get("layout_rescue") else {}),
     }
@@ -22998,7 +23214,8 @@ def run_zegrid_mode(
         f"{_requested_for_log} -> effective={resolved_halo_px} px "
         f"(source={halo_provenance['source']}); this width drives patch geometry, "
         "contributor membership, gauge patch domain, measurement band=2H and "
-        "feather=H in per_cell mode",
+        "feather=H in per_cell mode; max_halo_overhead policy="
+        f"{halo_overhead_policy_for_source(halo_provenance['source'])}",
         callback=progress_callback,
     )
 

@@ -35,6 +35,8 @@ __all__ = [
     "ZEGRID_HALO_ALLOWED_PX",
     "ZEGRID_HALO_CONFIG_KEY",
     "ZEGRID_HALO_DEFAULT_PX",
+    "HALO_OVERHEAD_POLICY_ADVISORY",
+    "HALO_OVERHEAD_POLICY_HARD_FLOOR",
     "ZEGRID_HALO_SOURCE_CONFIG",
     "ZEGRID_HALO_SOURCE_EXPLICIT",
     "ZEGRID_HALO_SOURCE_INTERNAL_ONLY",
@@ -42,6 +44,8 @@ __all__ = [
     "ZEGRID_HALO_UNITS",
     "ZeGridHaloError",
     "build_halo_provenance",
+    "halo_overhead_policy_for_source",
+    "normalize_halo_overhead_policy",
     "resolve_zegrid_halo_px",
     "resolve_run_halo_provenance",
 ]
@@ -71,6 +75,67 @@ _HALO_SOURCES = frozenset(
 
 class ZeGridHaloError(ValueError):
     """Raised when a requested ZeGrid halo is not an allowed product value."""
+
+
+# ---------------------------------------------------------------------------
+# ZM-HALO-EXECUTION-DECOUPLING — halo-overhead POLICY (not a geometry width).
+#
+# ``max_halo_overhead`` is an EFFICIENCY ceiling (halo area vs core area). It is
+# NOT a scientific feasibility rule: the halo width is part of the science
+# contract (membership, feather, gauge/offset band) and the planner can never
+# change it. Two explicit policies decide what an exceedance MEANS:
+#
+# * ``hard_floor`` — the historical behaviour: an exceedance rejects the
+#   candidate layout. Kept for product-default / internal-only halos and for
+#   every direct/unit caller that supplies no policy, so low-level behaviour is
+#   byte-for-byte unchanged.
+# * ``advisory_explicit_halo`` — a USER-REQUESTED halo is honoured exactly. The
+#   ratio is still computed, logged and persisted, but only as a diagnostic/cost
+#   signal; it never forces a coarser logical Cell and never rejects a layout on
+#   its own. Memory admission, the patch-area floor, the contributor floor and
+#   the joint PLAN/ACTIVE/RUN envelope remain fail-closed.
+HALO_OVERHEAD_POLICY_HARD_FLOOR: str = "hard_floor"
+HALO_OVERHEAD_POLICY_ADVISORY: str = "advisory_explicit_halo"
+
+_HALO_OVERHEAD_POLICIES = frozenset(
+    {HALO_OVERHEAD_POLICY_HARD_FLOOR, HALO_OVERHEAD_POLICY_ADVISORY}
+)
+
+
+def normalize_halo_overhead_policy(value=None) -> str:
+    """Resolve an optional policy token; ``None`` is the historical hard floor."""
+    if value is None:
+        return HALO_OVERHEAD_POLICY_HARD_FLOOR
+    token = str(value)
+    if token not in _HALO_OVERHEAD_POLICIES:
+        raise ZeGridHaloError(
+            f"unknown halo-overhead policy {value!r}; expected one of "
+            f"{sorted(_HALO_OVERHEAD_POLICIES)}"
+        )
+    return token
+
+
+def halo_overhead_policy_for_source(source: str) -> str:
+    """Map a halo PROVENANCE source to the overhead policy.
+
+    A user-selected halo (explicit keyword or config value) is honoured: the
+    overhead ratio is advisory only. The product default and the internal
+    default keep the historical hard floor, so a run that never requested a
+    halo width behaves exactly as before.
+    """
+    if source == ZEGRID_HALO_SOURCE_EXPLICIT:
+        return HALO_OVERHEAD_POLICY_ADVISORY
+    if source == ZEGRID_HALO_SOURCE_CONFIG:
+        return HALO_OVERHEAD_POLICY_ADVISORY
+    if source in (
+        ZEGRID_HALO_SOURCE_PRODUCT_DEFAULT,
+        ZEGRID_HALO_SOURCE_INTERNAL_ONLY,
+    ):
+        return HALO_OVERHEAD_POLICY_HARD_FLOOR
+    raise ZeGridHaloError(
+        f"unknown halo provenance source {source!r}; cannot decide the "
+        "halo-overhead policy"
+    )
 
 
 def resolve_zegrid_halo_px(value=None) -> int:
