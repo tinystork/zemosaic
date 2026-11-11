@@ -6462,6 +6462,47 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
     }
 
 
+def _resolve_rss_aggregation_concurrency(
+    per_cell_diagnostics=None,
+    per_cell_meta=None,
+    fallback=None,
+) -> int:
+    """Resolve the Cells-in-flight count that selects max vs sum for RSS.
+
+    ZM-ZEGRID-MANIFEST-RSS REWORK-1 (L2): an unknown concurrency must NEVER
+    fail open into the sequential MAX. ``aggregate_peak_rss_kib`` is a
+    documented UPPER BOUND, so the safe default is the concurrent SUM. Resolve
+    from the already-computed diagnostics/meta, then an explicit fallback, and
+    only then return 2 (concurrent) when truly undeterminable.
+    """
+    for source in (per_cell_diagnostics, per_cell_meta):
+        if not isinstance(source, dict):
+            continue
+        for key in (
+            "rss_aggregation_cells_in_flight",
+            "cells_in_flight",
+            "units_in_flight",
+        ):
+            value = source.get(key)
+            if value is None:
+                continue
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if value >= 1:
+                return value
+    if fallback is not None:
+        try:
+            value = int(fallback)
+        except (TypeError, ValueError):
+            value = 0
+        if value >= 1:
+            return value
+    # Unknown: fail CLOSED (concurrent => sum, a true upper bound).
+    return 2
+
+
 def _write_run_log(
     output_dir,
     timings,
@@ -6713,11 +6754,7 @@ def _write_run_log(
     )
     lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
-    _rss_cif = (per_cell_diagnostics or {}).get("cells_in_flight")
-    try:
-        _rss_cif = int(_rss_cif)
-    except (TypeError, ValueError):
-        _rss_cif = None
+    _rss_cif = _resolve_rss_aggregation_concurrency(per_cell_diagnostics)
     if _rss_cif == 1:
         _agg_rule = (
             "parent peak + MAX single cell-worker peak (Cells executed "
@@ -6726,17 +6763,21 @@ def _write_run_log(
         )
         _agg_hist_rule = (
             "MAX RESTORED durable Cell worker peak (historical evidence; "
-            "NOT workers this attempt ran)"
+            "max-vs-sum chosen with the CURRENT plan concurrency — the earlier "
+            "attempt's concurrency is not durably recorded; NOT workers this "
+            "attempt ran)"
         )
     else:
         _agg_rule = (
-            "parent peak + sum of THIS attempt's cell workers"
-            + (f" ({_rss_cif} Cells in flight)" if _rss_cif else "")
-            + ", UPPER BOUND incl. per-worker import baseline"
+            "parent peak + sum of THIS attempt's cell workers, UPPER BOUND "
+            "incl. per-worker import baseline (unknown concurrency fails "
+            "closed to this sum)"
         )
         _agg_hist_rule = (
             "sum of RESTORED durable Cells' worker peaks (historical "
-            "evidence; not workers this attempt ran)"
+            "evidence; max-vs-sum chosen with the CURRENT plan concurrency — "
+            "the earlier attempt's concurrency is not durably recorded; not "
+            "workers this attempt ran)"
         )
     lines.append(
         f"aggregate_peak_rss_kib: {aggregate_peak_rss_kib if aggregate_peak_rss_kib is not None else 'n/a'} "
@@ -21776,7 +21817,12 @@ def _run_single(
     # on a 7.7 GiB host). A wave with >1 Cell in flight keeps the sum, which is
     # the real batch bound. The cumulative sum stays available under its own
     # explicitly additive name for diagnostics.
-    _rss_cells_in_flight = int(per_cell_diagnostics.get("cells_in_flight") or 1)
+    _rss_cells_in_flight = _resolve_rss_aggregation_concurrency(
+        per_cell_diagnostics, per_cell_meta, cells_in_flight
+    )
+    per_cell_diagnostics[
+        "rss_aggregation_cells_in_flight"
+    ] = int(_rss_cells_in_flight)
     _current_worker_peaks = [r.get("peak_rss_kib", 0) for r in _current_records]
     _restored_worker_peaks = [r.get("peak_rss_kib", 0) for r in _restored_records]
     aggregate_peak_rss_kib = zsw.aggregate_peak_rss_kib(
@@ -21813,6 +21859,12 @@ def _run_single(
     per_cell_diagnostics[
         "aggregate_peak_rss_kib_historical_restored"
     ] = aggregate_peak_rss_kib_historical_restored
+    per_cell_diagnostics[
+        "aggregate_peak_rss_kib_historical_restored_concurrency_source"
+    ] = (
+        "current_plan: max-vs-sum is selected with THIS plan's concurrency; "
+        "the earlier attempt's concurrency is not durably recorded"
+    )
     per_cell_diagnostics[
         "sum_of_cell_worker_peak_rss_kib_historical_restored"
     ] = sum_of_cell_worker_peak_rss_kib_historical_restored
@@ -23685,7 +23737,7 @@ def _write_outputs(
                 "separately under "
                 "per_cell_diagnostics.sum_of_cell_worker_peak_rss_kib."
             )
-            if int((per_cell_diagnostics or {}).get("cells_in_flight") or 1) <= 1
+            if _resolve_rss_aggregation_concurrency(per_cell_diagnostics) == 1
             else (
                 "parent peak + sum of THIS attempt's concurrent cell-worker "
                 "peak RSS (cells_in_flight>1: the real batch bound; UPPER "
@@ -23701,16 +23753,18 @@ def _write_outputs(
         "aggregate_peak_rss_kib_historical_restored_note": (
             (
                 "MAX of the RESTORED durable Cells' committed worker peak RSS "
-                "(historical evidence; sequential rule taken from the current "
-                "plan's cells_in_flight=1; NOT workers this attempt ran). None "
-                "when nothing was restored."
+                "(historical evidence; max-vs-sum is computed with the CURRENT "
+                "plan concurrency because the earlier attempt's concurrency is "
+                "not durably recorded; NOT workers this attempt ran). None when "
+                "nothing was restored."
             )
-            if int((per_cell_diagnostics or {}).get("cells_in_flight") or 1) <= 1
+            if _resolve_rss_aggregation_concurrency(per_cell_diagnostics) == 1
             else (
                 "sum of the RESTORED durable Cells' committed worker peak RSS "
-                "(historical evidence from an earlier attempt under "
-                "cells_in_flight>1; NOT workers this attempt ran). None when "
-                "nothing was restored."
+                "(historical evidence from an earlier attempt; max-vs-sum is "
+                "computed with the CURRENT plan concurrency because the earlier "
+                "attempt's concurrency is not durably recorded; NOT workers "
+                "this attempt ran). None when nothing was restored."
             )
         ),
         "outputs": {

@@ -424,3 +424,24 @@ def test_aggregate_peak_rss_kib_sequential_takes_max_not_sum():
     assert zsw.aggregate_peak_rss_kib(0, [None, "bad", 50]) == 50
     # The cumulative churn stays available under its own additive name.
     assert zsw.sum_of_cell_worker_peak_rss_kib([200, 300, None, "bad"]) == 500
+
+
+def test_unknown_rss_concurrency_fails_closed_to_concurrent_sum():
+    # ZM-ZEGRID-MANIFEST-RSS REWORK-1 (L2): a missing/None cells_in_flight
+    # must NOT silently select the sequential max — the aggregate is an UPPER
+    # BOUND, so unknown concurrency resolves to the concurrent sum.
+    resolve = zz._resolve_rss_aggregation_concurrency
+    assert resolve({}, {}, None) == 2
+    assert resolve({"cells_in_flight": None}, {}, None) == 2
+    assert resolve({"cells_in_flight": "bad"}, {}, None) == 2
+    # Known values are preserved; an explicit fallback is authoritative.
+    assert resolve({"cells_in_flight": 1}, {}, None) == 1
+    assert resolve({}, {}, 4) == 4
+    assert resolve({"cells_in_flight": 1}, {}, 4) == 1
+    # End-to-end: the fail-closed resolution yields parent + SUM, not max.
+    unknown = resolve({}, None, None)
+    aggregate = zsw.aggregate_peak_rss_kib(
+        100, [200, 300], cells_in_flight=unknown
+    )
+    assert aggregate == 600
+    assert aggregate != 400
