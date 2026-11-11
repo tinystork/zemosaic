@@ -1222,6 +1222,46 @@ class ZeMosaicQtWorker(QObject):
                 parts.append(kv_pairs)
         return " | ".join(parts) if parts else "qt_worker_generic_update"
 
+# ZM-ZEGRID-MANIFEST-RSS-AND-GUI-VERSION (2026-11-11): the window title must
+# DERIVE its version from the package metadata, never hardcode it. Locales carry
+# a ``{version}`` placeholder; the product name and each locale's own wording /
+# suffix stay untouched.
+_WINDOW_TITLE_KEY = "qt_window_title_preview"
+_WINDOW_TITLE_FALLBACK_TEMPLATE = "ZeMosaic V{version}, Tesserae Compositae"
+
+
+def _zemosaic_version() -> str:
+    """Current package version, read at call time (patchable in tests)."""
+    try:
+        from . import __version__ as version
+    except Exception:  # pragma: no cover - defensive
+        return "unknown"
+    text = str(version).strip()
+    return text or "unknown"
+
+
+def _format_window_title(template: Any, version: str) -> str:
+    """Render a localized title template with ``version``, never raising.
+
+    A template without ``{version}`` (e.g. es/pl have no version today) is
+    returned verbatim with its own wording. A template with a malformed
+    placeholder falls back to the canonical English title so raw braces are
+    never shown.
+    """
+    text = template if isinstance(template, str) and template.strip() else ""
+    if not text:
+        return _WINDOW_TITLE_FALLBACK_TEMPLATE.format(version=version)
+    if "{version}" in text:
+        try:
+            return text.format(version=version)
+        except (KeyError, IndexError, ValueError, AttributeError):
+            return _WINDOW_TITLE_FALLBACK_TEMPLATE.format(version=version)
+    if "{" in text or "}" in text:
+        # Any other/odd placeholder cannot be rendered safely.
+        return _WINDOW_TITLE_FALLBACK_TEMPLATE.format(version=version)
+    return text
+
+
 class ZeMosaicQtMainWindow(QMainWindow):
     """Initial Qt main window skeleton with placeholder panels."""
 
@@ -1263,9 +1303,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.analysis_backend_diagnostic,
         ) = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
-        self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V5.0.0, Tesserae Compositae")
-        )
+        self.setWindowTitle(self._window_title())
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
             self.config.setdefault("gpu_selector", self._gpu_devices[0][0])
@@ -7574,6 +7612,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _tr(self, key: str, fallback: str) -> str:
         return self.localizer.get(key, fallback)
 
+    def _window_title(self) -> str:
+        """ONE derivation for both window-title call sites."""
+        template = self._tr(_WINDOW_TITLE_KEY, _WINDOW_TITLE_FALLBACK_TEMPLATE)
+        return _format_window_title(template, _zemosaic_version())
+
     def _initialize_log_level_prefixes(self) -> None:
         self._log_level_prefixes = {
             "debug": self._tr("qt_log_prefix_debug", "[DEBUG] "),
@@ -7584,9 +7627,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         }
 
     def _refresh_translated_ui(self) -> None:
-        self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V5.0.0, Tesserae Compositae")
-        )
+        self.setWindowTitle(self._window_title())
         previous_log = ""
         if hasattr(self, "log_output"):
             try:

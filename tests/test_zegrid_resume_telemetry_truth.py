@@ -195,7 +195,16 @@ def test_complete_gpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
     assert manifest[
         "aggregate_peak_rss_kib_historical_restored"
     ] == restored_aggregate
-    assert manifest["aggregate_peak_rss_kib"] < restored_aggregate
+    # ZM-ZEGRID-MANIFEST-RSS: sequential Cells keep their MAX worker peak under
+    # the aggregate name; the cumulative churn lives under the additive field.
+    # This complete replay executed no Cell, so its current aggregate covers the
+    # parent only and never absorbs the restored peaks.
+    assert manifest["aggregate_peak_rss_kib"] > 0
+    assert diag["sum_of_cell_worker_peak_rss_kib"] == 0
+    assert (
+        diag["sum_of_cell_worker_peak_rss_kib_historical_restored"]
+        >= restored_aggregate
+    )
 
     # REWORK-1 F3: the resource sample describes zero current stack units and
     # labels itself as durable replay, carrying the restored count separately.
@@ -266,9 +275,12 @@ def test_complete_cpu_replay_reports_zero_current_work(tmp_path, monkeypatch):
         diag["durable_replay_seconds"] > 0.0,
     ) == (0.0, 0.0, True)
     assert diag["aggregate_peak_rss_kib_historical_restored"] > 0
+    # Same sequential MAX rule as the GPU replay; the additive sum is separate.
+    assert manifest["aggregate_peak_rss_kib"] > 0
+    assert diag["sum_of_cell_worker_peak_rss_kib"] == 0
     assert (
-        manifest["aggregate_peak_rss_kib"]
-        < manifest["aggregate_peak_rss_kib_historical_restored"]
+        diag["sum_of_cell_worker_peak_rss_kib_historical_restored"]
+        >= diag["aggregate_peak_rss_kib_historical_restored"]
     )
     final3 = _phase3(recorder)[-1]
     assert final3["phase_name"] == "Durable replay"

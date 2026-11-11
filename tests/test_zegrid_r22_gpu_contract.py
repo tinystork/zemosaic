@@ -407,7 +407,20 @@ def test_planner_gpu_serializes_and_forces_stream():
 # 6. Aggregate RSS helper
 # ---------------------------------------------------------------------------
 
-def test_aggregate_peak_rss_kib_upper_bound():
-    assert zsw.aggregate_peak_rss_kib(100, [200, 300]) == 600
+def test_aggregate_peak_rss_kib_parallel_batch_upper_bound():
+    # cells_in_flight > 1: the sum IS the batch bound (unchanged semantics).
+    assert zsw.aggregate_peak_rss_kib(100, [200, 300], cells_in_flight=2) == 600
+    assert zsw.aggregate_peak_rss_kib(100, [], cells_in_flight=2) == 100
+    assert zsw.aggregate_peak_rss_kib(0, [None, "bad", 50], cells_in_flight=2) == 50
+
+
+def test_aggregate_peak_rss_kib_sequential_takes_max_not_sum():
+    # ZM-ZEGRID-MANIFEST-RSS: sequential Cells may never be summed into a
+    # "peak" (64 sequential Cells × ~1.3 GiB published ~79 GiB on a 7.7 GiB
+    # host). The peak is parent + the largest single worker peak.
+    assert zsw.aggregate_peak_rss_kib(100, [200, 300]) == 400
+    assert zsw.aggregate_peak_rss_kib(100, [200, 300], cells_in_flight=1) == 400
     assert zsw.aggregate_peak_rss_kib(100, []) == 100
     assert zsw.aggregate_peak_rss_kib(0, [None, "bad", 50]) == 50
+    # The cumulative churn stays available under its own additive name.
+    assert zsw.sum_of_cell_worker_peak_rss_kib([200, 300, None, "bad"]) == 500

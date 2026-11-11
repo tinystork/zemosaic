@@ -6484,6 +6484,8 @@ def _write_run_log(
     gpu_context=None,
     aggregate_peak_rss_kib=None,
     aggregate_peak_rss_kib_historical_restored=None,
+    sum_of_cell_worker_peak_rss_kib=None,
+    sum_of_cell_worker_peak_rss_kib_historical_restored=None,
     halo_provenance=None,
 ):
     """Append the run-log SUMMARY into the output folder.
@@ -6711,17 +6713,54 @@ def _write_run_log(
     )
     lines.append("")
     lines.append(f"peak_rss_kib: {peak_rss_kib}")
+    _rss_cif = (per_cell_diagnostics or {}).get("cells_in_flight")
+    try:
+        _rss_cif = int(_rss_cif)
+    except (TypeError, ValueError):
+        _rss_cif = None
+    if _rss_cif == 1:
+        _agg_rule = (
+            "parent peak + MAX single cell-worker peak (Cells executed "
+            "SEQUENTIALLY; not a sum). UPPER BOUND incl. one per-worker "
+            "import baseline"
+        )
+        _agg_hist_rule = (
+            "MAX RESTORED durable Cell worker peak (historical evidence; "
+            "NOT workers this attempt ran)"
+        )
+    else:
+        _agg_rule = (
+            "parent peak + sum of THIS attempt's cell workers"
+            + (f" ({_rss_cif} Cells in flight)" if _rss_cif else "")
+            + ", UPPER BOUND incl. per-worker import baseline"
+        )
+        _agg_hist_rule = (
+            "sum of RESTORED durable Cells' worker peaks (historical "
+            "evidence; not workers this attempt ran)"
+        )
     lines.append(
         f"aggregate_peak_rss_kib: {aggregate_peak_rss_kib if aggregate_peak_rss_kib is not None else 'n/a'} "
-        "(parent + cell workers of THIS attempt, UPPER BOUND incl. per-worker "
-        "import baseline)"
+        f"({_agg_rule})"
     )
+    if sum_of_cell_worker_peak_rss_kib is not None:
+        lines.append(
+            "sum_of_cell_worker_peak_rss_kib: "
+            f"{sum_of_cell_worker_peak_rss_kib} "
+            "(cumulative sum of THIS attempt's cell-worker peaks; diagnostic, "
+            "NOT a peak)"
+        )
     if aggregate_peak_rss_kib_historical_restored is not None:
         lines.append(
             "aggregate_peak_rss_kib_historical_restored: "
             f"{aggregate_peak_rss_kib_historical_restored} "
-            "(sum of RESTORED durable Cells' worker peaks, historical "
-            "evidence; not workers this attempt ran)"
+            f"({_agg_hist_rule})"
+        )
+    if sum_of_cell_worker_peak_rss_kib_historical_restored is not None:
+        lines.append(
+            "sum_of_cell_worker_peak_rss_kib_historical_restored: "
+            f"{sum_of_cell_worker_peak_rss_kib_historical_restored} "
+            "(cumulative sum of RESTORED durable Cells' worker peaks; "
+            "diagnostic, NOT a peak)"
         )
     lines.append(f"cache: {json.dumps(cache_info, sort_keys=True)}")
     lines.append(f"photometric_gauge.global_reference_frame_id: {global_reference_frame_id}")
@@ -21731,18 +21770,59 @@ def _run_single(
     # upper bound (only Cells stacked by THIS attempt contribute worker peaks).
     # Restored durable Cells' peaks are historical evidence and are reported
     # separately, never as workers this attempt ran.
+    # ZM-ZEGRID-MANIFEST-RSS (2026-11-11): the aggregate is a PEAK. Sequential
+    # Cells (cells_in_flight == 1) contribute their MAX worker peak, never the
+    # sum of every Cell's peak (a real 64-Cell sequential run published ~79 GiB
+    # on a 7.7 GiB host). A wave with >1 Cell in flight keeps the sum, which is
+    # the real batch bound. The cumulative sum stays available under its own
+    # explicitly additive name for diagnostics.
+    _rss_cells_in_flight = int(per_cell_diagnostics.get("cells_in_flight") or 1)
+    _current_worker_peaks = [r.get("peak_rss_kib", 0) for r in _current_records]
+    _restored_worker_peaks = [r.get("peak_rss_kib", 0) for r in _restored_records]
     aggregate_peak_rss_kib = zsw.aggregate_peak_rss_kib(
-        zsw.peak_rss_kib(), [r.get("peak_rss_kib", 0) for r in _current_records]
+        zsw.peak_rss_kib(),
+        _current_worker_peaks,
+        cells_in_flight=_rss_cells_in_flight,
+    )
+    sum_of_cell_worker_peak_rss_kib = zsw.sum_of_cell_worker_peak_rss_kib(
+        _current_worker_peaks
     )
     aggregate_peak_rss_kib_historical_restored = (
         zsw.aggregate_peak_rss_kib(
-            0, [r.get("peak_rss_kib", 0) for r in _restored_records]
+            0,
+            _restored_worker_peaks,
+            cells_in_flight=_rss_cells_in_flight,
         )
         if _restored_records else None
+    )
+    sum_of_cell_worker_peak_rss_kib_historical_restored = (
+        zsw.sum_of_cell_worker_peak_rss_kib(_restored_worker_peaks)
+        if _restored_records else None
+    )
+    per_cell_diagnostics[
+        "sum_of_cell_worker_peak_rss_kib"
+    ] = sum_of_cell_worker_peak_rss_kib
+    per_cell_diagnostics[
+        "sum_of_cell_worker_peak_rss_kib_note"
+    ] = (
+        "cumulative sum of THIS attempt's cell-worker peak RSS across every "
+        "Cell (memory churn diagnostic, NOT a peak); only equals "
+        "aggregate_peak_rss_kib minus the parent peak when Cells ran "
+        "concurrently"
     )
     per_cell_diagnostics[
         "aggregate_peak_rss_kib_historical_restored"
     ] = aggregate_peak_rss_kib_historical_restored
+    per_cell_diagnostics[
+        "sum_of_cell_worker_peak_rss_kib_historical_restored"
+    ] = sum_of_cell_worker_peak_rss_kib_historical_restored
+    per_cell_diagnostics[
+        "sum_of_cell_worker_peak_rss_kib_historical_restored_note"
+    ] = (
+        "cumulative sum of the RESTORED durable Cells' committed worker peak "
+        "RSS (historical memory-churn diagnostic, NOT a peak; None when "
+        "nothing was restored)"
+    )
     _assembly_rep.end(
         throughput=_fmt_throughput(len(assembled.complete_cells), timings.get("assembly"), "cells/s")
     )
@@ -22335,6 +22415,12 @@ def _run_single(
             aggregate_peak_rss_kib=aggregate_peak_rss_kib,
             aggregate_peak_rss_kib_historical_restored=(
                 aggregate_peak_rss_kib_historical_restored
+            ),
+            sum_of_cell_worker_peak_rss_kib=(
+                sum_of_cell_worker_peak_rss_kib
+            ),
+            sum_of_cell_worker_peak_rss_kib_historical_restored=(
+                sum_of_cell_worker_peak_rss_kib_historical_restored
             ),
             halo_provenance=_halo_provenance_pass,
         )
@@ -23591,19 +23677,41 @@ def _write_outputs(
         ),
         "aggregate_peak_rss_kib": aggregate_peak_rss_kib,
         "aggregate_peak_rss_kib_note": (
-            "parent + sum of THIS attempt's cell-worker peak RSS (UPPER BOUND: "
-            "each worker includes its own ~340 MiB import baseline; "
-            "shared/copy-on-write pages are not deduplicated). Restored durable "
-            "Cells' peaks are reported separately under "
-            "aggregate_peak_rss_kib_historical_restored."
+            (
+                "parent peak + MAX single cell-worker peak: Cells executed "
+                "SEQUENTIALLY (cells_in_flight=1). UPPER BOUND: the worker "
+                "includes its own ~340 MiB import baseline; shared/copy-on-write "
+                "pages are not deduplicated. The cumulative churn is reported "
+                "separately under "
+                "per_cell_diagnostics.sum_of_cell_worker_peak_rss_kib."
+            )
+            if int((per_cell_diagnostics or {}).get("cells_in_flight") or 1) <= 1
+            else (
+                "parent peak + sum of THIS attempt's concurrent cell-worker "
+                "peak RSS (cells_in_flight>1: the real batch bound; UPPER "
+                "BOUND because each worker includes its own ~340 MiB import "
+                "baseline and shared/copy-on-write pages are not deduplicated). "
+                "The cumulative churn is reported separately under "
+                "per_cell_diagnostics.sum_of_cell_worker_peak_rss_kib."
+            )
         ),
         "aggregate_peak_rss_kib_historical_restored": (
             aggregate_peak_rss_kib_historical_restored
         ),
         "aggregate_peak_rss_kib_historical_restored_note": (
-            "sum of the RESTORED durable Cells' committed worker peak RSS "
-            "(historical evidence from an earlier attempt; NOT workers this "
-            "attempt ran). None when nothing was restored."
+            (
+                "MAX of the RESTORED durable Cells' committed worker peak RSS "
+                "(historical evidence; sequential rule taken from the current "
+                "plan's cells_in_flight=1; NOT workers this attempt ran). None "
+                "when nothing was restored."
+            )
+            if int((per_cell_diagnostics or {}).get("cells_in_flight") or 1) <= 1
+            else (
+                "sum of the RESTORED durable Cells' committed worker peak RSS "
+                "(historical evidence from an earlier attempt under "
+                "cells_in_flight>1; NOT workers this attempt ran). None when "
+                "nothing was restored."
+            )
         ),
         "outputs": {
             "science": raw_science_path.name,
