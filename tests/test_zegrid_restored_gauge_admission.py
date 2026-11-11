@@ -451,3 +451,95 @@ def test_corrupt_gauge_artifact_never_yields_a_restored_signal(
     with pytest.raises(zsched.PlanRefused) as refused:
         _decide(tmp_path, descs, canvas, bundle)
     assert "phase=gauge components:" in str(refused.value)
+
+
+# ---------------------------------------------------------------------------
+# 6. REWORK-1 L1 — the residency bound is STRUCTURAL, not a field list.
+# ---------------------------------------------------------------------------
+
+def test_extra_array_is_counted_by_the_structural_scan():
+    """A array outside the old static names must be charged.
+
+    ``FixedNormalization`` is frozen, so a future gauge carrying an extra
+    array is modelled with an equivalent attribute bag: the OLD static helper
+    still sees only the four named fields, while the structural scan sees the
+    extra array too.
+    """
+    import types
+
+    gauge = types.SimpleNamespace(
+        coefficients=np.zeros((4, 3, 2), dtype=np.float64),
+        norm_active=np.ones(4, dtype=bool),
+        weights=np.ones(4, dtype=np.float64),
+        weight_active=np.ones(4, dtype=bool),
+        exclusions=(),
+        noise_sigma=np.ones(1000, dtype=np.float64),
+    )
+    old = _exact_resident_bytes(gauge)
+    extra = int(gauge.noise_sigma.nbytes)
+    measured = zz._restored_gauge_resident_bytes(gauge)
+    assert measured == old + extra
+    assert measured > old
+
+
+def test_views_aliases_and_containers_are_counted_once():
+    """One allocation is charged once: base/view, same object, list, dict."""
+    import types
+
+    base = np.zeros((10, 10), dtype=np.float64)
+    view = base[2:5, 2:5]
+    size = int(base.nbytes)
+
+    assert zz._restored_gauge_resident_bytes(
+        types.SimpleNamespace(coefficients=base, weights=view)
+    ) == size
+    assert zz._restored_gauge_resident_bytes(
+        types.SimpleNamespace(coefficients=base, weights=base)
+    ) == size
+    assert zz._restored_gauge_resident_bytes(
+        types.SimpleNamespace(items=[base, view, base])
+    ) == size
+    assert zz._restored_gauge_resident_bytes(
+        types.SimpleNamespace(items={"a": base, "b": view})
+    ) == size
+    # A VIEW alone still prices the WHOLE owning allocation (honest bound).
+    assert zz._restored_gauge_resident_bytes(
+        types.SimpleNamespace(coefficients=view)
+    ) == size
+
+
+def test_self_referencing_container_terminates():
+    import types
+
+    payload = np.zeros(16, dtype=np.uint8)
+    cycle: list = []
+    cycle.append(cycle)
+    cycle.append(payload)
+    assert zz._restored_gauge_resident_bytes(
+        types.SimpleNamespace(coefficients=cycle)
+    ) == int(payload.nbytes)
+
+
+def test_empty_object_returns_zero_and_keeps_fail_closed_pricing(
+    tmp_path, monkeypatch
+):
+    import types
+
+    assert zz._restored_gauge_resident_bytes(object()) == 0
+    assert zz._restored_gauge_resident_bytes(types.SimpleNamespace()) == 0
+
+    descs, canvas, bundle = _bundle(tmp_path, monkeypatch)
+    with pytest.raises(zsched.PlanRefused) as baseline:
+        _decide(tmp_path, descs, canvas, bundle)
+    with pytest.raises(zsched.PlanRefused) as empty:
+        _decide(
+            tmp_path,
+            descs,
+            canvas,
+            bundle,
+            gauge_restored=True,
+            restored_gauge_resident_bytes=zz._restored_gauge_resident_bytes(
+                types.SimpleNamespace()
+            ),
+        )
+    assert str(empty.value) == str(baseline.value)

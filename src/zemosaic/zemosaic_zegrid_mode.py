@@ -48,6 +48,7 @@ recorded in ``zegrid_manifest.json``.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
@@ -9276,35 +9277,142 @@ def _bundle_gauge_footprint_bytes(bundle, canvas_px: int) -> int:
 _RESTORED_GAUGE_EXCLUSION_BOUND_BYTES = 512
 
 
+_RESTORED_GAUGE_SCAN_MAX_DEPTH = 8
+_RESTORED_GAUGE_SCAN_MAX_NODES = 65536
+
+
+class _RestoredGaugeScanLimit(RuntimeError):
+    """The structural ownership scan exceeded its bounded depth/node budget."""
+
+
 def _restored_gauge_resident_bytes(gauge) -> int:
     """Resident host bytes of ONE verified restored gauge (never re-derived).
 
     ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: on a resume the global gauge artifact
     is restored from the durable store, so ``compute_global_gauge`` will NOT
-    run. The only real gauge cost left is the coefficients/weights/active flags
-    the run keeps resident. This helper measures exactly those owned arrays
-    plus a bounded per-exclusion bookkeeping charge. It never consults the
-    compute-phase footprint model, and it never guesses a path: the caller
-    passes the object returned by the VERIFIED ``ResumeBootstrap.restore_gauge``.
+    run. The only real gauge cost left is what the run keeps resident.
 
-    Returns a non-negative integer, or 0 when the object carries no measurable
-    residency (the caller then fails closed and prices the compute phase).
+    STRUCTURAL measurement (REWORK-1): the verified object is walked by its
+    dataclass fields (or ``__dict__``), recursing into plain containers with a
+    bounded depth and a visited set. Every value exposing ``nbytes`` is
+    charged; numpy views resolve ``.base`` to their owning array and buffers
+    are deduplicated by ``id()`` so one allocation is never charged twice.
+    Small non-array members of a container/field (e.g. ``FrameExclusion``)
+    keep the bounded 512 B bookkeeping charge. No attribute is CALLED and no
+    file is touched: only attributes and containers are inspected.
+
+    FAIL CLOSED: an empty total, a scan limit, or any error returns 0, which
+    makes the caller price the gauge COMPUTE phase instead.
     """
-    total = 0
-    for name in ("coefficients", "norm_active", "weights", "weight_active"):
-        array = getattr(gauge, name, None)
-        nbytes = getattr(array, "nbytes", None)
-        if nbytes is None:
-            continue
-        total += int(nbytes)
-    exclusions = getattr(gauge, "exclusions", None) or ()
     try:
-        total += int(len(exclusions)) * int(
-            _RESTORED_GAUGE_EXCLUSION_BOUND_BYTES
-        )
-    except TypeError:
-        pass
-    return int(total)
+        seen_nodes: set[int] = set()
+        seen_buffers: set[int] = set()
+        totals = {"bytes": 0, "nodes": 0}
+        primitives = (str, bytes, bytearray, int, float, bool, type(None))
+
+        def _buffer_owner(value):
+            """Resolve a numpy view to the array that owns its storage."""
+            owner = value
+            chain: set[int] = set()
+            base = getattr(value, "base", None)
+            while base is not None and id(base) not in chain:
+                chain.add(id(base))
+                if getattr(base, "nbytes", None) is None:
+                    break
+                owner = base
+                base = getattr(owner, "base", None)
+            return owner
+
+        def _array_bytes(value) -> int:
+            try:
+                amount = int(getattr(value, "nbytes", 0) or 0)
+            except Exception:
+                return 0
+            if amount <= 0:
+                return 0
+            owner = _buffer_owner(value)
+            owner_id = id(owner)
+            if owner_id in seen_buffers:
+                return 0
+            seen_buffers.add(owner_id)
+            try:
+                owner_amount = int(getattr(owner, "nbytes", amount) or amount)
+            except Exception:
+                owner_amount = amount
+            # A view is never larger than its owner; charging the owner's full
+            # size once is the honest host residency of that allocation.
+            return max(int(amount), int(owner_amount))
+
+        def _scan(value, depth, *, charge_small=False) -> None:
+            if depth > _RESTORED_GAUGE_SCAN_MAX_DEPTH:
+                raise _RestoredGaugeScanLimit(
+                    "restored gauge scan exceeded the depth budget"
+                )
+            identity = id(value)
+            if identity in seen_nodes:
+                return
+            seen_nodes.add(identity)
+            totals["nodes"] += 1
+            if totals["nodes"] > _RESTORED_GAUGE_SCAN_MAX_NODES:
+                raise _RestoredGaugeScanLimit(
+                    "restored gauge scan exceeded the node budget"
+                )
+            if isinstance(value, primitives):
+                return
+            try:
+                nbytes = getattr(value, "nbytes", None)
+            except Exception:
+                nbytes = None
+            if nbytes is not None:
+                totals["bytes"] += _array_bytes(value)
+                return
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    _scan(key, depth + 1, charge_small=True)
+                    _scan(item, depth + 1, charge_small=True)
+                return
+            if isinstance(value, (list, tuple, set, frozenset)):
+                for item in value:
+                    _scan(item, depth + 1, charge_small=True)
+                return
+            if dataclasses.is_dataclass(value) and not isinstance(value, type):
+                if charge_small:
+                    totals["bytes"] += int(
+                        _RESTORED_GAUGE_EXCLUSION_BOUND_BYTES
+                    )
+                # A dataclass instance exposes ALL its own attributes through
+                # ``__dict__`` (declared fields AND any runtime-added array such
+                # as ``noise_sigma``). Slotted dataclasses fall back to the
+                # declared fields. This is what makes the bound structural
+                # instead of a lucky field list.
+                dataclass_mapping = getattr(value, "__dict__", None)
+                if isinstance(dataclass_mapping, dict):
+                    for item in dataclass_mapping.values():
+                        _scan(item, depth + 1, charge_small=True)
+                else:
+                    for field in dataclasses.fields(value):
+                        _scan(
+                            getattr(value, field.name, None),
+                            depth + 1,
+                            charge_small=True,
+                        )
+                return
+            mapping = getattr(value, "__dict__", None)
+            if isinstance(mapping, dict):
+                if charge_small:
+                    totals["bytes"] += int(
+                        _RESTORED_GAUGE_EXCLUSION_BOUND_BYTES
+                    )
+                for item in mapping.values():
+                    _scan(item, depth + 1, charge_small=True)
+                return
+            if charge_small:
+                totals["bytes"] += int(_RESTORED_GAUGE_EXCLUSION_BOUND_BYTES)
+
+        _scan(gauge, 0)
+        return int(totals["bytes"]) if int(totals["bytes"]) > 0 else 0
+    except Exception:
+        return 0
 
 
 def _build_r55_observe_block(
