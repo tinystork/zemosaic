@@ -112,6 +112,7 @@ from .core.zegrid import bounded_assembly as zbas
 from .core.zegrid import cell_feather as zcf
 from .core.zegrid import cell_offset as zco
 from .core.zegrid import execution as zxe
+from .core.zegrid import fd_limits as zfdl
 from .core.zegrid import file_provider as zfp
 from .core.zegrid import final_mosaic_finishing as zfin
 from .core.zegrid import geometry as zg
@@ -1604,6 +1605,9 @@ def _cell_cache_frame_worker(task):
     rgb, geom = _prepare_cell_source_frame(
         frame_desc, bounds, patch_wcs_header, patch_hw
     )
+    # ZM-ZEGRID-FD-EXHAUSTION (A): worker-start hardening. Idempotent per process
+    # (and inherited from the parent on fork), never fatal on denial.
+    zfdl.ensure_nofile_headroom()
     np.save(rgb_path, rgb)
     np.save(sup_path, geom)
     return {
@@ -1633,6 +1637,18 @@ def _build_one_cell_cache(
     """
     planned = _plan_cell_source_frames(descs, canvas, patch, mem)
     frame_ids = [f.frame_id.logical_path for f, _p in planned]
+
+    # ZM-ZEGRID-FD-EXHAUSTION (B): the worst-cell descriptor budget is checked
+    # UP FRONT — before the cache is wiped, written or reused and before any
+    # stack work. With the bounded provider the requirement is independent of the
+    # frame count, so this fails only when the process truly cannot fit; it then
+    # refuses with an actionable message instead of dying mid-cell with EMFILE.
+    _cell_fd_budget = zfdl.assert_cell_fd_budget(
+        f"cell {getattr(cell, 'cell_id', '?')}",
+        n_frames=len(planned),
+        max_open_files=zfp.DEFAULT_MAX_OPEN_MAPPINGS,
+        workers=int(workers),
+    )
 
     cache_dir = Path(cache_dir)
     patch_identity = zfp.patch_geometry_identity(patch)
@@ -5416,6 +5432,9 @@ def _prepare_stack_cell(task):
     storage_profile = zsp.normalize_storage_profile(storage_profile)
     if source_requested and not zsp.is_bounded(storage_profile):
         raise RuntimeError("source-backed cell task requires bounded storage")
+    # ZM-ZEGRID-FD-EXHAUSTION (A): worker-start hardening for the producer side
+    # (idempotent; child processes inherit an already-raised limit on fork).
+    zfdl.ensure_nofile_headroom()
     cid = cell.cell_id
     _patch_bounds = [int(patch.patch.x0), int(patch.patch.y0),
                      int(patch.patch.x1), int(patch.patch.y1)]
@@ -16811,6 +16830,10 @@ def _run_single(
         "cpu_fallback_plan": dict(cpu_fallback_info),
         # ZM-ZEGRID-R41-B: the full 80 %-plan / 90 %-admit contract trail.
         "ram_contract": _ram_contract_diagnostics(_adm, _final, _initial_bundle),
+        # ZM-ZEGRID-FD-EXHAUSTION (A): additive, observed descriptor limits so a
+        # future EMFILE is diagnosable from the run record alone (the raise itself
+        # already ran once at ZeGrid entry and is cached per process).
+        "fd_limits": zfdl.ensure_nofile_headroom(),
         "requested_cell_gauge_mode": requested_cell_gauge_mode,
     }
 
@@ -23663,6 +23686,28 @@ def run_zegrid_mode(
         callback=progress_callback,
     )
     _emit("ZeGrid engine activated (explicit ZeGrid mode)", callback=progress_callback)
+    # ZM-ZEGRID-FD-EXHAUSTION (A): defensively raise the soft RLIMIT_NOFILE
+    # toward min(hard, 131072) BEFORE any planning, cache build or worker start.
+    # POSIX-guarded, never lowers an existing limit, never crashes when denied
+    # (the per-cell descriptor budget below is the fail-closed gate). The record
+    # is additive run diagnostics so a future EMFILE is diagnosable.
+    _fd_limits_record = zfdl.ensure_nofile_headroom()
+    if _fd_limits_record.get("supported"):
+        _emit(
+            "ZeGrid: open files — soft RLIMIT_NOFILE "
+            f"{_fd_limits_record['soft_before']} -> "
+            f"{_fd_limits_record['soft_effective']} (hard "
+            f"{_fd_limits_record['hard'] if _fd_limits_record['hard'] is not None else 'unlimited'}"
+            f"; {_fd_limits_record['reason']})",
+            callback=progress_callback,
+        )
+    else:
+        _emit(
+            "ZeGrid: open files — descriptor limit unavailable on this platform "
+            f"({_fd_limits_record['reason']}); bounded cache access still applies",
+            lvl="WARN",
+            callback=progress_callback,
+        )
     # ZM-ZEGRID-VISIBLE-ARTIFACTS-20261031: ONE explicit line when a legacy
     # hidden publication container is the one that will be READ. Nothing is
     # moved, renamed or migrated; the visible name stays the write target.

@@ -62,7 +62,9 @@ import numbers
 import json
 import logging
 import shutil
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -73,6 +75,7 @@ from zemosaic.core.canonical_stacking import (
 )
 
 from . import execution as zxe
+from .fd_limits import DEFAULT_MAX_OPEN_CACHE_FILES, FILES_PER_FRAME
 from .geometry import (
     FrameDescriptor,
     GlobalCanvas,
@@ -82,10 +85,16 @@ from .geometry import (
 
 CACHE_SCHEMA = "zemosaic-zegrid-r6-aligned-cache-v1"
 
+#: ZM-ZEGRID-FD-EXHAUSTION: hard cap on simultaneously mapped ``.npy`` files in
+#: ONE :class:`MemmapCanonicalProvider`. Counted in FILES (2 per frame), so the
+#: default keeps at most 32 frames mapped regardless of the cell's frame count.
+DEFAULT_MAX_OPEN_MAPPINGS = DEFAULT_MAX_OPEN_CACHE_FILES
+
 __all__ = [
     "CACHE_SCHEMA",
     "AlignedCacheBuilder",
     "BoundedMemmapCanonicalProvider",
+    "DEFAULT_MAX_OPEN_MAPPINGS",
     "MemmapCanonicalProvider",
     "WindowedCanonicalProvider",
     "build_aligned_cache_from_sources",
@@ -491,9 +500,16 @@ class MemmapCanonicalProvider:
     which releases every memmap's underlying ``mmap`` handle. On Windows a file
     still mapped/opened cannot be deleted (``WinError 32``), so callers MUST
     ``close()`` (or ``with``) the provider BEFORE deleting the cache directory.
+
+    ZM-ZEGRID-FD-EXHAUSTION: the number of simultaneously mapped cache files is
+    BOUNDED (``max_open_mappings``, default 64 files = 32 frames). A small cache
+    that fits the cap is opened eagerly exactly as before; a dense cell (e.g.
+    527 frames -> 1054 files) now keeps at most the cap mapped and re-opens on
+    demand, so one cell can no longer exhaust the process descriptor limit.
+    Served values are unchanged (bit-identical ``.npy`` round-trips).
     """
 
-    def __init__(self, cache_dir) -> None:
+    def __init__(self, cache_dir, *, max_open_mappings=None) -> None:
         self.cache_dir = Path(cache_dir)
         manifest = load_cache_manifest(self.cache_dir)
         self._manifest = manifest
@@ -505,14 +521,120 @@ class MemmapCanonicalProvider:
         self.original_ndim = int(manifest["original_ndim"])
         self.original_shape = tuple(manifest["original_shape"])
         self.frame_ids = tuple(manifest["frame_ids"])
-        self._rgb = [
-            np.load(_frame_rgb_path(self.cache_dir, i), mmap_mode="r")
-            for i in range(self.n_frames)
-        ]
-        self._sup = [
-            np.load(_frame_sup_path(self.cache_dir, i), mmap_mode="r")
-            for i in range(self.n_frames)
-        ]
+        cap = (
+            DEFAULT_MAX_OPEN_MAPPINGS
+            if max_open_mappings is None
+            else int(max_open_mappings)
+        )
+        # At least one whole frame (2 files) must be mappable at a time.
+        self.max_open_mappings = max(2 * FILES_PER_FRAME, cap)
+        self._total_files = FILES_PER_FRAME * self.n_frames
+        # Eager == the historical shape: every file of a cache that FITS the cap.
+        self._eager = self._total_files <= self.max_open_mappings
+        self._rgb: list = []
+        self._sup: list = []
+        self._open_order: "OrderedDict[int, None]" = OrderedDict()
+        self.mapping_open_count = 0
+        self.mapping_close_count = 0
+        self.mapping_open_failures = 0
+        self.peak_open_mappings = 0
+        # The canonical executor is a single-reader provider (documented), but a
+        # bounded mapping MAY be evicted by a later access, so the lazy bookkeeping
+        # and the copy-out happen under one lock: a future concurrent caller gets
+        # owned data, never a dangling view.
+        self._lock = threading.RLock()
+        if self._eager:
+            for i in range(self.n_frames):
+                rgb, sup = self._open_pair_maps(i)
+                self._rgb.append(rgb)
+                self._sup.append(sup)
+                self._open_order[i] = None
+            self.peak_open_mappings = FILES_PER_FRAME * len(self._open_order)
+        else:
+            self._rgb = [None] * self.n_frames
+            self._sup = [None] * self.n_frames
+
+    # -- bounded mapping lifecycle (ZM-ZEGRID-FD-EXHAUSTION) -------------
+    @property
+    def open_mappings(self) -> int:
+        """Number of cache files currently mapped (2 per open frame)."""
+        return FILES_PER_FRAME * len(self._open_order)
+
+    def _open_pair_maps(self, i: int):
+        """Open ``(rgb, support)`` with an all-or-nothing error path."""
+        rgb = _load_memmap(_frame_rgb_path(self.cache_dir, i))
+        self.mapping_open_count += 1
+        try:
+            sup = _load_memmap(_frame_sup_path(self.cache_dir, i))
+            self.mapping_open_count += 1
+        except BaseException:
+            self.mapping_open_failures += 1
+            _close_memmap(rgb)
+            self.mapping_close_count += 1
+            raise
+        return rgb, sup
+
+    def _drop_index(self, i: int) -> None:
+        rgb = self._rgb[i] if i < len(self._rgb) else None
+        sup = self._sup[i] if i < len(self._sup) else None
+        for arr in (rgb, sup):
+            if arr is not None:
+                _close_memmap(arr)
+                self.mapping_close_count += 1
+        if i < len(self._rgb):
+            self._rgb[i] = None
+            self._sup[i] = None
+
+    def _evict_until_within_cap(self, keep: int) -> None:
+        cap_frames = max(1, self.max_open_mappings // FILES_PER_FRAME)
+        while len(self._open_order) > cap_frames:
+            victim = next(iter(self._open_order))
+            if victim == keep:
+                # Never evict the frame the caller is about to read.
+                if len(self._open_order) <= 1:
+                    break
+                victim = next(iter(list(self._open_order)[1:]))
+            self._open_order.pop(victim, None)
+            self._drop_index(victim)
+
+    def _maps(self, i: int):
+        """Return the mappings for frame ``i``, opening on demand (LRU)."""
+        i = int(i)
+        rgb = self._rgb[i] if i < len(self._rgb) else None
+        sup = self._sup[i] if i < len(self._sup) else None
+        if rgb is not None and sup is not None:
+            self._open_order.pop(i, None)
+            self._open_order[i] = None
+            return rgb, sup
+        # Re-open a partially dropped pair from scratch.
+        if rgb is not None or sup is not None:
+            self._drop_index(i)
+            self._open_order.pop(i, None)
+        rgb, sup = self._open_pair_maps(i)
+        self._rgb[i] = rgb
+        self._sup[i] = sup
+        self._open_order[i] = None
+        self._evict_until_within_cap(i)
+        self.peak_open_mappings = max(self.peak_open_mappings, self.open_mappings)
+        return rgb, sup
+
+    def fd_telemetry(self) -> dict:
+        """Truthful descriptor telemetry for the run manifest / tests."""
+        return {
+            "provider": type(self).__name__,
+            "storage_domain": getattr(
+                self, "storage_domain", "aligned-npy-memmap-dense"
+            ),
+            "eager": bool(self._eager),
+            "frames": int(self.n_frames),
+            "cache_files": int(self._total_files),
+            "max_open_mappings": int(self.max_open_mappings),
+            "open_mappings": int(self.open_mappings),
+            "peak_open_mappings": int(self.peak_open_mappings),
+            "mapping_open_count": int(self.mapping_open_count),
+            "mapping_close_count": int(self.mapping_close_count),
+            "mapping_open_failures": int(self.mapping_open_failures),
+        }
 
     def close(self) -> None:
         """Release every memmap handle (idempotent; never raises).
@@ -521,10 +643,14 @@ class MemmapCanonicalProvider:
         directory is deleted, otherwise Windows raises ``WinError 32`` on the
         ``.npy`` files still mapped into the process.
         """
-        for arr in list(self._rgb) + list(self._sup):
-            _close_memmap(arr)
-        self._rgb = []
-        self._sup = []
+        with self._lock:
+            for arr in list(self._rgb) + list(self._sup):
+                if arr is not None:
+                    _close_memmap(arr)
+                    self.mapping_close_count += 1
+            self._rgb = []
+            self._sup = []
+            self._open_order.clear()
 
     def __enter__(self):
         return self
@@ -544,17 +670,37 @@ class MemmapCanonicalProvider:
 
     # -- phase 1 raw access -------------------------------------------------
     def get_raw_frame(self, i: int):
-        return np.asarray(self._rgb[i]), np.asarray(self._sup[i])
+        if self._eager:
+            # Historical dense semantics: the mappings stay open for the life of
+            # the provider, so a view is a valid read-only handle.
+            rgb, sup = self._maps(int(i))
+            return np.asarray(rgb), np.asarray(sup)
+        # Bounded semantics: the mapping can be evicted by a LATER access (the
+        # canonical phase 1 holds the reference frame across every other frame),
+        # so hand out owned copies — identical values, never a dangling view.
+        with self._lock:
+            rgb, sup = self._maps(int(i))
+            return np.array(rgb, copy=True), np.array(sup, copy=True)
 
     # -- phase 2 prepared tile access (mirrors InMemoryCanonicalProvider) ----
     def get_tile(self, i: int, y0: int, y1: int, x0: int, x1: int):
-        raw = self._rgb[i]
-        sup = self._sup[i]
-        if self.original_mono:
-            tile = raw[y0:y1, x0:x1]
-        else:
-            tile = raw[y0:y1, x0:x1, :]
-        sup_tile = sup[y0:y1, x0:x1]
+        if self._eager:
+            raw, sup = self._maps(int(i))
+            if self.original_mono:
+                tile = raw[y0:y1, x0:x1]
+            else:
+                tile = raw[y0:y1, x0:x1, :]
+            sup_tile = sup[y0:y1, x0:x1]
+            batch = prepare_canonical_inputs([tile], [sup_tile])
+            return batch.images[0], batch.valid_mask[0]
+        # Bounded: copy the requested window out of the mapping immediately.
+        with self._lock:
+            raw, sup = self._maps(int(i))
+            if self.original_mono:
+                tile = np.array(raw[y0:y1, x0:x1], copy=True)
+            else:
+                tile = np.array(raw[y0:y1, x0:x1, :], copy=True)
+            sup_tile = np.array(sup[y0:y1, x0:x1], copy=True)
         batch = prepare_canonical_inputs([tile], [sup_tile])
         return batch.images[0], batch.valid_mask[0]
 
