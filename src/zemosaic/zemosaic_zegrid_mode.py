@@ -21244,13 +21244,17 @@ def _run_single(
     # A COMPLETE resume executed no cell at all, so reused durable descriptors
     # must never be reported as fresh GPU execution; the frozen admission stays
     # visible as the run's backend contract.
-    if _resume_complete_replay:
-        gpu_executed_cells = 0
-    else:
-        gpu_executed_cells = sum(
-            1 for r in results
-            if r.get("status") == "complete" and r.get("backend_used") == "gpu"
-        )
+    # ZM-ZEGRID-GPU-PARTIAL-RESUME REWORK-1: count THIS attempt only. On a
+    # PARTIAL resume ``results`` is the FULL canonical store view (correct for
+    # coverage/assembly) and restored Cells carry their persisted
+    # ``backend_used="gpu"``; summing it would report restored commits as fresh
+    # GPU execution. ``_current_records`` is exactly the Cells stacked by this
+    # attempt (empty on a COMPLETE replay), the same notion used by the
+    # current/historical split above.
+    gpu_executed_cells = sum(
+        1 for r in _current_records
+        if r.get("status") == "complete" and r.get("backend_used") == "gpu"
+    )
     actually_used_gpu = bool(gpu_executed_cells > 0 and runtime_gpu_fallback is None)
     gpu_ctx = dict(gpu_ctx)
     gpu_ctx["gpu_executed_cells"] = int(gpu_executed_cells)

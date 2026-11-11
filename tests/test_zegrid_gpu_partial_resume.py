@@ -119,6 +119,11 @@ def test_gpu_frozen_partial_resume_executes_only_pending_cells(tmp_path, monkeyp
     manifest = RERUN._published_manifest(out)
     gpu = manifest["gpu"]
     assert gpu["actually_used"] is True
+    # REWORK-1: per-attempt evidence counts ONLY the Cells this attempt stacked.
+    # The restored commits also carry backend_used="gpu"; summing the full
+    # canonical ``results`` view would wrongly report 4.
+    assert gpu["gpu_executed_cells"] == len(removed_ids)
+    assert gpu["gpu_executed_cells"] != expected_total
     assert gpu["executed_this_attempt"] == len(removed_ids)
     diag = manifest["per_cell_diagnostics"]
     assert diag["executed_this_attempt"] == len(removed_ids)
