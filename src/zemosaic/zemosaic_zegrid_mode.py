@@ -4127,17 +4127,16 @@ def _frozen_admission_refusal(
     )
 
 
-_WORKING_SET_DOWNGRADES = ((WORKING_SET_INMEM, WORKING_SET_RAM_TILE),)
-
-
 def _working_set_downgrade_allowed(from_class, to_class) -> bool:
     """ZM-ZEGRID-CLASS-DOWNGRADE-RESUME: the ONE permitted class transition.
 
-    A resume may only move to a STRICTLY smaller working set: in-memory ->
-    RAM-tiled. The reverse (upgrade), anything -> external_spool and
-    external_spool -> anything are refused elsewhere.
+    Thin wrapper over the SINGLE source of truth in :mod:`run_resume`, so the
+    engine and the durable-state validator can never drift. A resume may only
+    move to a STRICTLY smaller working set: in-memory -> RAM-tiled. The reverse
+    (upgrade), anything -> external_spool and external_spool -> anything are
+    refused elsewhere.
     """
-    return (str(from_class), str(to_class)) in _WORKING_SET_DOWNGRADES
+    return zres.is_working_set_downgrade(from_class, to_class)
 
 
 def _frozen_working_set_mismatch_message(from_class, to_class) -> str:

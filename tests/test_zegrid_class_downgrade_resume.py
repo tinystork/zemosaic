@@ -599,6 +599,121 @@ def test_transition_trail_survives_state_rewrites(tmp_path):
     assert final["admission"]["working_set"]["class"] == "ram_tile"
 
 
+_VALID_PROPOSAL = {
+    "from_class": "inmem",
+    "to_class": "ram_tile",
+    "tile_px": 16,
+    "column_batch": None,
+    "reason": "RAM observation forced the strictly-smaller class",
+    "ram_observation": {"raw_available_bytes": 1, "plan_budget_bytes": 1},
+}
+
+
+def _root_with_one_transition(tmp_path):
+    root = tmp_path / "run"
+    _, identity_sha = _partial_inmem_store(root)
+    record = zres.record_working_set_downgrade(
+        root, transition=_VALID_PROPOSAL, identity_sha256=identity_sha
+    )
+    return root, record, identity_sha
+
+
+# ---------------------------------------------------------------------------
+# 3b — M1: the "at most one transition" rule is enforced on LOAD
+# ---------------------------------------------------------------------------
+
+
+def test_two_transition_entries_are_refused_on_load(tmp_path):
+    root, record, _ = _root_with_one_transition(tmp_path)
+    state = zres.read_state(root)
+    state["working_set_transitions"] = [dict(record), dict(record)]
+    with pytest.raises(zres.ResumeStateError) as excinfo:
+        zres.validate_state(state)
+    message = str(excinfo.value)
+    assert "exactly one downgrade per run" in message
+    assert "2 entries" in message
+
+
+def test_wrong_transition_pair_is_refused_on_load(tmp_path):
+    root, record, _ = _root_with_one_transition(tmp_path)
+    state = zres.read_state(root)
+    bad = dict(record)
+    bad["from_class"] = "ram_tile"
+    bad["to_class"] = "inmem"
+    state["working_set_transitions"] = [bad]
+    with pytest.raises(zres.ResumeStateError) as excinfo:
+        zres.validate_state(state)
+    assert "is not an allowed downgrade" in str(excinfo.value)
+
+
+def test_transition_contradicting_admission_class_is_refused_on_load(tmp_path):
+    root, _, _ = _root_with_one_transition(tmp_path)
+    state = zres.read_state(root)
+    state["admission"]["working_set"]["class"] = "inmem"
+    with pytest.raises(zres.ResumeStateError) as excinfo:
+        zres.validate_state(state)
+    message = str(excinfo.value)
+    assert "admission.working_set.class is 'inmem'" in message
+    assert "does not claim" in message
+
+
+def test_one_consistent_transition_round_trips(tmp_path):
+    root, record, identity_sha = _root_with_one_transition(tmp_path)
+    state = zres.read_state(root)
+    assert state["working_set_transitions"] == [record]
+    assert state["admission"]["working_set"]["class"] == "ram_tile"
+    # Re-writing the SAME consistent state is accepted and preserved verbatim.
+    rewritten = zres.write_state(
+        root,
+        run_id=state["run_id"],
+        expected_cell_ids=state["expected_cell_ids"],
+        policy=state["policy"],
+        plan_generation=int(state["plan_generation"]),
+        finalized=bool(state["finalized"]),
+        gauge_sha256=state.get("gauge_sha256"),
+        outputs=state.get("outputs"),
+        created_unix_ns=int(state["created_unix_ns"]),
+        note=state.get("note"),
+        admission=state["admission"],
+        working_set_transitions=state["working_set_transitions"],
+    )
+    assert rewritten["working_set_transitions"] == [record]
+    assert rewritten["working_set_transitions"][0]["identity_sha256"] == identity_sha
+
+
+def test_record_refuses_a_caller_identity_that_is_not_the_store_identity(tmp_path):
+    root = tmp_path / "run"
+    _, durable_sha = _partial_inmem_store(root)
+    before = (root / "state.json").read_bytes()
+    with pytest.raises(zres.ResumeStateError) as excinfo:
+        zres.record_working_set_downgrade(
+            root,
+            transition=_VALID_PROPOSAL,
+            identity_sha256="0" * 64,
+        )
+    message = str(excinfo.value)
+    assert "does not match the store's durable identity" in message
+    assert durable_sha in message
+    # Nothing was written: the state is byte-identical.
+    assert (root / "state.json").read_bytes() == before
+
+
+def test_single_source_of_the_permitted_pair():
+    from zemosaic.core.zegrid import run_resume as rr
+
+    assert rr.WORKING_SET_DOWNGRADES == (("inmem", "ram_tile"),)
+    assert zz._working_set_downgrade_allowed("inmem", "ram_tile") is True
+    assert zz._working_set_downgrade_allowed("ram_tile", "inmem") is False
+    # The engine wrapper is exactly the run_resume predicate.
+    for pair in (
+        ("inmem", "ram_tile"),
+        ("ram_tile", "inmem"),
+        ("inmem", "external_spool"),
+        ("external_spool", "ram_tile"),
+    ):
+        assert zz._working_set_downgrade_allowed(*pair) is rr.is_working_set_downgrade(*pair)
+
+
 def test_working_set_class_is_not_part_of_the_identity_fingerprints(tmp_path):
     root = tmp_path / "run"
     _, identity_sha_before = _partial_inmem_store(root)

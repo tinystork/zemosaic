@@ -59,6 +59,15 @@ ADMISSION_REMEDY = (
 # move to a code path whose bit-parity has not been proven here.
 WORKING_SET_TRANSITION_SCHEMA = "zegrid-working-set-transition-v1"
 WORKING_SET_DOWNGRADES = (("inmem", "ram_tile"),)
+def is_working_set_downgrade(from_class, to_class) -> bool:
+    """True only for the ONE permitted class transition (single source).
+
+    ``WORKING_SET_DOWNGRADES`` is the sole encoding of the permitted set; the
+    engine and the state validator both consult it through this predicate.
+    """
+    return (str(from_class), str(to_class)) in WORKING_SET_DOWNGRADES
+
+
 WORKING_SET_TRANSITION_REQUIRED = (
     "schema",
     "from_class",
@@ -652,9 +661,35 @@ def validate_state(raw: Any) -> dict:
             raise ResumeStateError(
                 "resume state.working_set_transitions must be a list"
             )
+        if len(transitions) > 1:
+            raise ResumeStateError(
+                "resume state.working_set_transitions has "
+                f"{len(transitions)} entries; exactly one downgrade per run is "
+                "permitted (a second entry would silently describe a class the "
+                "run never admitted)"
+            )
         normalised["working_set_transitions"] = [
             validate_working_set_transition(item) for item in transitions
         ]
+        if normalised["working_set_transitions"]:
+            record = normalised["working_set_transitions"][0]
+            admission = normalised.get("admission")
+            working_set = (
+                None if admission is None else admission.get("working_set")
+            )
+            if working_set is None:
+                raise ResumeStateError(
+                    "resume state records a working-set downgrade but its "
+                    "admission has no working-set section; the state is "
+                    "internally inconsistent"
+                )
+            if str(working_set.get("class")) != str(record["to_class"]):
+                raise ResumeStateError(
+                    "resume state working-set transition moves to "
+                    f"{record['to_class']!r} but admission.working_set.class is "
+                    f"{working_set.get('class')!r}; the state would describe a "
+                    "class the admission does not claim"
+                )
     return normalised
 
 
@@ -735,6 +770,28 @@ def write_state(
     return state
 
 
+def _durable_identity_sha256(run_root: str | os.PathLike[str]) -> str:
+    """The store's OWN durable identity digest (never a caller claim).
+
+    Reading ``run.json`` directly avoids re-opening (and re-locking) the store
+    while the resume process already owns the single-writer lock.
+    """
+    path = Path(run_root) / "run.json"
+    try:
+        raw = json.loads(path.read_bytes().decode("utf-8"))
+    except Exception as exc:
+        raise ResumeStateError(
+            f"cannot verify the durable run identity at {path}: {exc}"
+        ) from exc
+    try:
+        identity = zrs.validate_run_identity(raw)
+    except Exception as exc:
+        raise ResumeStateError(
+            f"the durable run identity at {path} is invalid: {exc}"
+        ) from exc
+    return zrs.identity_sha256(identity)
+
+
 def record_working_set_downgrade(
     run_root: str | os.PathLike[str],
     *,
@@ -790,6 +847,15 @@ def record_working_set_downgrade(
             "working-set downgrade already recorded for this run; exactly one "
             "transition is permitted"
         )
+    durable_sha = _durable_identity_sha256(run_root)
+    supplied_sha = str(identity_sha256)
+    if supplied_sha != durable_sha:
+        raise ResumeStateError(
+            "cannot record a working-set downgrade: the supplied "
+            f"identity_sha256 {supplied_sha!r} does not match the store's "
+            f"durable identity {durable_sha!r}; the record would carry false "
+            "provenance"
+        )
     record = {
         "schema": WORKING_SET_TRANSITION_SCHEMA,
         "from_class": from_class,
@@ -803,7 +869,7 @@ def record_working_set_downgrade(
         "reason": str(proposal["reason"]),
         "ram_observation": dict(proposal["ram_observation"]),
         "plan_generation": int(state["plan_generation"]),
-        "identity_sha256": str(identity_sha256),
+        "identity_sha256": durable_sha,
         "identity_unchanged": True,
         "recorded_unix_ns": int(time.time_ns()),
     }
