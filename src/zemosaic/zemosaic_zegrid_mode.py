@@ -9268,6 +9268,44 @@ def _bundle_gauge_footprint_bytes(bundle, canvas_px: int) -> int:
         return int(model["footprint_bytes"])
     return int(zpar.gauge_footprint_bytes(int(canvas_px)))
 
+#: ZM-ZEGRID-RESTORED-GAUGE: conservative per-exclusion bookkeeping bound.
+#: A :class:`FrameExclusion` holds three small strings and an int; 512 B covers
+#: the dataclass plus its string payloads with a wide margin. It is only ever
+#: ADDED to the exact array ``nbytes`` of a VERIFIED restored gauge, never used
+#: to price a compute phase.
+_RESTORED_GAUGE_EXCLUSION_BOUND_BYTES = 512
+
+
+def _restored_gauge_resident_bytes(gauge) -> int:
+    """Resident host bytes of ONE verified restored gauge (never re-derived).
+
+    ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: on a resume the global gauge artifact
+    is restored from the durable store, so ``compute_global_gauge`` will NOT
+    run. The only real gauge cost left is the coefficients/weights/active flags
+    the run keeps resident. This helper measures exactly those owned arrays
+    plus a bounded per-exclusion bookkeeping charge. It never consults the
+    compute-phase footprint model, and it never guesses a path: the caller
+    passes the object returned by the VERIFIED ``ResumeBootstrap.restore_gauge``.
+
+    Returns a non-negative integer, or 0 when the object carries no measurable
+    residency (the caller then fails closed and prices the compute phase).
+    """
+    total = 0
+    for name in ("coefficients", "norm_active", "weights", "weight_active"):
+        array = getattr(gauge, name, None)
+        nbytes = getattr(array, "nbytes", None)
+        if nbytes is None:
+            continue
+        total += int(nbytes)
+    exclusions = getattr(gauge, "exclusions", None) or ()
+    try:
+        total += int(len(exclusions)) * int(
+            _RESTORED_GAUGE_EXCLUSION_BOUND_BYTES
+        )
+    except TypeError:
+        pass
+    return int(total)
+
 
 def _build_r55_observe_block(
     *,
@@ -9756,11 +9794,22 @@ def _r55_active_facts(
     frame_ids,
     gauge_workers=None,
     cache_workers=None,
+    gauge_restored=False,
+    restored_gauge_resident_bytes=None,
 ) -> dict:
     """Derive the integer facts the accepted scheduler needs (no probe).
 
     Everything is computed from the INITIAL bundle's frozen layout,
     memberships, frames and halo. No global and no solver state is mutated.
+
+    ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: ``gauge_restored`` is an EXPLICIT,
+    derived signal. It is true only when the caller has a VERIFIED restored
+    gauge artifact (the ``ResumeBootstrap.restore_gauge`` object the run will
+    actually use) and passes its measured residency. When true, the gauge
+    COMPUTE phase is not priced; the ``gauge`` phase charges only that resident
+    cost, with its basis recorded in the facts. When false (fresh run, missing
+    artifact, failed restore, identity mismatch) the historical compute
+    footprint is priced exactly as before.
     """
     active = [
         (cell, patch, mem)
@@ -9845,6 +9894,28 @@ def _r55_active_facts(
     cache_workers = _r55_coherent_worker_count(
         _cache_start, _worker_raw_ceiling, cache_footprint
     )
+    # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: the compute worker count is preserved
+    # for traceability, but a RESTORED gauge never runs a compute worker. Only
+    # a proven, positive restored residency may exclude the compute phase; an
+    # unproven signal fails closed and keeps today's compute pricing.
+    _gauge_compute_workers = int(gauge_workers)
+    _gauge_restored = bool(gauge_restored)
+    _restored_resident = (
+        None
+        if restored_gauge_resident_bytes is None
+        else int(restored_gauge_resident_bytes)
+    )
+    if _gauge_restored and (
+        _restored_resident is None or int(_restored_resident) <= 0
+    ):
+        _gauge_restored = False
+    if _gauge_restored:
+        gauge_workers = 1
+        _gauge_phase_basis = "restored"
+        _gauge_phase_bytes = int(_restored_resident)
+    else:
+        _gauge_phase_basis = "compute"
+        _gauge_phase_bytes = int(gauge_footprint) * int(gauge_workers)
     bytes_per_px = 4 * 4
     halo_band_bytes = max(
         0, int(patch_area_px) - int(core_area_px)
@@ -9895,9 +9966,23 @@ def _r55_active_facts(
         "disk_free": int(disk_free),
         "canvas_px": int(canvas_px),
         "channels": int(channels),
+        # The COMPUTE-phase per-worker footprint is preserved unchanged (it is
+        # the honest cost of a fresh/missing-artifact gauge). Whether it is
+        # actually priced is stated explicitly below.
         "gauge_footprint_bytes": int(gauge_footprint),
         "cache_footprint_bytes": int(cache_footprint),
         "gauge_workers": int(gauge_workers),
+        # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: ONE explicit basis for the gauge
+        # phase in the aggregate. ``gauge_compute_priced`` is the fail-closed
+        # switch: True means the compute footprint above is charged.
+        "gauge_restored": bool(_gauge_restored),
+        "gauge_restored_resident_bytes": (
+            int(_restored_resident) if _gauge_restored else None
+        ),
+        "gauge_phase_basis": str(_gauge_phase_basis),
+        "gauge_phase_bytes": int(_gauge_phase_bytes),
+        "gauge_compute_priced": bool(not _gauge_restored),
+        "gauge_compute_workers_unpriced": int(_gauge_compute_workers),
         "cache_workers": int(cache_workers),
         # ZM-ZEGRID-R56 REWORK-1 (F2): the ONE producer phase that genuinely
         # coexists with the GPU consumer in the bounded pipeline. Cache-build
@@ -9951,15 +10036,29 @@ def _r55_active_phase_requests(facts) -> tuple:
     """
     gauge_workers = max(1, int(facts["gauge_workers"]))
     cache_workers = max(1, int(facts["cache_workers"]))
-    gauge_worker_bytes = int(facts["gauge_footprint_bytes"]) * gauge_workers
+    # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: a VERIFIED restored gauge is a single
+    # resident charge, never a compute worker phase. Every fresh/unproven case
+    # keeps the historical footprint x workers component verbatim.
+    if bool(facts.get("gauge_restored")):
+        gauge_components = {
+            "restored_gauge_resident_bytes": int(facts["gauge_phase_bytes"])
+        }
+        gauge_units = 1
+    else:
+        gauge_components = {
+            "gauge_worker_footprint_bytes": (
+                int(facts["gauge_footprint_bytes"]) * gauge_workers
+            )
+        }
+        gauge_units = int(gauge_workers)
     cache_worker_bytes = int(facts["cache_footprint_bytes"]) * cache_workers
     canvas_px = int(facts["canvas_px"])
     return (
         zsched.PhaseRequest(
             phase=renv.PHASE_GAUGE,
-            components={"gauge_worker_footprint_bytes": gauge_worker_bytes},
-            units=gauge_workers,
-            units_in_flight=gauge_workers,
+            components=gauge_components,
+            units=gauge_units,
+            units_in_flight=gauge_units,
             workers_per_unit=1,
         ),
         zsched.PhaseRequest(
@@ -10114,6 +10213,29 @@ def _r55_worker_adaptation_detail(facts, trail):
         "cache_ladder": list(_r55_worker_ladder(int(facts["cache_workers"]))),
         "selected_gauge_workers": int(facts["gauge_workers"]),
         "selected_cache_workers": int(facts["cache_workers"]),
+        # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: the gauge phase's priced BASIS is
+        # explicit, so an aggregate is explainable without reading code.
+        "gauge_phase": {
+            "basis": str(facts.get("gauge_phase_basis", "compute")),
+            "restored": bool(facts.get("gauge_restored", False)),
+            "phase_bytes": int(
+                facts.get(
+                    "gauge_phase_bytes",
+                    int(facts["gauge_footprint_bytes"])
+                    * int(facts["gauge_workers"]),
+                )
+            ),
+            "restored_resident_bytes": facts.get(
+                "gauge_restored_resident_bytes"
+            ),
+            "compute_priced": bool(facts.get("gauge_compute_priced", True)),
+            "compute_workers_unpriced": int(
+                facts.get(
+                    "gauge_compute_workers_unpriced",
+                    int(facts["gauge_workers"]),
+                )
+            ),
+        },
         "trail": [dict(entry) for entry in trail],
     }
 
@@ -10220,6 +10342,21 @@ def _gauge_phase_refusal_components(facts, bundle, canvas_px: int) -> str:
         facts.get("gauge_footprint_bytes")
         or _bundle_gauge_footprint_bytes(bundle, canvas_px)
     )
+    if bool(facts.get("gauge_restored")):
+        # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: never hide that the compute phase
+        # exists; state that it is NOT charged because the verified artifact is
+        # restored, and name the residency actually priced.
+        return (
+            "phase=gauge basis=restored: restored_gauge_resident_bytes="
+            f"{int(facts.get('gauge_phase_bytes') or 0)} x 1; the gauge "
+            f"COMPUTE footprint {footprint} B x gauge_workers={workers} is "
+            "NOT priced on this resume (verified durable artifact restored, "
+            "compute_global_gauge will not run); "
+            f"mode={model.get('mode')}, peak_phase={model.get('peak_phase')}, "
+            f"max_bbox_px={model.get('max_bbox_px')}, "
+            f"reference_tile_px={model.get('tile_px')}, "
+            f"canvas_px={model.get('canvas_px', int(canvas_px))}"
+        )
     return (
         "phase=gauge components: "
         f"footprint_bytes={footprint} x gauge_workers={workers} = "
@@ -10279,7 +10416,8 @@ def _r55_active_external_context(facts, bundle, cache_workers_cap):
 
 
 def _r55_active_external_decide(
-    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
+    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids,
+    gauge_restored=False, restored_gauge_resident_bytes=None,
 ) -> _R55ActiveDecision:
     """ACTIVE decision for the external working-set class (single-owner).
 
@@ -10298,6 +10436,8 @@ def _r55_active_external_decide(
         cache_root=cache_root,
         output_dir=output_dir,
         frame_ids=frame_ids,
+        gauge_restored=gauge_restored,
+        restored_gauge_resident_bytes=restored_gauge_resident_bytes,
     )
     # ZM-EXTERNAL-PHASE-BUDGET rework-1: the external bounded path is
     # SOURCE-BACKED and NEVER builds the aligned cache. The generic
@@ -10426,7 +10566,8 @@ def _r55_active_external_decide(
 
 
 def _r55_active_decide(
-    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids
+    *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids,
+    gauge_restored=False, restored_gauge_resident_bytes=None,
 ) -> _R55ActiveDecision:
     """Build the deterministic CPU inmem+stream decision BEFORE gauge/stack.
 
@@ -10449,6 +10590,8 @@ def _r55_active_decide(
             cache_root=cache_root,
             output_dir=output_dir,
             frame_ids=frame_ids,
+            gauge_restored=gauge_restored,
+            restored_gauge_resident_bytes=restored_gauge_resident_bytes,
         )
     facts = _r55_active_facts(
         bundle=bundle,
@@ -10458,6 +10601,8 @@ def _r55_active_decide(
         cache_root=cache_root,
         output_dir=output_dir,
         frame_ids=frame_ids,
+        gauge_restored=gauge_restored,
+        restored_gauge_resident_bytes=restored_gauge_resident_bytes,
     )
     trail: list[dict] = []
     last_exc = None
@@ -10770,6 +10915,8 @@ def _r55_active_gpu_decide(
     gpu_probe,
     readiness,
     max_gpu_tile=None,
+    gauge_restored=False,
+    restored_gauge_resident_bytes=None,
 ):
     """Build the ACTIVE GPU decision from explicit integer facts only.
 
@@ -10785,6 +10932,8 @@ def _r55_active_gpu_decide(
         cache_root=cache_root,
         output_dir=output_dir,
         frame_ids=frame_ids,
+        gauge_restored=gauge_restored,
+        restored_gauge_resident_bytes=restored_gauge_resident_bytes,
     )
     free = gpu_probe.get("vram_free_bytes")
     total = gpu_probe.get("vram_total_bytes")
@@ -15153,6 +15302,13 @@ def _run_single(
 
     _resume_gauge = None
     _resume_geometry = None
+    # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: the ACTIVE admission may only stop
+    # pricing the gauge COMPUTE phase when THIS resume restored a VERIFIED
+    # artifact and the run will actually use it. Both values are derived from
+    # the object returned by the verified restore below; they are never guessed
+    # from a path or a config flag.
+    _resume_gauge_restored = False
+    _resume_gauge_resident_bytes = None
     _resume_store_dir = (
         getattr(zconfig, "zegrid_durable_store_dir", None)
         if zconfig is not None
@@ -15258,6 +15414,13 @@ def _run_single(
             try:
                 _resume_gauge = _resume_boot.restore_gauge()
                 _resume_geometry = _resume_boot.restore_geometry()
+                # restore_gauge() verified the artifact identity, self-digest
+                # and gauge_sha256 before returning. Only THAT object may
+                # suppress the compute phase.
+                _resume_gauge_restored = True
+                _resume_gauge_resident_bytes = int(
+                    _restored_gauge_resident_bytes(_resume_gauge[0])
+                )
             except zres.ResumeError as _artifact_exc:
                 _resume_runtime["refusal"] = (
                     f"{type(_artifact_exc).__name__}: {_artifact_exc}"
@@ -15275,14 +15438,23 @@ def _run_single(
                 "geometry_cells": int(len(_resume_geometry[2])),
                 "gauge_frames": int(len(_resume_gauge[1])),
                 "gauge_reference_frame_id": _resume_gauge[2],
+                # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: what the admission will
+                # price for a phase that will NOT run.
+                "gauge_phase_basis": "restored",
+                "gauge_restored_resident_bytes": int(
+                    _resume_gauge_resident_bytes
+                ),
             }
             _emit(
                 "ZeGrid: resume artifacts RESTORED — gauge "
                 f"({len(_resume_gauge[1])} frames, ref "
-                f"{_resume_gauge[2]!r}) and geometry "
-                f"({len(_resume_geometry[2])} cells, "
+                f"{_resume_gauge[2]!r}, resident "
+                f"{int(_resume_gauge_resident_bytes) / 2**20:.2f} MiB) and "
+                f"geometry ({len(_resume_geometry[2])} cells, "
                 f"{_resume_geometry[1]['nx']}x{_resume_geometry[1]['ny']}); "
-                "the gauge and layout phases will NOT run",
+                "the gauge and layout phases will NOT run — the admission "
+                "prices phase=gauge as basis=restored (resident only, compute "
+                "excluded)",
                 callback=progress_callback,
             )
         else:
@@ -15937,6 +16109,10 @@ def _run_single(
                     gpu_probe=gpu_ctx,
                     readiness=_r55_readiness,
                     max_gpu_tile=_r55_frozen_gpu_tile_cap(),
+                    gauge_restored=_resume_gauge_restored,
+                    restored_gauge_resident_bytes=(
+                        _resume_gauge_resident_bytes
+                    ),
                 )
                 _admitted = _r55_active_gpu_admit(
                     initial_bundle=initial_bundle,
@@ -16305,6 +16481,10 @@ def _run_single(
                     cache_root=cache_root,
                     output_dir=output_dir,
                     frame_ids=_r55_frame_ids,
+                    gauge_restored=_resume_gauge_restored,
+                    restored_gauge_resident_bytes=(
+                        _resume_gauge_resident_bytes
+                    ),
                 )
                 return (decision, _r55_active_admit(
                     initial_bundle=bundle,
@@ -17506,6 +17686,10 @@ def _run_single(
                     bundle=_seed, cell_ctxs=_seed.cell_ctxs, canvas=canvas,
                     halo_px=halo_px, cache_root=cache_root,
                     output_dir=output_dir, frame_ids=_r55_frame_ids,
+                    gauge_restored=_resume_gauge_restored,
+                    restored_gauge_resident_bytes=(
+                        _resume_gauge_resident_bytes
+                    ),
                 )
                 (
                     _bnd, _cand, _map, _adm2, _trail2,
@@ -21211,6 +21395,10 @@ def _run_single(
                 cache_root=cache_root,
                 output_dir=output_dir,
                 frame_ids=_r55_frame_ids,
+                gauge_restored=_resume_gauge_restored,
+                restored_gauge_resident_bytes=(
+                    _resume_gauge_resident_bytes
+                ),
             )
             (
                 _r55_active_bundle,
