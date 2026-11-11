@@ -3900,6 +3900,60 @@ def _frozen_planning_gpu(frozen_admission, *, gpu_used):
     )
 
 
+def _resume_partial_gpu_refusal(
+    frozen_admission, *, gpu_plan_selected, pending_count
+):
+    """ZM-ZEGRID-GPU-PARTIAL-RESUME: the ONE gate for a GPU PARTIAL resume.
+
+    A partial durable resume may execute its sparse pending set on GPU ONLY
+    under the run's OWN frozen backend contract (same geometry/halo/working
+    set/science/parity; the execution tile stays shrink-only). Returns ``None``
+    when the resume may proceed, otherwise an accurate refusal message.
+
+    * ``pending_count <= 0``: no Cell is stacked (complete replay or finalized
+      no-op), so no backend is admitted here -> ``None``;
+    * no GPU plan selected: the CPU path owns execution -> ``None``;
+    * frozen admission missing (pre-parity store): refuse — a GPU plan is
+      never injected when the frozen backend cannot be checked;
+    * frozen backend ``"cpu"``: refuse — a GPU backend is never injected into
+      a CPU-frozen store (the literal historical meaning of this guard);
+    * frozen backend ``"gpu"``: allow — SAME backend, and the admission step
+      itself has already re-validated the frozen tile
+      (:func:`_r55_require_frozen_gpu_mapping`);
+    * unknown frozen backend: refuse.
+    """
+    if int(pending_count) <= 0 or not bool(gpu_plan_selected):
+        return None
+    if frozen_admission is None:
+        return (
+            "resume refused: a GPU plan was selected to execute this run's "
+            "sparse pending set, but the durable store has no FROZEN "
+            "admission section (pre-parity store). A GPU backend is never "
+            "injected into a store whose frozen execution contract cannot be "
+            "checked; mixing backends without a qualified numeric parity "
+            "contract is forbidden. Remedy: "
+            f"{zres.ADMISSION_REMEDY}."
+        )
+    backend = str(frozen_admission["backend"])
+    if backend == "gpu":
+        return None
+    if backend == "cpu":
+        return (
+            "resume refused: a GPU plan was selected to execute this run's "
+            "sparse pending set, but the FROZEN admission of this run is "
+            "backend='cpu'. A GPU backend is never injected into a CPU-frozen "
+            "store; mixing backends without a qualified numeric parity "
+            "contract is forbidden. Remedy: "
+            f"{zres.ADMISSION_REMEDY}."
+        )
+    return (
+        "resume refused: a GPU plan was selected to execute this run's "
+        "sparse pending set, but the FROZEN admission of this run names "
+        f"backend={backend!r}, which is unknown. Refusing to plan (no silent "
+        f"backend switch). Remedy: {zres.ADMISSION_REMEDY}."
+    )
+
+
 def _frozen_permitted_tiles(frozen_admission, permitted_tiles):
     """Restrict the CPU streaming ladder to the run's OWN frozen tile.
 
@@ -18300,7 +18354,7 @@ def _run_single(
 
     def _run_r55_active_gpu_units(
         *, gpu_bundle, gpu_mapping, gpu_decision, gpu_candidate=None,
-        unit_progress=None, result_registry=None
+        unit_progress=None, result_registry=None, pending_cell_ids=None
     ):
         """R55-E2: bounded CPU->GPU producer/consumer pipeline (single owner).
 
@@ -19120,7 +19174,19 @@ def _run_single(
 
         # Per-unit index is needed by the consumer record without relying on
         # thread-shared mutable state. Wrap each canonical task once.
-        tasks = list(gpu_bundle.cell_tasks)
+        # ZM-ZEGRID-GPU-PARTIAL-RESUME-20261111: a durable PARTIAL resume
+        # executes ONLY the sparse pending Cells. The canonical (unfiltered)
+        # list remains the assembly/coverage source below; the filter keeps
+        # canonical order and is never a prefix/offset shortcut.
+        canonical_tasks = list(gpu_bundle.cell_tasks)
+        if pending_cell_ids is None:
+            tasks = list(canonical_tasks)
+        else:
+            _pending_set = {str(cid) for cid in pending_cell_ids}
+            tasks = [
+                task for task in canonical_tasks
+                if str(task[0].cell_id) in _pending_set
+            ]
         indexed = list(enumerate(tasks))
         def _host_reserve(task):
             """F1: PREDICTED resident staging bytes, from the PLAN bound only.
@@ -19462,7 +19528,9 @@ def _run_single(
             # the registry-owned payloads in canonical order (sparse identity,
             # never list-position). M5-A: with a durable store, that access is
             # bounded and read-only instead of an eager list of every payload.
-            _store_ids = [t[0].cell_id for t in tasks]
+            # Assembly/coverage still needs EVERY expected Cell; only the
+            # EXECUTED subset above is the sparse pending set.
+            _store_ids = [t[0].cell_id for t in canonical_tasks]
             _store = _store_state["store"]
             # COMPLETE sparse coverage (not a boolean, not attempts>0) BEFORE
             # any lazy durable-results consumer, diagnostics included.
@@ -19528,7 +19596,9 @@ def _run_single(
             if r.get("unit_index") is not None
         }
         units_block = []
-        for index in range(len(results)):
+        # One record per Cell STACKED by this attempt (pending subset on a
+        # partial resume), never one fake "empty" record per restored commit.
+        for index in range(len(tasks)):
             record = runtime_by_index.get(int(index))
             if record is None:
                 units_block.append(
@@ -19580,11 +19650,12 @@ def _run_single(
             "wave_executors": ["gpu_pipeline"],
             "parent_daemon": False,
             "workers": 1,
-            "tasks": int(len(results)),
+            "tasks": int(len(tasks)),
+            "executed_this_attempt": int(len(tasks)),
             "fallback": False,
             "fallback_reason": None,
             "seconds": float(wall),
-            "seconds_per_unit": float(wall) / max(1, int(len(results))),
+            "seconds_per_unit": float(wall) / max(1, int(len(tasks))),
             "waves": 1,
             "heartbeat_calls": 0,
             "heartbeat_errors": 0,
@@ -20379,19 +20450,26 @@ def _run_single(
             # A COMPLETE run must resume ASSEMBLY without any GPU stack
             # admission. No cell is admitted, so no GPU decision is needed.
             _r55_active_gpu_decision = None
-        elif _r55_active_gpu_decision is not None:
-            _resume_runtime["refusal"] = (
-                "resume refused: a GPU backend was selected for a CPU-frozen "
-                "run; mixing backends without a qualified numeric parity "
-                "contract is forbidden (V1 conservative policy)"
+        else:
+            # ZM-ZEGRID-GPU-PARTIAL-RESUME-20261111: a PARTIAL resume may run
+            # on GPU ONLY when the run itself is GPU-frozen (SAME qualified
+            # backend contract; the execution tile stays shrink-only at RUN).
+            # A GPU plan injected into a CPU-frozen or pre-parity store stays
+            # refused BEFORE any Cell, cache or commit is written.
+            _resume_gpu_refusal = _resume_partial_gpu_refusal(
+                _frozen_admission,
+                gpu_plan_selected=_r55_active_gpu_decision is not None,
+                pending_count=len(_resume_pending_ids),
             )
-            _emit(
-                "ZeGrid: resume REFUSED — "
-                f"{_resume_runtime['refusal']}",
-                lvl="ERROR",
-                callback=progress_callback,
-            )
-            raise RuntimeError(_resume_runtime["refusal"])
+            if _resume_gpu_refusal is not None:
+                _resume_runtime["refusal"] = _resume_gpu_refusal
+                _emit(
+                    "ZeGrid: resume REFUSED — "
+                    f"{_resume_runtime['refusal']}",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
+                raise RuntimeError(_resume_runtime["refusal"])
     _r55_gpu_retained = None
     if not _resume_complete_replay:
         # ZM-RESUME-TELEMETRY-TRUTH REWORK-1: the canonical per-cell stacking
@@ -20439,6 +20517,7 @@ def _run_single(
                 gpu_candidate=_r55_active_candidate,
                 unit_progress=_gpu_unit_progress,
                 result_registry=result_registry,
+                pending_cell_ids=_resume_pending_ids,
             )
         except _R55GpuFallback as _gpu_exc:
             # EXACT whole-batch CPU fallback from a CLEAN state. Every GPU

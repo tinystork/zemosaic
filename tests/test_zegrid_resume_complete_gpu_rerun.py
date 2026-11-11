@@ -376,37 +376,45 @@ def test_partial_cpu_resume_executes_only_pending_cells(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 3b — a GPU-frozen PARTIAL resume keeps its pre-existing fail-closed refusal
+# 3b — a GPU-frozen PARTIAL resume is now a same-backend sparse execution
 # ---------------------------------------------------------------------------
 
 
-def test_partial_gpu_frozen_resume_keeps_the_existing_refusal(
+def test_partial_gpu_frozen_resume_executes_only_pending_cells(
     tmp_path, monkeypatch
 ):
-    """UNCHANGED policy: a GPU plan is never mixed into a resumed sparse set.
+    """ZM-ZEGRID-GPU-PARTIAL-RESUME: the sparse pending set runs on its GPU.
 
-    ``ZM-RESUME-COMPLETE-GPU-RERUN`` must not alter this fail-closed contract:
-    the sparse pending set is refused before any cell admission, no commit is
-    written and no stack runs.
+    The owner-approved policy allows a PARTIAL resume whose frozen admission
+    is GPU, provided it stays under the SAME qualified backend contract. Only
+    the pending Cells run (never the whole list), only they are committed, and
+    the run finishes. The dedicated sparse/predicate/no-GPU matrix lives in
+    ``test_zegrid_gpu_partial_resume.py``.
     """
     out, store = _run(tmp_path, monkeypatch, use_gpu=True)
     assert len(_commits(store)) == 4
+    removed_ids = sorted(_commit_cid(path) for path in _commits(store)[2:])
     for path in _commits(store)[2:]:
         path.unlink()
-    partial = _commit_bytes(store)
+    before = _commit_bytes(store)
 
-    stacks = _bomb_cell_execution(monkeypatch)
     commits_spy = _spy_commits(monkeypatch)
     lines: list[str] = []
-    with pytest.raises(RuntimeError) as excinfo:
-        _run(
-            tmp_path, monkeypatch, use_gpu=True, resume_mode="auto",
-            progress=lambda msg, *a, **k: lines.append(str(msg)),
-        )
-    assert "CPU-frozen" in str(excinfo.value)
-    assert stacks == [], stacks
-    assert commits_spy == [], commits_spy
-    assert _commit_bytes(store) == partial
+    _run(
+        tmp_path, monkeypatch, use_gpu=True, resume_mode="auto",
+        progress=lambda msg, *a, **k: lines.append(str(msg)),
+    )
+    assert sorted(commits_spy) == removed_ids, commits_spy
+    after = _commit_bytes(store)
+    for name, payload in before.items():
+        assert after[name] == payload, name
+    assert len(_commits(store)) == 4
+    text = "\n".join(lines)
+    assert "pending=2" in text
+    assert "CPU-frozen" not in text
+    manifest = _published_manifest(out)
+    assert manifest["gpu"]["executed_this_attempt"] == 2
+    assert manifest["per_cell_diagnostics"]["executed_this_attempt"] == 2
 
 
 # ---------------------------------------------------------------------------
