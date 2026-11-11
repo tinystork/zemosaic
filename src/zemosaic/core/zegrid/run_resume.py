@@ -51,6 +51,27 @@ ADMISSION_REMEDY = (
     "free enough memory so the frozen tile fits on this host again, or start "
     "a NEW run in a NEW output folder (a new run freezes its own admission)"
 )
+# ZM-ZEGRID-CLASS-DOWNGRADE-RESUME: the ONLY working-set class transition a
+# resume may perform. It is a strict DOWNGRADE (strictly less RAM), recorded
+# explicitly from/to with the RAM observation that forced it. Every other
+# direction (ram_tile -> inmem, anything -> external_spool, external_spool ->
+# anything) stays refused: those would change the admitted residency upward or
+# move to a code path whose bit-parity has not been proven here.
+WORKING_SET_TRANSITION_SCHEMA = "zegrid-working-set-transition-v1"
+WORKING_SET_DOWNGRADES = (("inmem", "ram_tile"),)
+WORKING_SET_TRANSITION_REQUIRED = (
+    "schema",
+    "from_class",
+    "to_class",
+    "tile_px",
+    "column_batch",
+    "reason",
+    "ram_observation",
+    "plan_generation",
+    "identity_sha256",
+    "identity_unchanged",
+    "recorded_unix_ns",
+)
 
 
 class ResumeError(RuntimeError):
@@ -461,6 +482,82 @@ def validate_admission(admission: Any) -> dict:
     }
 
 
+def validate_working_set_transition(raw: Any) -> dict:
+    """Validate ONE recorded working-set class transition.
+
+    The record is additive evidence, never a second source of scientific
+    identity. It names the exact from/to classes, the derived streaming tile,
+    the RAM observation that forced the change, the plan generation at which it
+    happened and the (unchanged) identity digest.
+    """
+    _strict_keys(
+        raw, "working_set_transitions[]", WORKING_SET_TRANSITION_REQUIRED
+    )
+    if raw["schema"] != WORKING_SET_TRANSITION_SCHEMA:
+        raise ResumeStateError(
+            f"working-set transition schema {raw['schema']!r} != "
+            f"{WORKING_SET_TRANSITION_SCHEMA!r}"
+        )
+    from_class = str(raw["from_class"])
+    to_class = str(raw["to_class"])
+    if (from_class, to_class) not in WORKING_SET_DOWNGRADES:
+        raise ResumeStateError(
+            f"working-set transition {from_class!r} -> {to_class!r} is not an "
+            "allowed downgrade; only "
+            + ", ".join(f"{a!r} -> {b!r}" for a, b in WORKING_SET_DOWNGRADES)
+            + " may be recorded"
+        )
+    tile_px = _as_int(
+        raw["tile_px"], "working_set_transitions[].tile_px", minimum=1
+    )
+    batch = raw["column_batch"]
+    if batch is not None:
+        batch = _as_int(
+            batch, "working_set_transitions[].column_batch", minimum=1
+        )
+    reason = str(raw["reason"])
+    if not reason.strip():
+        raise ResumeStateError(
+            "working_set_transitions[].reason must not be empty"
+        )
+    observation = raw["ram_observation"]
+    if not isinstance(observation, Mapping):
+        raise ResumeStateError(
+            "working_set_transitions[].ram_observation must be an object"
+        )
+    identity_sha = str(raw["identity_sha256"])
+    if not identity_sha:
+        raise ResumeStateError(
+            "working_set_transitions[].identity_sha256 must not be empty"
+        )
+    if raw["identity_unchanged"] is not True:
+        raise ResumeStateError(
+            "working_set_transitions[].identity_unchanged must be True: a "
+            "class downgrade never changes the scientific identity"
+        )
+    return {
+        "schema": WORKING_SET_TRANSITION_SCHEMA,
+        "from_class": from_class,
+        "to_class": to_class,
+        "tile_px": int(tile_px),
+        "column_batch": (None if batch is None else int(batch)),
+        "reason": reason,
+        "ram_observation": dict(observation),
+        "plan_generation": _as_int(
+            raw["plan_generation"],
+            "working_set_transitions[].plan_generation",
+            minimum=0,
+        ),
+        "identity_sha256": identity_sha,
+        "identity_unchanged": True,
+        "recorded_unix_ns": _as_int(
+            raw["recorded_unix_ns"],
+            "working_set_transitions[].recorded_unix_ns",
+            minimum=0,
+        ),
+    }
+
+
 def build_admission(
     *,
     backend: Any,
@@ -488,7 +585,8 @@ def validate_state(raw: Any) -> dict:
             "schema", "schema_version", "run_id", "created_unix_ns",
             "expected_cell_ids", "policy", "plan_generation", "finalized",
         ),
-        ("gauge_sha256", "outputs", "note", "admission"),
+        ("gauge_sha256", "outputs", "note", "admission",
+         "working_set_transitions"),
     )
     if raw["schema"] != RESUME_STATE_SCHEMA:
         raise ResumeStateError(
@@ -545,6 +643,18 @@ def validate_state(raw: Any) -> dict:
     # is ever written for a store that genuinely has no frozen contract.
     if raw.get("admission") is not None:
         normalised["admission"] = validate_admission(raw["admission"])
+    # ZM-ZEGRID-CLASS-DOWNGRADE-RESUME: the optional, append-only audit trail of
+    # explicit working-set class transitions. Absent for every pre-existing
+    # store (byte-compatible); never fabricated on load.
+    if raw.get("working_set_transitions") is not None:
+        transitions = raw["working_set_transitions"]
+        if not isinstance(transitions, list):
+            raise ResumeStateError(
+                "resume state.working_set_transitions must be a list"
+            )
+        normalised["working_set_transitions"] = [
+            validate_working_set_transition(item) for item in transitions
+        ]
     return normalised
 
 
@@ -582,6 +692,7 @@ def write_state(
     created_unix_ns: int | None = None,
     note: str | None = None,
     admission: Mapping[str, Any] | None = None,
+    working_set_transitions: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict:
     """Atomically persist the frozen expected set, policy and admission.
 
@@ -610,6 +721,11 @@ def write_state(
     }
     if admission is not None:
         payload["admission"] = validate_admission(admission)
+    if working_set_transitions is not None:
+        payload["working_set_transitions"] = [
+            validate_working_set_transition(item)
+            for item in working_set_transitions
+        ]
     state = validate_state(payload)
     tmp_dir = root / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -617,6 +733,110 @@ def write_state(
         state_path(root), zrs.canonical_json(state), tmp_dir=tmp_dir
     )
     return state
+
+
+def record_working_set_downgrade(
+    run_root: str | os.PathLike[str],
+    *,
+    transition: Mapping[str, Any],
+    identity_sha256: str,
+) -> dict:
+    """Persist EXACTLY ONE approved working-set class downgrade on resume.
+
+    The caller has already proven (in the planner) that the frozen ``inmem``
+    class no longer fits the observed budget while ``ram_tile`` does. This
+    function:
+
+    * refuses anything except ``inmem`` -> ``ram_tile``;
+    * refuses a second transition (exactly one per run);
+    * preserves ``backend``/``tile_px``/``parity_qualified`` byte-for-byte;
+    * rewrites only the durable working-set class/tile of the admission;
+    * appends the explicit record (from, to, reason, RAM observation, plan
+      generation, identity digest, identity_unchanged) to the state.
+
+    The scientific identity is never touched: the working-set class is not
+    part of ``identity_fingerprints``.
+    """
+    state = read_state(run_root)
+    admission = state.get("admission")
+    if admission is None:
+        raise ResumeStateError(
+            "cannot record a working-set downgrade: the run has no frozen "
+            "admission"
+        )
+    existing = admission.get("working_set")
+    if existing is None:
+        raise ResumeStateError(
+            "cannot record a working-set downgrade: the frozen admission has "
+            "no working-set section"
+        )
+    proposal = dict(transition)
+    from_class = str(proposal.get("from_class"))
+    to_class = str(proposal.get("to_class"))
+    if (from_class, to_class) not in WORKING_SET_DOWNGRADES:
+        raise ResumeStateError(
+            f"working-set transition {from_class!r} -> {to_class!r} is not "
+            "permitted on resume"
+        )
+    if str(existing.get("class")) != from_class:
+        raise ResumeStateError(
+            "cannot record a working-set downgrade: the frozen class "
+            f"{existing.get('class')!r} is not the transition's from_class "
+            f"{from_class!r}"
+        )
+    prior = state.get("working_set_transitions") or []
+    if prior:
+        raise ResumeStateError(
+            "working-set downgrade already recorded for this run; exactly one "
+            "transition is permitted"
+        )
+    record = {
+        "schema": WORKING_SET_TRANSITION_SCHEMA,
+        "from_class": from_class,
+        "to_class": to_class,
+        "tile_px": int(proposal["tile_px"]),
+        "column_batch": (
+            None
+            if proposal.get("column_batch") is None
+            else int(proposal["column_batch"])
+        ),
+        "reason": str(proposal["reason"]),
+        "ram_observation": dict(proposal["ram_observation"]),
+        "plan_generation": int(state["plan_generation"]),
+        "identity_sha256": str(identity_sha256),
+        "identity_unchanged": True,
+        "recorded_unix_ns": int(time.time_ns()),
+    }
+    validate_working_set_transition(record)
+    new_admission = build_admission(
+        backend=admission["backend"],
+        tile_px=admission["tile_px"],
+        parity_qualified=admission["parity_qualified"],
+        working_set={
+            "class": to_class,
+            "tile_px": int(record["tile_px"]),
+            "column_batch": (
+                None
+                if record["column_batch"] is None
+                else int(record["column_batch"])
+            ),
+        },
+    )
+    write_state(
+        run_root,
+        run_id=state["run_id"],
+        expected_cell_ids=state["expected_cell_ids"],
+        policy=state["policy"],
+        plan_generation=int(state["plan_generation"]),
+        finalized=bool(state["finalized"]),
+        gauge_sha256=state.get("gauge_sha256"),
+        outputs=state.get("outputs"),
+        created_unix_ns=int(state["created_unix_ns"]),
+        note=state.get("note"),
+        admission=new_admission,
+        working_set_transitions=list(prior) + [record],
+    )
+    return record
 
 
 def attach_working_set(
@@ -669,6 +889,7 @@ def attach_working_set(
         created_unix_ns=int(state["created_unix_ns"]),
         note=state.get("note"),
         admission=new_admission,
+        working_set_transitions=state.get("working_set_transitions"),
     )
 
 
@@ -699,6 +920,8 @@ def update_policy(
         note=state["note"],
         # The admission contract is FROZEN: a policy rewrite never touches it.
         admission=state.get("admission"),
+        # ... and the explicit class-transition audit trail is never dropped.
+        working_set_transitions=state.get("working_set_transitions"),
     )
 
 
@@ -1227,6 +1450,9 @@ class ResumeBootstrap:
             created_unix_ns=self.state["created_unix_ns"],
             note=self.state["note"],
             admission=self.state.get("admission"),
+            working_set_transitions=self.state.get(
+                "working_set_transitions"
+            ),
         )
         return self.state
 

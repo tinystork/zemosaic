@@ -4127,6 +4127,143 @@ def _frozen_admission_refusal(
     )
 
 
+_WORKING_SET_DOWNGRADES = ((WORKING_SET_INMEM, WORKING_SET_RAM_TILE),)
+
+
+def _working_set_downgrade_allowed(from_class, to_class) -> bool:
+    """ZM-ZEGRID-CLASS-DOWNGRADE-RESUME: the ONE permitted class transition.
+
+    A resume may only move to a STRICTLY smaller working set: in-memory ->
+    RAM-tiled. The reverse (upgrade), anything -> external_spool and
+    external_spool -> anything are refused elsewhere.
+    """
+    return (str(from_class), str(to_class)) in _WORKING_SET_DOWNGRADES
+
+
+def _frozen_working_set_mismatch_message(from_class, to_class) -> str:
+    """Accurate, actionable wording for each REFUSED transition."""
+    from_class = str(from_class)
+    to_class = str(to_class)
+    if (from_class, to_class) == (WORKING_SET_RAM_TILE, WORKING_SET_INMEM):
+        return (
+            "frozen working-set class 'ram_tile' cannot be upgraded to 'inmem' "
+            "on this resume; only the strictly-smaller inmem -> ram_tile "
+            "downgrade is permitted. Remedy: free enough memory so the frozen "
+            "ram_tile class fits on this host again, or start a new run/output "
+            "folder."
+        )
+    if to_class == WORKING_SET_EXTERNAL:
+        return (
+            f"frozen working-set class {from_class!r} cannot be re-derived as "
+            "'external_spool' on this resume; only the inmem -> ram_tile RAM "
+            "downgrade is permitted (the external disk-spool class is a "
+            "different execution path and is not part of the proven parity). "
+            "Remedy: free enough memory so a RAM class fits, or start a new "
+            "run/output folder."
+        )
+    if from_class == WORKING_SET_EXTERNAL:
+        return (
+            "frozen working-set class 'external_spool' cannot be re-derived as "
+            f"{to_class!r} on this resume; the external class is never left on "
+            "resume (that would silently change where the run stages its "
+            "data). Remedy: resume with the external spool available, or start "
+            "a new run/output folder."
+        )
+    return (
+        f"frozen working-set class {from_class!r} cannot be re-derived as "
+        f"{to_class!r} on this resume; the run identity is not silently "
+        "changed. Remedy: resume the frozen class or start a new run/output "
+        "folder."
+    )
+
+
+def _pinned_inmem_plan(plan):
+    """Honour a frozen ``inmem`` class whenever its OWN candidate is feasible.
+
+    The joint planner compares estimated makespans, so it may prefer
+    ``stream`` for speed even when the in-memory plan fits. A resume may not
+    downgrade gratuitously: the feasible in-memory candidate is selected
+    verbatim (its concurrency and phase totals), never re-derived from current
+    free RAM. Returns ``None`` when the in-memory candidate is infeasible.
+    """
+    if str(plan.get("mode")) == WORKING_SET_INMEM:
+        return plan
+    candidate = None
+    for item in plan.get("candidates") or ():
+        if (
+            str(item.get("mode")) == WORKING_SET_INMEM
+            and bool(item.get("feasible"))
+        ):
+            candidate = item
+            break
+    if candidate is None:
+        return None
+    pinned = dict(plan)
+    pinned["mode"] = WORKING_SET_INMEM
+    pinned["cells_in_flight"] = int(candidate["cells_in_flight"])
+    pinned["cache_workers_per_cell"] = int(
+        candidate["cache_workers_per_cell"]
+    )
+    for key in (
+        "cache_per_cell_bytes",
+        "stack_total_bytes",
+        "cache_total_bytes",
+        "aggregate_bytes",
+    ):
+        if candidate.get(key) is not None:
+            pinned[key] = int(candidate[key])
+    pinned["chosen_reason"] = (
+        "frozen working-set class 'inmem' is still feasible on this resume: "
+        "the in-memory candidate was selected instead of a faster streaming "
+        "alternative (no gratuitous downgrade)"
+    )
+    return pinned
+
+
+def _working_set_downgrade_record(
+    *, frozen_ws, plan, chosen_tile, budget_bytes, raw_available_bytes
+) -> dict:
+    """The EXPLICIT record of the one approved resume class downgrade.
+
+    Carries the from/to classes, the derived streaming tile, the reason and
+    the RAM observation that forced it. The caller persists it with the plan
+    generation and the (unchanged) identity digest before any pending Cell
+    runs; it is also published in the manifest/log.
+    """
+    frozen_class = str(frozen_ws.get("class"))
+    inmem_required = None
+    ram_tile_required = None
+    for candidate in plan.get("candidates") or ():
+        mode = str(candidate.get("mode"))
+        if mode == WORKING_SET_INMEM and inmem_required is None:
+            inmem_required = int(candidate.get("max_bound_bytes") or 0)
+        elif mode == "stream" and ram_tile_required is None:
+            ram_tile_required = int(candidate.get("max_bound_bytes") or 0)
+    deficit = (
+        None
+        if inmem_required is None
+        else max(0, int(inmem_required) - int(budget_bytes))
+    )
+    return {
+        "from_class": frozen_class,
+        "to_class": WORKING_SET_RAM_TILE,
+        "tile_px": int(chosen_tile),
+        "column_batch": None,
+        "reason": (
+            "the frozen in-memory working set no longer fits the observed "
+            "plan budget; the strictly-smaller ram_tile class was admitted "
+            "for the pending Cells (committed Cells are untouched)"
+        ),
+        "ram_observation": {
+            "raw_available_bytes": int(raw_available_bytes),
+            "plan_budget_bytes": int(budget_bytes),
+            "inmem_required_bytes": inmem_required,
+            "ram_tile_required_bytes": ram_tile_required,
+            "deficit_bytes": deficit,
+        },
+    }
+
+
 def _plan_bundle_auto(
     *,
     canvas,
@@ -7840,10 +7977,12 @@ def _build_execution_bundle(
         None if _frozen_admission is None
         else _frozen_admission.get("working_set")
     )
-    _frozen_external = bool(
-        _frozen_ws_policy
-        and str(_frozen_ws_policy.get("class")) == WORKING_SET_EXTERNAL
+    _frozen_ws_class = (
+        None
+        if not _frozen_ws_policy
+        else str(_frozen_ws_policy.get("class"))
     )
+    _frozen_external = _frozen_ws_class == WORKING_SET_EXTERNAL
     _force_external = bool(force_external) or _frozen_external
     # SINGLE-SOURCED enforcement (both directions). The bundle can never plan a
     # backend that the run's frozen identity does not own.
@@ -8499,6 +8638,21 @@ def _build_execution_bundle(
                 )
             continue
 
+        # ZM-ZEGRID-CLASS-DOWNGRADE-RESUME: a frozen 'inmem' class that STILL
+        # fits is never downgraded for a faster makespan. The planner's
+        # stream-vs-inmem comparison may prefer streaming for speed; the
+        # resume honours the frozen class whenever its own candidate is
+        # feasible (gratuitous downgrade refused).
+        if (
+            _frozen_admission is not None
+            and not _bounded
+            and _frozen_ws_class == WORKING_SET_INMEM
+            and not effective_gpu
+            and str(plan.get("mode")) == "stream"
+        ):
+            _pinned_inmem = _pinned_inmem_plan(plan)
+            if _pinned_inmem is not None:
+                plan = _pinned_inmem
         cpu_streaming_tile = int(chosen_tile)
         chosen_mode = plan["mode"]
         if _bounded and chosen_mode not in ("stream", "external"):
@@ -8742,19 +8896,42 @@ def _build_execution_bundle(
         # Additive only: every pre-existing RAM decision field is untouched.
         stack_working_set = _working_set_class_for_mode(chosen_mode)
         # Resume identity: a frozen class is never silently re-derived.
+        working_set_transition = None
         if _frozen_admission is not None:
             _frozen_ws = _frozen_admission.get("working_set")
+            _frozen_class = (
+                None if _frozen_ws is None else str(_frozen_ws.get("class"))
+            )
             if (
-                _frozen_ws is not None
-                and str(_frozen_ws.get("class")) != stack_working_set
+                _frozen_class is not None
+                and _frozen_class != stack_working_set
             ):
-                raise zpar.ModeInfeasible(
-                    "frozen working-set class "
-                    f"{_frozen_ws.get('class')!r} cannot be re-derived as "
-                    f"{stack_working_set!r} on this resume; the run identity is "
-                    "not silently changed. Remedy: resume the frozen class or "
-                    "start a new run/output folder."
-                )
+                # ZM-ZEGRID-CLASS-DOWNGRADE-RESUME: EXACTLY ONE transition is
+                # permitted at the resume boundary: inmem -> ram_tile (strictly
+                # less RAM). It is only reachable when the planner genuinely
+                # could NOT fit the frozen in-memory class (the pin above keeps
+                # inmem whenever its own candidate is feasible). The transition
+                # is recorded explicitly in state + manifest + log, never
+                # silent. Every other direction stays refused.
+                if (
+                    _working_set_downgrade_allowed(
+                        _frozen_class, stack_working_set
+                    )
+                    and not _bounded
+                ):
+                    working_set_transition = _working_set_downgrade_record(
+                        frozen_ws=_frozen_ws,
+                        plan=plan,
+                        chosen_tile=chosen_tile,
+                        budget_bytes=budget_bytes,
+                        raw_available_bytes=raw_available_bytes,
+                    )
+                else:
+                    raise zpar.ModeInfeasible(
+                        _frozen_working_set_mismatch_message(
+                            _frozen_class, stack_working_set
+                        )
+                    )
             if _frozen_ws is None and stack_working_set == WORKING_SET_EXTERNAL:
                 raise zpar.ModeInfeasible(
                     "legacy run identity has no working-set section; switching "
@@ -8782,6 +8959,13 @@ def _build_execution_bundle(
             ),
             refusal=None,
         )
+        if working_set_transition is not None:
+            # Additive and explicit: a reader can never mistake the frozen
+            # contract for one that always said ram_tile.
+            working_set_block["frozen_class"] = str(
+                working_set_transition["from_class"]
+            )
+            working_set_block["transition"] = dict(working_set_transition)
         layout["stack_working_set"] = stack_working_set
         working_set_block["owner_token"] = _owner_token
         layout["working_set"] = working_set_block
@@ -20041,6 +20225,86 @@ def _run_single(
         _store_state.update(
             enabled=True, store=_store, publishing=True, resumed=True
         )
+        # ZM-ZEGRID-CLASS-DOWNGRADE-RESUME: persist the ONE approved
+        # working-set class downgrade BEFORE any pending Cell runs. The
+        # scientific identity is unchanged (the class is not part of it); the
+        # transition is explicit in the durable state, the manifest and the
+        # run log, and it is never silent.
+        _ws_scope_bundle_now = _run_scope_bundle(_r55_active_bundle, _final)
+        _ws_block_now = getattr(_ws_scope_bundle_now, "working_set_block", None)
+        _ws_transition_proposal = (
+            _ws_block_now.get("transition")
+            if isinstance(_ws_block_now, dict) else None
+        )
+        if _ws_transition_proposal:
+            try:
+                _ws_transition_record = zres.record_working_set_downgrade(
+                    _store.root,
+                    transition=_ws_transition_proposal,
+                    identity_sha256=zrs.identity_sha256(_store_identity),
+                )
+            except zres.ResumeError as _ws_transition_exc:
+                _emit(
+                    "ZeGrid: resume REFUSED — the approved working-set class "
+                    "downgrade could not be recorded durably "
+                    f"({type(_ws_transition_exc).__name__}: "
+                    f"{_ws_transition_exc}); no pending Cell was executed.",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
+                raise
+            # Publish the STORED record (it now carries the plan generation)
+            # into every bundle that can reach the manifest/log. The frozen
+            # class is kept beside it so the transition is never invisible.
+            _ws_record_targets = [_final]
+            if _r55_active_bundle is not None:
+                _ws_record_targets.append(_r55_active_bundle)
+            if _initial_bundle is not None:
+                _ws_record_targets.append(_initial_bundle)
+            for _ws_target in _ws_record_targets:
+                _ws_target_block = getattr(
+                    _ws_target, "working_set_block", None
+                )
+                if not isinstance(_ws_target_block, dict):
+                    continue
+                _ws_target_block["frozen_class"] = str(
+                    _ws_transition_record["from_class"]
+                )
+                _ws_target_block["transition"] = dict(_ws_transition_record)
+                _ws_target_layout = getattr(_ws_target, "layout", None)
+                if (
+                    isinstance(_ws_target_layout, dict)
+                    and isinstance(
+                        _ws_target_layout.get("working_set"), dict
+                    )
+                ):
+                    _ws_target_layout["working_set"]["frozen_class"] = str(
+                        _ws_transition_record["from_class"]
+                    )
+                    _ws_target_layout["working_set"]["transition"] = dict(
+                        _ws_transition_record
+                    )
+            _emit(
+                "ZeGrid: working-set class DOWNGRADED on resume — "
+                f"{_ws_transition_record['from_class']} -> "
+                f"{_ws_transition_record['to_class']} "
+                f"(tile={_ws_transition_record['tile_px']}, "
+                f"plan_generation={_ws_transition_record['plan_generation']}); "
+                "reason: "
+                f"{_ws_transition_record['reason']}; RAM observation raw="
+                f"{_ws_transition_record['ram_observation'].get('raw_available_bytes')} B "
+                "plan budget="
+                f"{_ws_transition_record['ram_observation'].get('plan_budget_bytes')} B "
+                "inmem required="
+                f"{_ws_transition_record['ram_observation'].get('inmem_required_bytes')} B "
+                "ram_tile required="
+                f"{_ws_transition_record['ram_observation'].get('ram_tile_required_bytes')} B. "
+                "Committed Cells are untouched; only pending Cells run under "
+                "the new class. Scientific identity unchanged "
+                f"(identity_sha256={_ws_transition_record['identity_sha256']}).",
+                lvl="WARN",
+                callback=progress_callback,
+            )
         _bundle_cids = sorted(
             str(task[0].cell_id) for task in _initial_bundle.cell_tasks
         )
@@ -20209,6 +20473,9 @@ def _run_single(
                             created_unix_ns=_prev_state["created_unix_ns"],
                             note=_prev_state["note"],
                             admission=_prev_state.get("admission"),
+                            working_set_transitions=_prev_state.get(
+                                "working_set_transitions"
+                            ),
                         )
                     except Exception as _ack_exc:
                         _emit(
@@ -22623,6 +22890,11 @@ def _run_single(
                     note=_prev_state["note"],
                     # The frozen admission is never rewritten after creation.
                     admission=_prev_state.get("admission"),
+                    # The explicit class-transition audit trail survives the
+                    # finalization rewrite.
+                    working_set_transitions=_prev_state.get(
+                        "working_set_transitions"
+                    ),
                 )
                 _resume_runtime["finalized_noop"] = False
                 _resume_runtime["outputs"] = dict(_outputs)
