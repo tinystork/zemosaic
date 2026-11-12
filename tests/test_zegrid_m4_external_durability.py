@@ -267,18 +267,24 @@ def test_frozen_tile_and_batch_are_reused_or_refused(tmp_path, monkeypatch):
     )
     assert ok["refused"] is False
     assert ok["tile"] == 16 and ok["column_batch"] == 64
-    bad = zz._select_external_fallback(
+    assert "batch_transition" not in ok
+    # ZM-M33 lot 1 + ZM-ZEGRID-FROZEN-BATCH-SHRINK: a frozen batch merely
+    # larger than the real interior surface is CLAMPED (never refused), and a
+    # batch that still fits the phase budget is kept verbatim with NO recorded
+    # transition. A genuine HOST-RAM shortfall (frozen batch that does not fit)
+    # is covered by the selector/batch-shrink tests.
+    clamped = zz._select_external_fallback(
         permitted_tiles=zz.CPU_STREAMING_TILE_LADDER,
         worst_patch_hw=(40, 40), max_n_frames=10, channels=3,
         budget_bytes=512 * 2 ** 20, halo_px=9, cache_root=str(tmp_path),
         storage_profile="bounded", frozen_tile=16, frozen_batch=10 ** 9,
         observation_domain=zz.rcontract.OBSERVATION_DOMAIN_NET_AVAILABLE,
     )
-    assert bad["refused"] is True
-    # A VALID frozen batch that no longer fits the fresh reduction RAM budget
-    # is a HOST-RAM refusal, never a disk shortfall and never a silent shrink.
-    assert bad["reason"] == "frozen_batch_ram"
-    assert bad["free_bytes"] == 10 ** 12
+    assert clamped["refused"] is False
+    assert clamped["column_batch"] == 10 ** 9  # requested value preserved
+    assert clamped["column_batch_clamped"] is True
+    assert clamped["effective_column_batch"] <= 16 * 16 * 3
+    assert "batch_transition" not in clamped
 
 
 # ---------------------------------------------------------------------------

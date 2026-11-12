@@ -1424,13 +1424,14 @@ def test_selector_distinguishes_frozen_batch_ram_from_invalid(
     # ZM-M33 lot 1: the batch is now priced on the REAL interior surface, so an
     # absurd frozen ``column_batch`` can no longer inflate the peak. A genuine
     # HOST-RAM shortfall therefore needs a tile whose honest interior batch does
-    # not fit (the qualified 128 px tile over a 160 px patch).
+    # not fit AND that cannot shrink (40 000 frames: one position alone already
+    # exceeds the phase-local residual).
     kwargs = dict(
         permitted_tiles=(128,),
         worst_patch_hw=(160, 160),
-        max_n_frames=100,
+        max_n_frames=40_000,
         channels=3,
-        budget_bytes=512 * MIB,
+        budget_bytes=7_475_000,
         halo_px=8,
         cache_root=str(tmp_path / "cache"),
         storage_profile="bounded",
@@ -1443,6 +1444,7 @@ def test_selector_distinguishes_frozen_batch_ram_from_invalid(
     assert ram["reason"] == "frozen_batch_ram"
     assert ram["free_bytes"] == 77 * GIB
     assert "HOST RAM" in ram["detail"]
+    assert "batch_transition" not in ram
 
     invalid = zz._select_external_fallback(
         **kwargs, frozen_tile=128, frozen_batch=0

@@ -82,6 +82,28 @@ WORKING_SET_TRANSITION_REQUIRED = (
     "recorded_unix_ns",
 )
 
+# ZM-ZEGRID-FROZEN-BATCH-SHRINK: the ONLY column-batch transition a resume may
+# perform. It is strictly SHRINK-ONLY (``to_batch < from_batch``), never a
+# growth and never a class/tile change, and it is recorded from/to with the
+# EXACT host peak and phase budget that forced it. The batch is a staging
+# parameter (bit-identical payloads across batch sizes proven on real data);
+# the scientific identity is never touched.
+COLUMN_BATCH_TRANSITION_SCHEMA = "zegrid-column-batch-transition-v1"
+COLUMN_BATCH_TRANSITION_REQUIRED = (
+    "schema",
+    "from_batch",
+    "to_batch",
+    "frozen_batch",
+    "required_peak_bytes",
+    "admitted_peak_bytes",
+    "phase_budget_bytes",
+    "reason",
+    "plan_generation",
+    "identity_sha256",
+    "identity_unchanged",
+    "recorded_unix_ns",
+)
+
 
 class ResumeError(RuntimeError):
     """Base class for every explicit resume refusal (never silent)."""
@@ -567,6 +589,110 @@ def validate_working_set_transition(raw: Any) -> dict:
     }
 
 
+def validate_column_batch_transition(raw: Any) -> dict:
+    """Validate ONE recorded SHRINK-ONLY frozen column-batch transition.
+
+    The record is additive evidence, never a second source of scientific
+    identity. It names the exact from/to/frozen batches, the EXACT host peak
+    the frozen value required, the phase-local budget that refused it, the
+    peak the admitted batch actually needs, the reason and the (unchanged)
+    identity digest. It enforces the same discipline as the class downgrade:
+    strictly smaller, never a growth, never a class/tile change.
+    """
+    _strict_keys(
+        raw, "column_batch_transitions[]", COLUMN_BATCH_TRANSITION_REQUIRED
+    )
+    if raw["schema"] != COLUMN_BATCH_TRANSITION_SCHEMA:
+        raise ResumeStateError(
+            f"column-batch transition schema {raw['schema']!r} != "
+            f"{COLUMN_BATCH_TRANSITION_SCHEMA!r}"
+        )
+    from_batch = _as_int(
+        raw["from_batch"], "column_batch_transitions[].from_batch", minimum=1
+    )
+    to_batch = _as_int(
+        raw["to_batch"], "column_batch_transitions[].to_batch", minimum=1
+    )
+    frozen_batch = _as_int(
+        raw["frozen_batch"],
+        "column_batch_transitions[].frozen_batch",
+        minimum=1,
+    )
+    if int(frozen_batch) != int(from_batch):
+        raise ResumeStateError(
+            "column_batch_transitions[].frozen_batch must equal from_batch: "
+            "the transition describes the value it shrinks away from"
+        )
+    if int(to_batch) >= int(from_batch):
+        raise ResumeStateError(
+            "column_batch_transitions[].to_batch must be STRICTLY smaller "
+            f"than from_batch ({to_batch} >= {from_batch}); the frozen batch "
+            "is never grown or re-sized upward"
+        )
+    required_peak = _as_int(
+        raw["required_peak_bytes"],
+        "column_batch_transitions[].required_peak_bytes",
+        minimum=1,
+    )
+    admitted_peak = _as_int(
+        raw["admitted_peak_bytes"],
+        "column_batch_transitions[].admitted_peak_bytes",
+        minimum=1,
+    )
+    phase_budget = _as_int(
+        raw["phase_budget_bytes"],
+        "column_batch_transitions[].phase_budget_bytes",
+        minimum=1,
+    )
+    if int(required_peak) <= int(phase_budget):
+        raise ResumeStateError(
+            "column_batch_transitions[].required_peak_bytes must EXCEED the "
+            "phase budget; the frozen batch was shrunk although it fitted"
+        )
+    if int(admitted_peak) > int(phase_budget):
+        raise ResumeStateError(
+            "column_batch_transitions[].admitted_peak_bytes must fit the "
+            "phase budget; a transition that does not fit admits nothing"
+        )
+    reason = str(raw["reason"])
+    if not reason.strip():
+        raise ResumeStateError(
+            "column_batch_transitions[].reason must not be empty"
+        )
+    identity_sha = str(raw["identity_sha256"])
+    if not identity_sha:
+        raise ResumeStateError(
+            "column_batch_transitions[].identity_sha256 must not be empty"
+        )
+    if raw["identity_unchanged"] is not True:
+        raise ResumeStateError(
+            "column_batch_transitions[].identity_unchanged must be True: the "
+            "column batch is a staging parameter, never a science parameter"
+        )
+    return {
+        "schema": COLUMN_BATCH_TRANSITION_SCHEMA,
+        "from_batch": int(from_batch),
+        "to_batch": int(to_batch),
+        "frozen_batch": int(frozen_batch),
+        "required_peak_bytes": int(required_peak),
+        "admitted_peak_bytes": int(admitted_peak),
+        "phase_budget_bytes": int(phase_budget),
+        "reason": reason,
+        "plan_generation": _as_int(
+            raw["plan_generation"],
+            "column_batch_transitions[].plan_generation",
+            minimum=0,
+        ),
+        "identity_sha256": identity_sha,
+        "identity_unchanged": True,
+        "recorded_unix_ns": _as_int(
+            raw["recorded_unix_ns"],
+            "column_batch_transitions[].recorded_unix_ns",
+            minimum=0,
+        ),
+    }
+
+
 def build_admission(
     *,
     backend: Any,
@@ -595,7 +721,7 @@ def validate_state(raw: Any) -> dict:
             "expected_cell_ids", "policy", "plan_generation", "finalized",
         ),
         ("gauge_sha256", "outputs", "note", "admission",
-         "working_set_transitions"),
+         "working_set_transitions", "column_batch_transitions"),
     )
     if raw["schema"] != RESUME_STATE_SCHEMA:
         raise ResumeStateError(
@@ -690,6 +816,59 @@ def validate_state(raw: Any) -> dict:
                     f"{working_set.get('class')!r}; the state would describe a "
                     "class the admission does not claim"
                 )
+    # ZM-ZEGRID-FROZEN-BATCH-SHRINK: the optional, append-only audit trail of
+    # SHRINK-ONLY column-batch transitions. Absent for every pre-existing store
+    # (byte-compatible); never fabricated on load. The chain must be strictly
+    # decreasing and its LAST ``to_batch`` must be the batch the admission now
+    # claims, otherwise the state would describe a batch the run never used.
+    if raw.get("column_batch_transitions") is not None:
+        transitions = raw["column_batch_transitions"]
+        if not isinstance(transitions, list):
+            raise ResumeStateError(
+                "resume state.column_batch_transitions must be a list"
+            )
+        records = [
+            validate_column_batch_transition(item) for item in transitions
+        ]
+        previous_to = None
+        for index, record in enumerate(records):
+            if previous_to is not None:
+                if int(record["from_batch"]) != int(previous_to):
+                    raise ResumeStateError(
+                        "resume state.column_batch_transitions is not a "
+                        f"contiguous shrink chain at index {index}: from_batch "
+                        f"{record['from_batch']} != previous to_batch "
+                        f"{previous_to}"
+                    )
+            previous_to = int(record["to_batch"])
+        normalised["column_batch_transitions"] = records
+        if records:
+            admission = normalised.get("admission")
+            working_set = (
+                None if admission is None else admission.get("working_set")
+            )
+            if working_set is None:
+                raise ResumeStateError(
+                    "resume state records a column-batch shrink but its "
+                    "admission has no working-set section; the state is "
+                    "internally inconsistent"
+                )
+            if str(working_set.get("class")) != "external_spool":
+                raise ResumeStateError(
+                    "resume state records a column-batch shrink but "
+                    "admission.working_set.class is "
+                    f"{working_set.get('class')!r}; only the external_spool "
+                    "class carries a column batch"
+                )
+            if int(working_set.get("column_batch") or 0) != int(
+                records[-1]["to_batch"]
+            ):
+                raise ResumeStateError(
+                    "resume state column-batch transition ends at "
+                    f"{records[-1]['to_batch']} but admission.working_set"
+                    f".column_batch is {working_set.get('column_batch')!r}; "
+                    "the state would describe a batch the run never admitted"
+                )
     return normalised
 
 
@@ -728,6 +907,7 @@ def write_state(
     note: str | None = None,
     admission: Mapping[str, Any] | None = None,
     working_set_transitions: Iterable[Mapping[str, Any]] | None = None,
+    column_batch_transitions: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict:
     """Atomically persist the frozen expected set, policy and admission.
 
@@ -760,6 +940,11 @@ def write_state(
         payload["working_set_transitions"] = [
             validate_working_set_transition(item)
             for item in working_set_transitions
+        ]
+    if column_batch_transitions is not None:
+        payload["column_batch_transitions"] = [
+            validate_column_batch_transition(item)
+            for item in column_batch_transitions
         ]
     state = validate_state(payload)
     tmp_dir = root / "tmp"
@@ -901,6 +1086,157 @@ def record_working_set_downgrade(
         note=state.get("note"),
         admission=new_admission,
         working_set_transitions=list(prior) + [record],
+        column_batch_transitions=state.get("column_batch_transitions"),
+    )
+    return record
+
+
+def record_column_batch_shrink(
+    run_root: str | os.PathLike[str],
+    *,
+    transition: Mapping[str, Any],
+    identity_sha256: str,
+) -> dict:
+    """Persist ONE explicit SHRINK-ONLY frozen column-batch transition.
+
+    The caller has already proven (in the planner, with the SAME exact host
+    accounting the ``frozen_batch_ram`` refusal uses) that the frozen batch no
+    longer fits the phase-local budget while a strictly SMALLER one does. This
+    function:
+
+    * refuses anything except ``external_spool`` with a frozen column batch;
+    * refuses a non-shrink (``to_batch >= from_batch``) or a from_batch that
+      is not the batch the admission currently claims;
+    * preserves ``backend``/``tile_px``/``parity_qualified`` byte-for-byte and
+      keeps the class/tile untouched;
+    * rewrites ONLY ``admission.working_set.column_batch`` to the admitted
+      smaller value, so a later resume starts from the batch it actually uses;
+    * appends the explicit record (from/to/frozen, required/admitted peak,
+      phase budget, reason, plan generation, identity digest, unchanged flag)
+      to the state.
+
+    The scientific identity is never touched: the column batch is a staging
+    parameter and is not part of ``identity_fingerprints``.
+    """
+    state = read_state(run_root)
+    admission = state.get("admission")
+    if admission is None:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: the run has no frozen "
+            "admission"
+        )
+    existing = admission.get("working_set")
+    if existing is None:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: the frozen admission has no "
+            "working-set section"
+        )
+    if str(existing.get("class")) != "external_spool":
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: the frozen class "
+            f"{existing.get('class')!r} carries no column batch"
+        )
+    current_batch = existing.get("column_batch")
+    if current_batch is None:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: the frozen external "
+            "working set has no column_batch"
+        )
+    proposal = dict(transition)
+    from_batch = int(proposal.get("from_batch") or 0)
+    to_batch = int(proposal.get("to_batch") or 0)
+    frozen_batch = int(proposal.get("frozen_batch") or 0)
+    if int(current_batch) != from_batch:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: the frozen batch "
+            f"{current_batch!r} is not the transition's from_batch "
+            f"{from_batch!r}"
+        )
+    if from_batch < 1 or to_batch < 1 or frozen_batch != from_batch:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: malformed from/to/frozen "
+            f"batch ({from_batch!r}, {to_batch!r}, {frozen_batch!r})"
+        )
+    if to_batch >= from_batch:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: the frozen batch is never "
+            f"grown or kept ({to_batch} >= {from_batch})"
+        )
+    required_peak = int(proposal.get("required_peak_bytes") or 0)
+    admitted_peak = int(proposal.get("admitted_peak_bytes") or 0)
+    phase_budget = int(proposal.get("phase_budget_bytes") or 0)
+    if required_peak < 1 or admitted_peak < 1 or phase_budget < 1:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: the peak/budget accounting "
+            "is missing or non-positive"
+        )
+    if admitted_peak > phase_budget or required_peak <= phase_budget:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: required_peak must exceed "
+            "the phase budget and the admitted peak must fit it "
+            f"(required={required_peak}, admitted={admitted_peak}, "
+            f"budget={phase_budget})"
+        )
+    reason = str(proposal.get("reason") or "")
+    if not reason.strip():
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: reason must not be empty"
+        )
+    durable_sha = _durable_identity_sha256(run_root)
+    supplied_sha = str(identity_sha256)
+    if supplied_sha != durable_sha:
+        raise ResumeStateError(
+            "cannot record a column-batch shrink: the supplied identity_sha256 "
+            f"{supplied_sha!r} does not match the store's durable identity "
+            f"{durable_sha!r}; the record would carry false provenance"
+        )
+    prior = list(state.get("column_batch_transitions") or [])
+    if prior:
+        if int(prior[-1]["to_batch"]) != from_batch:
+            raise ResumeStateError(
+                "cannot record a column-batch shrink: the last recorded "
+                f"to_batch {prior[-1]['to_batch']!r} is not the frozen batch "
+                f"{from_batch!r}; the shrink chain is not contiguous"
+            )
+    record = {
+        "schema": COLUMN_BATCH_TRANSITION_SCHEMA,
+        "from_batch": int(from_batch),
+        "to_batch": int(to_batch),
+        "frozen_batch": int(frozen_batch),
+        "required_peak_bytes": int(required_peak),
+        "admitted_peak_bytes": int(admitted_peak),
+        "phase_budget_bytes": int(phase_budget),
+        "reason": reason,
+        "plan_generation": int(state["plan_generation"]),
+        "identity_sha256": durable_sha,
+        "identity_unchanged": True,
+        "recorded_unix_ns": int(time.time_ns()),
+    }
+    validate_column_batch_transition(record)
+    new_admission = build_admission(
+        backend=admission["backend"],
+        tile_px=admission["tile_px"],
+        parity_qualified=admission["parity_qualified"],
+        working_set={
+            "class": str(existing["class"]),
+            "tile_px": int(existing["tile_px"]),
+            "column_batch": int(to_batch),
+        },
+    )
+    write_state(
+        run_root,
+        run_id=state["run_id"],
+        expected_cell_ids=state["expected_cell_ids"],
+        policy=state["policy"],
+        plan_generation=int(state["plan_generation"]),
+        finalized=bool(state["finalized"]),
+        gauge_sha256=state.get("gauge_sha256"),
+        outputs=state.get("outputs"),
+        created_unix_ns=int(state["created_unix_ns"]),
+        note=state.get("note"),
+        admission=new_admission,
+        working_set_transitions=state.get("working_set_transitions"),
+        column_batch_transitions=prior + [record],
     )
     return record
 
@@ -956,6 +1292,7 @@ def attach_working_set(
         note=state.get("note"),
         admission=new_admission,
         working_set_transitions=state.get("working_set_transitions"),
+        column_batch_transitions=state.get("column_batch_transitions"),
     )
 
 
@@ -988,6 +1325,8 @@ def update_policy(
         admission=state.get("admission"),
         # ... and the explicit class-transition audit trail is never dropped.
         working_set_transitions=state.get("working_set_transitions"),
+        # ... neither is the explicit column-batch shrink audit trail.
+        column_batch_transitions=state.get("column_batch_transitions"),
     )
 
 
@@ -1518,6 +1857,9 @@ class ResumeBootstrap:
             admission=self.state.get("admission"),
             working_set_transitions=self.state.get(
                 "working_set_transitions"
+            ),
+            column_batch_transitions=self.state.get(
+                "column_batch_transitions"
             ),
         )
         return self.state

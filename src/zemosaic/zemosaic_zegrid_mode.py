@@ -7437,6 +7437,7 @@ def _select_external_fallback(
     trials = []
     best = None
     priced_any = False
+    batch_transition = None
     floor_fixed = 0
     floor_residual = None
     floor_host = {}
@@ -7557,56 +7558,106 @@ def _select_external_fallback(
         host_peak = int(host["peak_bytes"])
         if host_peak > int(effective_phase_budget):
             if frozen_batch is not None:
-                return {
-                    "refused": True, "reason": "frozen_batch_ram",
-                    "detail": (
-                        f"frozen column_batch {batch} yields a host peak of "
-                        f"{host_peak} B but only {effective_phase_budget} B "
-                        "remain in the phase-local budget (the process baseline "
-                        "is already excluded from current available and the "
-                        "later assembly is separately admitted); refusing to "
-                        "shrink the frozen identity silently (HOST RAM)"
-                    ),
-                    "trials": [],
-                    "free_bytes": int(free),
-                    "required_reduction_bytes": int(
-                        host["reduction_batch_bytes"]
-                    ),
-                    "reduction_budget_bytes": int(effective_phase_budget),
-                    "residual_batch_budget_bytes": int(residual),
+                # ZM-ZEGRID-FROZEN-BATCH-SHRINK: the frozen batch is a
+                # STAGING parameter (bit-identical payloads proven across batch
+                # sizes on real data), so a resume may re-derive a SMALLER one
+                # with the SAME exact host accounting this refusal already uses.
+                # Growth, class and tile are never touched; when no smaller
+                # batch fits, the refusal below stays byte-identical.
+                _frozen_batch = int(batch)
+                _frozen_host = host
+                _frozen_host_peak = int(host_peak)
+                _shrink = zext.shrink_frozen_column_batch(
+                    frozen_batch=_frozen_batch,
+                    phase_budget_bytes=int(effective_phase_budget),
+                    n_frames=int(max_n_frames),
+                    height=int(worst_patch_hw[0]),
+                    width=int(worst_patch_hw[1]),
+                    channels=int(channels),
+                    tile_size=int(tile),
+                    halo_px=int(halo_px),
+                    equalize_rgb=bool(equalize_rgb),
+                    rejection=str(rejection),
+                    combine=str(combine),
+                )
+                if _shrink is not None:
+                    # Accept the FIRST (largest) smaller batch that fits; it is
+                    # re-priced here so the published peak is the one this
+                    # decision actually admits.
+                    pricing = zext.estimate_external_working_set(
+                        n_frames=int(max_n_frames),
+                        height=int(worst_patch_hw[0]),
+                        width=int(worst_patch_hw[1]),
+                        channels=int(channels),
+                        tile_size=int(tile),
+                        halo_px=int(halo_px),
+                        column_batch=int(_shrink["to_batch"]),
+                        equalize_rgb=bool(equalize_rgb),
+                        rejection=str(rejection),
+                        combine=str(combine),
+                    )
+                    host = pricing["host"]
+                    host_peak = int(host["peak_bytes"])
+                    if host_peak <= int(effective_phase_budget):
+                        batch = int(_shrink["to_batch"])
+                        batch_transition = dict(_shrink)
+                if batch_transition is None:
+                    # No smaller batch fits: today's refusal, byte-identical
+                    # (the frozen batch and its exact priced peak are restored).
+                    batch = _frozen_batch
+                    host = _frozen_host
+                    host_peak = _frozen_host_peak
+                    return {
+                        "refused": True, "reason": "frozen_batch_ram",
+                        "detail": (
+                            f"frozen column_batch {batch} yields a host peak of "
+                            f"{host_peak} B but only {effective_phase_budget} B "
+                            "remain in the phase-local budget (the process baseline "
+                            "is already excluded from current available and the "
+                            "later assembly is separately admitted); refusing to "
+                            "shrink the frozen identity silently (HOST RAM)"
+                        ),
+                        "trials": [],
+                        "free_bytes": int(free),
+                        "required_reduction_bytes": int(
+                            host["reduction_batch_bytes"]
+                        ),
+                        "reduction_budget_bytes": int(effective_phase_budget),
+                        "residual_batch_budget_bytes": int(residual),
+                        "host_fixed_bytes": int(host_fixed),
+                        "host_peak_bytes": int(host_peak),
+                        "host_components": dict(host),
+                        "budget_domain": str(budget_domain),
+                        "phase_budgets": _external_phase_budget_block(
+                            budget_domain=budget_domain,
+                            plan_budget_bytes=int(budget_bytes),
+                            margin_num=margin_num,
+                            margin_den=margin_den,
+                            effective_phase_budget=int(effective_phase_budget),
+                            charged_baseline_bytes=charged_baseline_bytes,
+                            charged_assembly_bytes=charged_assembly_bytes,
+                            assembly_reserve_excluded_bytes=int(fixed_overlap_bytes),
+                            host_fixed_bytes=host_fixed,
+                            reduce_fixed_bytes=reduce_fixed,
+                            residual_batch_budget_bytes=residual,
+                            host_peak_bytes=host_peak,
+                            host_components=host,
+                        ),
+                    }
+            else:
+                trials.append({
+                    "tile": int(tile), "fits": False,
+                    "reason_code": "host_peak_over_budget",
                     "host_fixed_bytes": int(host_fixed),
+                    "reduce_fixed_bytes": int(reduce_fixed),
+                    "residual_batch_budget_bytes": int(residual),
                     "host_peak_bytes": int(host_peak),
-                    "host_components": dict(host),
-                    "budget_domain": str(budget_domain),
-                    "phase_budgets": _external_phase_budget_block(
-                        budget_domain=budget_domain,
-                        plan_budget_bytes=int(budget_bytes),
-                        margin_num=margin_num,
-                        margin_den=margin_den,
-                        effective_phase_budget=int(effective_phase_budget),
-                        charged_baseline_bytes=charged_baseline_bytes,
-                        charged_assembly_bytes=charged_assembly_bytes,
-                        assembly_reserve_excluded_bytes=int(fixed_overlap_bytes),
-                        host_fixed_bytes=host_fixed,
-                        reduce_fixed_bytes=reduce_fixed,
-                        residual_batch_budget_bytes=residual,
-                        host_peak_bytes=host_peak,
-                        host_components=host,
+                    "detail": (
+                        f"column_batch {batch} yields host peak {host_peak} B > "
+                        f"phase budget {effective_phase_budget} B"
                     ),
-                }
-            trials.append({
-                "tile": int(tile), "fits": False,
-                "reason_code": "host_peak_over_budget",
-                "host_fixed_bytes": int(host_fixed),
-                "reduce_fixed_bytes": int(reduce_fixed),
-                "residual_batch_budget_bytes": int(residual),
-                "host_peak_bytes": int(host_peak),
-                "detail": (
-                    f"column_batch {batch} yields host peak {host_peak} B > "
-                    f"phase budget {effective_phase_budget} B"
-                ),
-            })
-            continue
+                })
+                continue
         envelope = int(
             pricing["disk"]["spool_peak_bytes_worst_tile"]
             + resident_unit
@@ -7654,6 +7705,12 @@ def _select_external_fallback(
                 "host_fixed_bytes": int(host_fixed),
                 "host_peak_bytes": int(host_peak),
                 "host_components": dict(host),
+                # Only present when a shrink actually happened: a fresh run and
+                # a fitting frozen batch keep their exact previous shape.
+                **(
+                    {"batch_transition": dict(batch_transition)}
+                    if batch_transition else {}
+                ),
                 # The aligned cache is not a disk cost here (source-backed);
                 # publish the exact resident staging unit instead.
                 "resident_unit_bytes": int(resident_unit),
@@ -7858,6 +7915,16 @@ def _working_set_block(
         "gpu": {"used": bool(gpu_used), "tile_size": gpu_tile},
         "disk": disk,
         "refusal": (None if refusal is None else dict(refusal)),
+        **(
+            {
+                "batch_transition": dict(
+                    external.get("batch_transition")
+                )
+            }
+            if external is not None
+            and external.get("batch_transition")
+            else {}
+        ),
     }
 
 
@@ -8855,6 +8922,20 @@ def _build_execution_bundle(
                 ),
                 "phase_budgets": dict(
                     external_selection.get("phase_budgets") or {}
+                ),
+                # ZM-ZEGRID-FROZEN-BATCH-SHRINK: the explicit, additive record
+                # of a shrink-only batch re-derivation (absent for a fresh run
+                # and for a fitting frozen batch). It travels selector -> task
+                # -> ACTIVE scheduler -> manifest and is persisted durably at
+                # the resume boundary.
+                **(
+                    {
+                        "batch_transition": dict(
+                            external_selection["batch_transition"]
+                        )
+                    }
+                    if external_selection.get("batch_transition")
+                    else {}
                 ),
                 "owner_token": _owner_token,
                 "owner_record": dict(_owner_record),
@@ -20596,6 +20677,90 @@ def _run_single(
                 lvl="WARN",
                 callback=progress_callback,
             )
+        # ZM-ZEGRID-FROZEN-BATCH-SHRINK: persist the SHRINK-ONLY frozen
+        # column-batch re-derivation BEFORE any pending Cell runs. The frozen
+        # class/backend/tile are untouched; the batch is a staging parameter
+        # (bit-identical payloads across batch sizes on real data), so the
+        # scientific identity is unchanged. The record is explicit in the
+        # durable state, the manifest working-set block and ONE WARN log line.
+        # A fresh run and a fitting frozen batch reach this point with NO
+        # proposal and are byte-identical to before.
+        _batch_transition_proposal = (
+            _ws_block_now.get("batch_transition")
+            if isinstance(_ws_block_now, dict) else None
+        )
+        if not _batch_transition_proposal:
+            _ws_contract_now = getattr(
+                _ws_scope_bundle_now, "external_contract", None
+            )
+            if isinstance(_ws_contract_now, dict):
+                _batch_transition_proposal = _ws_contract_now.get(
+                    "batch_transition"
+                )
+        if _batch_transition_proposal:
+            try:
+                _batch_transition_record = zres.record_column_batch_shrink(
+                    _store.root,
+                    transition=_batch_transition_proposal,
+                    identity_sha256=zrs.identity_sha256(_store_identity),
+                )
+            except zres.ResumeError as _batch_transition_exc:
+                _emit(
+                    "ZeGrid: resume REFUSED — the approved frozen "
+                    "column-batch shrink could not be recorded durably "
+                    f"({type(_batch_transition_exc).__name__}: "
+                    f"{_batch_transition_exc}); no pending Cell was executed.",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
+                raise
+            _batch_record_targets = [_final]
+            if _r55_active_bundle is not None:
+                _batch_record_targets.append(_r55_active_bundle)
+            if _initial_bundle is not None:
+                _batch_record_targets.append(_initial_bundle)
+            for _batch_target in _batch_record_targets:
+                _batch_target_block = getattr(
+                    _batch_target, "working_set_block", None
+                )
+                if not isinstance(_batch_target_block, dict):
+                    continue
+                _batch_target_block["batch_transition"] = dict(
+                    _batch_transition_record
+                )
+                _batch_target_layout = getattr(_batch_target, "layout", None)
+                if (
+                    isinstance(_batch_target_layout, dict)
+                    and isinstance(
+                        _batch_target_layout.get("working_set"), dict
+                    )
+                ):
+                    _batch_target_layout["working_set"][
+                        "batch_transition"
+                    ] = dict(_batch_transition_record)
+            _emit(
+                "ZeGrid: frozen column_batch SHRUNK on resume — "
+                f"{_batch_transition_record['from_batch']} -> "
+                f"{_batch_transition_record['to_batch']} "
+                "(frozen_batch="
+                f"{_batch_transition_record['frozen_batch']}, "
+                "required_peak="
+                f"{_batch_transition_record['required_peak_bytes']} B, "
+                "phase_budget="
+                f"{_batch_transition_record['phase_budget_bytes']} B, "
+                "admitted_peak="
+                f"{_batch_transition_record['admitted_peak_bytes']} B, "
+                "plan_generation="
+                f"{_batch_transition_record['plan_generation']}); "
+                "reason: "
+                f"{_batch_transition_record['reason']}. The batch is a "
+                "staging parameter only; class/backend/tile and the "
+                "scientific identity are unchanged "
+                f"(identity_sha256={_batch_transition_record['identity_sha256']}). "
+                "Committed Cells are untouched; only pending Cells run.",
+                lvl="WARN",
+                callback=progress_callback,
+            )
         _bundle_cids = sorted(
             str(task[0].cell_id) for task in _initial_bundle.cell_tasks
         )
@@ -20766,6 +20931,11 @@ def _run_single(
                             admission=_prev_state.get("admission"),
                             working_set_transitions=_prev_state.get(
                                 "working_set_transitions"
+                            ),
+                            # The explicit column-batch shrink audit trail
+                            # survives the publication-ack rewrite.
+                            column_batch_transitions=_prev_state.get(
+                                "column_batch_transitions"
                             ),
                         )
                     except Exception as _ack_exc:
@@ -23189,6 +23359,11 @@ def _run_single(
                     # finalization rewrite.
                     working_set_transitions=_prev_state.get(
                         "working_set_transitions"
+                    ),
+                    # The explicit column-batch shrink audit trail survives the
+                    # finalization rewrite too.
+                    column_batch_transitions=_prev_state.get(
+                        "column_batch_transitions"
                     ),
                 )
                 _resume_runtime["finalized_noop"] = False

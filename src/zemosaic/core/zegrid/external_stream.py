@@ -129,6 +129,7 @@ __all__ = [
     "validate_tile",
     "estimate_external_working_set",
     "largest_admissible_column_batch",
+    "shrink_frozen_column_batch",
     "reduce_spooled_tile",
     "run_cell_streaming_external",
 ]
@@ -1482,6 +1483,152 @@ def estimate_external_working_set(
             "read_bytes_per_cell": int(round(cumulative_writes * amplification)),
         },
     }
+
+
+def shrink_frozen_column_batch(
+    *,
+    frozen_batch: int,
+    phase_budget_bytes: int,
+    n_frames: int,
+    height: int,
+    width: int,
+    channels: int,
+    tile_size,
+    halo_px: int,
+    equalize_rgb: bool = False,
+    rejection: str = "winsorized_sigma_clip",
+    combine: str = "mean",
+) -> dict | None:
+    """Largest STRICTLY SMALLER batch whose EXACT host peak fits the budget.
+
+    ZM-ZEGRID-FROZEN-BATCH-SHRINK: a resumed ``external_spool`` run freezes its
+    ``column_batch`` at creation. The batch is a STAGING parameter, not a
+    science parameter (bit-identical payloads proven across 8/64/512 on real
+    M106 data), so a resume may re-derive a SMALLER one when, and only when,
+    the frozen value no longer fits the phase-local budget.
+
+    The ladder is finite, deterministic and derived from the SAME accounting
+    the ``frozen_batch_ram`` refusal already uses:
+
+    1. the exact admissible-batch inversion
+       (:func:`largest_admissible_column_batch`) over the residual budget
+       ``phase_budget_bytes - reduce_fixed_bytes``;
+    2. then the halving cascade of that candidate down to one pixel, always
+       STRICTLY below ``frozen_batch``.
+
+    Every candidate is priced with :func:`estimate_external_working_set` (the
+    SAME host model as the refusal) and the FIRST (largest) candidate whose
+    ``host.peak_bytes`` fits is accepted. Returns ``None`` when the frozen
+    batch already fits (nothing to do, always the case for a fresh run) or
+    when NO smaller batch fits (the caller keeps today's refusal byte-exact).
+    It never returns a value >= ``frozen_batch``.
+    """
+    frozen = _require_int(frozen_batch, "frozen_batch", minimum=1)
+    budget = _require_int(phase_budget_bytes, "phase_budget_bytes", minimum=1)
+    n = _require_int(n_frames, "n_frames", minimum=1)
+    h = _require_int(height, "height", minimum=1)
+    w = _require_int(width, "width", minimum=1)
+    c = _require_int(channels, "channels", minimum=1)
+    halo = _require_int(halo_px, "halo_px")
+
+    def _price(batch: int) -> dict:
+        return estimate_external_working_set(
+            n_frames=n,
+            height=h,
+            width=w,
+            channels=c,
+            tile_size=tile_size,
+            halo_px=halo,
+            column_batch=int(batch),
+            equalize_rgb=bool(equalize_rgb),
+            rejection=str(rejection),
+            combine=str(combine),
+        )
+
+    frozen_pricing = _price(frozen)
+    frozen_host = frozen_pricing["host"]
+    frozen_peak = int(frozen_host["peak_bytes"])
+    if frozen_peak <= budget:
+        return None
+    reduce_fixed = int(frozen_host["reduce_fixed_bytes"])
+    residual = int(budget) - int(reduce_fixed)
+    tiles, _max_th, _max_tw = _tile_geometry(h, w, tile_size, halo)
+    max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in tiles)
+    max_iw = _max_interior_width(tiles)
+
+    ladder: list[int] = []
+    if residual >= 1:
+        try:
+            inversion = int(
+                largest_admissible_column_batch(
+                    budget_bytes=int(residual),
+                    n_frames=int(n),
+                    interior_width=int(max_iw),
+                    channels=int(c),
+                    fixed_position_bytes=int(
+                        EXTERNAL_BATCH_FIXED_POSITION_BYTES
+                    ),
+                )
+            )
+        except ExternalBudgetError:
+            inversion = 0
+        if 1 <= inversion < frozen:
+            ladder.append(int(inversion))
+            candidate = int(inversion)
+            while candidate > 1:
+                candidate = max(1, candidate // 2)
+                if candidate < frozen and candidate not in ladder:
+                    ladder.append(int(candidate))
+    if 1 < frozen and 1 not in ladder:
+        # The declared floor: ONE pixel (``channels`` positions). It is only
+        # reached when every larger rung failed the exact host pricing.
+        ladder.append(1)
+    trials: list[dict] = []
+    for candidate in ladder:
+        if not 1 <= int(candidate) < frozen:
+            continue
+        pricing = _price(candidate)
+        host = pricing["host"]
+        peak = int(host["peak_bytes"])
+        fits = peak <= budget
+        trials.append(
+            {
+                "column_batch": int(candidate),
+                "host_peak_bytes": int(peak),
+                "fits": bool(fits),
+            }
+        )
+        if fits:
+            return {
+                "schema": "zemosaic-zegrid-frozen-batch-shrink-v1",
+                "from_batch": int(frozen),
+                "to_batch": int(candidate),
+                "frozen_batch": int(frozen),
+                "required_peak_bytes": int(frozen_peak),
+                "admitted_peak_bytes": int(peak),
+                "phase_budget_bytes": int(budget),
+                "reduce_fixed_bytes": int(reduce_fixed),
+                "residual_batch_budget_bytes": int(residual),
+                "reason": (
+                    "frozen column_batch "
+                    f"{frozen} yields a host peak of {frozen_peak} B but only "
+                    f"{budget} B remain in the phase-local budget; the "
+                    "largest smaller admissible batch "
+                    f"{candidate} fits at {peak} B (staging-only change, "
+                    "identity unchanged)"
+                ),
+                "ladder": trials,
+                "requested_column_batch": int(
+                    host["requested_column_batch"]
+                ),
+                "effective_column_batch": int(
+                    host["effective_column_batch"]
+                ),
+                "column_batch_clamped": bool(
+                    host["column_batch_clamped"]
+                ),
+            }
+    return None
 
 
 def largest_admissible_column_batch(
