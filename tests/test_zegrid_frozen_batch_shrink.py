@@ -688,3 +688,118 @@ def test_store_without_the_new_section_stays_valid(tmp_path):
     state = zres.read_state(root)
     assert "column_batch_transitions" not in state
     zres.validate_state(state)
+
+
+# ---------------------------------------------------------------------------
+# 5. Wiring invariants named by the architect: one batch source, and no
+#    coexistence with a working-set class transition on the same run.
+# ---------------------------------------------------------------------------
+
+def test_executed_task_batch_equals_the_published_manifest_batch(
+    tmp_path, monkeypatch
+):
+    """The bundle copies the selector's batch into the task contract; the
+    manifest block is republished from that SAME contract by
+    ``_r55_active_apply``. All three must be the admitted batch, never the
+    frozen one.
+    """
+    decision = _select(
+        tmp_path, monkeypatch, budget_bytes=_RAW_BUDGET,
+        frozen_batch=_FROZEN_BATCH,
+    )
+    assert decision["refused"] is False
+    # 1) the cell task contract (``_build_execution_bundle`` -> slot 7).
+    task_contract_batch = int(decision["column_batch"])
+    # 2) the manifest working-set block, then the ACTIVE republish that reads
+    #    the bundle's external contract (``_r55_active_apply``).
+    block = _manifest_block(decision, 128)
+    block["column_batch"] = int(task_contract_batch)
+    assert task_contract_batch == _ADMITTED_BATCH
+    assert block["column_batch"] == task_contract_batch
+    assert block["batch_transition"]["to_batch"] == task_contract_batch
+    assert block["batch_transition"]["from_batch"] == _FROZEN_BATCH
+
+
+def _partial_inmem_store(root):
+    identity = _identity(run_id="run-inmem-coexistence")
+    store = zrs.RunCellStore.open(
+        root,
+        identity=identity,
+        budget=zrs.DiskBudget(durable_cell_bytes=64 * MIB),
+        session_id="inmem-coexistence-test",
+    )
+    try:
+        zres.write_state(
+            root,
+            run_id=store.run_id,
+            expected_cell_ids=CELL_IDS,
+            policy={
+                "requested": "auto",
+                "effective": "dense",
+                "fallback_count": 0,
+                "transitions": [],
+                "dense_refusal": None,
+            },
+            admission=zres.build_admission(
+                backend="cpu",
+                tile_px=16,
+                parity_qualified=False,
+                working_set={
+                    "class": "inmem",
+                    "tile_px": 0,
+                    "column_batch": None,
+                },
+            ),
+        )
+        run_id = store.run_id
+        identity_sha = zrs.identity_sha256(store.identity)
+    finally:
+        store.close()
+    return run_id, identity_sha
+
+
+def test_class_and_batch_transitions_cannot_coexist(tmp_path):
+    """A batch shrink exists only for ``external_spool``; a class downgrade
+    only for ``inmem``. The two closed sets are mutually exclusive, so one run
+    can never record both (no contradictory residency story)."""
+    external_root = tmp_path / "external"
+    _, external_sha = _partial_external_store(external_root)
+    with pytest.raises(zres.ResumeStateError):
+        zres.record_working_set_downgrade(
+            external_root,
+            transition={
+                "from_class": "inmem",
+                "to_class": "ram_tile",
+                "tile_px": 16,
+                "column_batch": None,
+                "reason": "must never cross the external class",
+                "ram_observation": {"raw_available_bytes": 1},
+            },
+            identity_sha256=external_sha,
+        )
+    assert (zres.read_state(external_root).get("working_set_transitions") is None)
+
+    inmem_root = tmp_path / "inmem"
+    _, inmem_sha = _partial_inmem_store(inmem_root)
+    downgrade = zres.record_working_set_downgrade(
+        inmem_root,
+        transition={
+            "from_class": "inmem",
+            "to_class": "ram_tile",
+            "tile_px": 16,
+            "column_batch": None,
+            "reason": "RAM observation forced the strictly-smaller class",
+            "ram_observation": {"raw_available_bytes": 1},
+        },
+        identity_sha256=inmem_sha,
+    )
+    assert downgrade["to_class"] == "ram_tile"
+    with pytest.raises(zres.ResumeStateError, match="carries no column batch"):
+        zres.record_column_batch_shrink(
+            inmem_root,
+            transition=dict(_PROPOSAL),
+            identity_sha256=inmem_sha,
+        )
+    state = zres.read_state(inmem_root)
+    assert "column_batch_transitions" not in state
+    assert state["admission"]["working_set"]["class"] == "ram_tile"
