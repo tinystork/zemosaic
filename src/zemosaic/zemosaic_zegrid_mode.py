@@ -3858,27 +3858,31 @@ def _stack_item_cid(tasks, processed):
         return None
 
 
-def _frozen_planning_gpu(frozen_admission, *, gpu_used):
-    """SINGLE-SOURCED: the planning backend of a run with a FROZEN admission.
+def _effective_run_backend(frozen_admission, *, gpu_used):
+    """SINGLE-SOURCED: the backend THIS run will ACTUALLY execute (cpu|gpu).
 
-    This is the one mapping every planning entry uses (the ``_run_single``
-    launch decision, the auto plan request and the explicit bundle builder), so
-    no entry can bypass it:
+    ZM-ZEGRID-BACKEND-IDENTITY: ONE decision, consumed by every consumer that
+    must reason about the run's backend — the planning entry
+    (:func:`_frozen_planning_gpu`), the launch-time ignore/refusal diagnostics
+    and the durable science identity. They can therefore never disagree.
 
-    * ``frozen_admission is None`` -> ``bool(gpu_used)`` (fresh run or a
-      pre-parity store: today's behaviour is unchanged);
-    * frozen ``"cpu"`` -> ``False`` — the resumed plan MUST be CPU. The run's
-      own identity is CPU-frozen, so GPU enablement/availability is ignored for
-      this launch (never a silent backend switch into a GPU identity);
-    * frozen ``"gpu"`` -> ``True`` when this process selected a GPU, otherwise
+    * ``frozen_admission is None`` -> the selected backend (``gpu_used``): a
+      fresh run or a pre-parity store keeps today's behaviour exactly;
+    * frozen ``"cpu"`` -> ``"cpu"`` — the resumed run MUST execute on CPU. A
+      GPU offered by this host/enablement is IGNORED for this launch (the
+      product already says so); it never switches a frozen run;
+    * frozen ``"gpu"`` -> ``"gpu"`` when this process selected a GPU, otherwise
       the typed fail-closed refusal (a frozen GPU run never silently becomes
-      CPU).
+      CPU);
+    * an unknown frozen token is refused (never guessed).
+
+    The returned token is the EFFECTIVE backend, never the requested one.
     """
     if frozen_admission is None:
-        return bool(gpu_used)
+        return "gpu" if bool(gpu_used) else "cpu"
     backend = str(frozen_admission["backend"])
     if backend == "cpu":
-        return False
+        return "cpu"
     if backend == "gpu":
         if not bool(gpu_used):
             raise zres.ResumeFrozenAdmissionUnavailable(
@@ -3890,7 +3894,7 @@ def _frozen_planning_gpu(frozen_admission, *, gpu_used):
                 frozen_tile_px=int(frozen_admission["tile_px"]),
                 detail="no GPU available for the frozen backend",
             )
-        return True
+        return "gpu"
     raise zres.ResumeFrozenAdmissionUnavailable(
         "resume refused: the FROZEN admission of this run names an unknown "
         f"backend {backend!r}; refusing to plan (no silent backend switch). "
@@ -3899,6 +3903,18 @@ def _frozen_planning_gpu(frozen_admission, *, gpu_used):
         frozen_tile_px=int(frozen_admission["tile_px"]),
         detail="unknown frozen backend",
     )
+
+
+def _frozen_planning_gpu(frozen_admission, *, gpu_used):
+    """Boolean view of :func:`_effective_run_backend` (historical API).
+
+    This is the one mapping every planning entry uses (the ``_run_single``
+    launch decision, the auto plan request and the explicit bundle builder), so
+    no entry can bypass it. ``True`` means the run executes on GPU; ``False``
+    means CPU. A frozen GPU run without a GPU still raises the typed refusal
+    from the single decision above.
+    """
+    return _effective_run_backend(frozen_admission, gpu_used=gpu_used) == "gpu"
 
 
 def _resume_partial_gpu_refusal(
@@ -14811,8 +14827,19 @@ def _r55_build_run_store_identity(
     science_config,
     workers: int | None,
     prefetch_units: int | None,
+    effective_backend: str | None = None,
 ) -> dict:
-    """Build the frozen scientific identity of THIS run (plan §6.1)."""
+    """Build the frozen scientific identity of THIS run (plan §6.1).
+
+    ``effective_backend`` (ZM-ZEGRID-BACKEND-IDENTITY) is the run's EFFECTIVE
+    backend as decided by :func:`_effective_run_backend` (the frozen admission
+    on a resume, the selected backend on a fresh run). It is used ONLY to
+    normalise the ``backend`` field of the science parameters, so a CPU-frozen
+    run resumed on a GPU-enabled host freezes ``backend='cpu'`` exactly like the
+    process that created it. The execution contract itself (``backend`` block /
+    tile) still comes from the run-scope bundle and is never re-derived here.
+    ``None`` keeps the historical behaviour for direct/unit callers.
+    """
     import socket as _socket
 
     frames = []
@@ -14937,6 +14964,30 @@ def _r55_build_run_store_identity(
         science_params = _r55_digest_tree(vars(science_config))
     except TypeError:
         science_params = {"__type__": type(science_config).__name__}
+    # ZM-ZEGRID-BACKEND-IDENTITY: the science block describes the backend the
+    # run ACTUALLY executes, not the one this host requested. The science
+    # config carries the requested backend (``use_gpu`` resolved at launch); on
+    # a resume the frozen admission owns it. Overriding ONLY that field keeps
+    # every genuine science parameter (normalization/weighting/rejection/
+    # combine/kappa/tolerance/winsor/taper/gauge/reference) fail-closed.
+    if effective_backend is not None:
+        _eff_backend = str(effective_backend)
+        if _eff_backend not in ("cpu", "gpu"):
+            raise _R55RunStoreIdentityError(
+                "durable identity: effective backend must be 'cpu' or 'gpu', "
+                f"got {effective_backend!r}"
+            )
+        _contract_backend = str(_execution_contract["backend"])
+        if _eff_backend != _contract_backend:
+            raise _R55RunStoreIdentityError(
+                "durable identity: the effective backend "
+                f"{_eff_backend!r} disagrees with the run-scope bundle "
+                f"contract {_contract_backend!r}; refusing to freeze a "
+                "self-contradicting identity"
+            )
+        if isinstance(science_params, dict) and "backend" in science_params:
+            science_params = dict(science_params)
+            science_params["backend"] = _eff_backend
     science_block = {
         "sha256": _r55_sha256_json(science_params),
         "contract_version": str(
@@ -17377,6 +17428,37 @@ def _run_single(
             or str(_final.gpu_pre_execution_fallback.get("reason"))
         )
         ignored_settings = zin.ignored_settings_present(zconfig, gpu_honoured=False)
+
+    # ZM-ZEGRID-BACKEND-IDENTITY: ONE effective-backend decision for this run,
+    # consumed by the durable science identity below. It is the SAME helper that
+    # gated the plan and drives the ignore/refusal diagnostics (fresh run:
+    # selected backend; resume: frozen admission), so identity and that logic can
+    # never disagree again.
+    _effective_backend = (
+        "gpu"
+        if _frozen_planning_gpu(
+            _frozen_admission, gpu_used=bool(gpu_used)
+        )
+        else "cpu"
+    )
+    _requested_backend = str(getattr(science_config, "backend", "cpu") or "cpu")
+    if _requested_backend != _effective_backend:
+        # Additive diagnostic: requested and effective are explicit. A frozen
+        # run never switches backend; the identity records the EFFECTIVE one.
+        _emit(
+            "ZeGrid: science identity backend — effective="
+            f"{_effective_backend} requested={_requested_backend} "
+            "(frozen admission="
+            f"{None if _frozen_admission is None else _frozen_admission.get('backend')}"
+            "): the durable identity is built from the EFFECTIVE backend",
+            callback=progress_callback,
+        )
+        # The run EXECUTES on the effective backend too: a requested GPU must
+        # never leak into a CPU-frozen resume's per-cell science request (nor a
+        # frozen GPU silently become CPU). Identity and execution therefore
+        # consume the SAME single-source decision, and the frozen science
+        # contract cannot disagree with what actually produced the Cells.
+        science_config = replace(science_config, backend=_effective_backend)
 
     _emit(
         f"ZeGrid: joint plan (ADMITTED, final) — mode={chosen_mode} "
@@ -20565,6 +20647,10 @@ def _run_single(
                 science_config=science_config,
                 workers=workers,
                 prefetch_units=None,
+                # ZM-ZEGRID-BACKEND-IDENTITY: the science block describes the
+                # EFFECTIVE backend (frozen admission on a resume), never the
+                # backend this host requested.
+                effective_backend=_effective_backend,
             )
             _resume_boot.verify_identity(_store_identity)
         except zres.ResumeIncompatible as _resume_exc:
@@ -21030,6 +21116,10 @@ def _run_single(
                 science_config=science_config,
                 workers=workers,
                 prefetch_units=None,
+                # ZM-ZEGRID-BACKEND-IDENTITY: on a fresh run this equals the
+                # requested backend (unchanged identity); the parameter makes
+                # the one decision explicit at every identity build.
+                effective_backend=_effective_backend,
             )
             _store_stage = "store_open"
             _store_budget_bytes = int(

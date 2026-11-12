@@ -1162,8 +1162,113 @@ def test_resume_progress_real_run_starts_from_the_committed_count(tmp_path):
     assert "item=r0001c0001" in final[-1], final[-1]
 
 
-# ---------------------------------------------------------------------------
-# 6c — R4: the published products are DISCOVERABLE at the output root
+def test_cpu_frozen_resume_with_a_gpu_request_proceeds_on_cpu(tmp_path, monkeypatch):
+    """ZM-ZEGRID-BACKEND-IDENTITY end-to-end on a REAL durable run.
+
+    A CPU-frozen store resumed on a host that offers and REQUESTS a GPU must
+    (a) pass the identity check (the stored science digest is unchanged),
+    (b) emit the existing “GPU ignored — CPU-frozen run” warning exactly once,
+    (c) execute only the pending Cells on CPU, leaving the committed ones byte
+    identical, and (d) still publish normally.
+    """
+    corpus = tmp_path / "in"
+    proc = subprocess.run(
+        [sys.executable, str(TINY_CORPUS_TOOL), str(corpus)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    store_root = tmp_path / "store"
+    out = tmp_path / "out"
+    base = dict(
+        zegrid_scheduler_mode="active",
+        zegrid_durable_store_dir=str(store_root),
+        zegrid_resume_run_id=None,
+        zegrid_durable_store_budget_bytes=64 * MIB,
+        zegrid_layout="2x2",
+        zegrid_cell_gauge_mode="global",
+        zegrid_resource_recovery_enabled=False,
+        zegrid_resource_recovery_deadline_s=None,
+        zegrid_sip_mode="keep",
+        temporary_work_dir="",
+    )
+    # 1) The original run is CPU-frozen (no GPU requested).
+    zz.run_zegrid_mode(
+        str(corpus), str(out),
+        zconfig=SimpleNamespace(**base, zegrid_resume_mode="never"),
+        zegrid_halo_px=8, use_gpu=False,
+    )
+    run_json = store_root / "run.json"
+    assert run_json.is_file(), sorted(p.name for p in store_root.iterdir())
+    identity_before = json.loads(run_json.read_text(encoding="utf-8"))
+    science_before = zrs.identity_fingerprints(identity_before)["science"]
+    assert identity_before["science_contract"]["backend"]["backend"] == "cpu"
+
+    # Crash simulation: the LAST two of the four commits disappear.
+    commits = sorted((store_root / "commits").glob("*.json"))
+    assert len(commits) == 4, [p.name for p in commits]
+    kept = {p.name: p.read_bytes() for p in commits[:2]}
+    for path in commits[2:]:
+        path.unlink()
+
+    # 2) This host offers AND requests a GPU. The frozen CPU admission must
+    #    ignore it (never switch backend) and the identity must still match.
+    def fake_probe(_use_gpu, _zconfig):
+        return True, "backend-identity-test", {
+            "available": True,
+            "reason": None,
+            "device": "stub-gpu",
+            "cupy_version": "stub",
+            "vram_total_bytes": 4 * 2**30,
+            "vram_free_bytes": 3 * 2**30,
+        }, 4 * 2**30
+
+    monkeypatch.setattr(zz, "_r55_resolve_gpu_probe", fake_probe)
+    lines: list[str] = []
+    zz.run_zegrid_mode(
+        str(corpus), str(out),
+        lambda *args, **_kwargs: lines.append(str(args[0])),
+        zconfig=SimpleNamespace(**base, zegrid_resume_mode="auto"),
+        zegrid_halo_px=8, use_gpu=True,
+    )
+    resume_lines = [line for line in lines if "ZeGrid resume:" in line]
+    assert resume_lines == [
+        "[ZEGRID] ZeGrid resume: 2/4 cells already committed, 2 to stack"
+    ], resume_lines
+
+    # The existing warning is emitted exactly once (unchanged product contract).
+    ignored = [
+        line for line in lines
+        if "GPU ignored" in line and "CPU-frozen run" in line
+    ]
+    assert len(ignored) == 1, ignored
+    # Additive diagnostics: requested vs effective are distinguishable.
+    identity_lines = [
+        line for line in lines if "science identity backend" in line
+    ]
+    assert len(identity_lines) == 1, identity_lines
+    assert "effective=cpu" in identity_lines[0]
+    assert "requested=gpu" in identity_lines[0]
+
+    # The stored science contract is untouched and still matches the run.
+    identity_after = json.loads(run_json.read_text(encoding="utf-8"))
+    assert zrs.identity_sha256(identity_after) == zrs.identity_sha256(
+        identity_before
+    )
+    assert zrs.identity_fingerprints(identity_after)["science"] == science_before
+
+    # Committed Cells were never re-stacked or rewritten.
+    for name, payload in kept.items():
+        assert (store_root / "commits" / name).read_bytes() == payload
+
+    # The run completed and published a generation.
+    assert (out / zpub.PRODUCTS_JSON_FILENAME).is_file()
+    resume_log = (out / "zegrid_run.log").read_text(encoding="utf-8")
+    progress = [
+        line for line in resume_log.splitlines()
+        if "per_cell_stack" in line and "PROGRESS" in line
+    ]
+    assert progress and "per_cell_stack 2/4" in progress[0]
+    assert "per_cell_stack 1/4" not in resume_log
 # ---------------------------------------------------------------------------
 
 
