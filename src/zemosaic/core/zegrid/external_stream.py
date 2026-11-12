@@ -1812,12 +1812,20 @@ def reduce_spooled_tile(
     low_n_count = 0
     degenerate_count = 0
     tile_iters = 0
+    # ZM-ZEGRID-BATCH-TRUTH-AND-USAGE: the EXECUTED block geometry is recorded
+    # by the reducer itself (not re-derived by a caller). ``max_block_positions``
+    # is the largest live column-batch block this tile actually formed.
+    n_blocks = 0
+    max_block_positions = 0
 
     for a in range(0, h_int, rows_per_batch):
         b = min(h_int, a + rows_per_batch)
         for x0 in range(0, w_int, cols_per_batch):
             x1 = min(w_int, x0 + cols_per_batch)
             npos = (b - a) * (x1 - x0) * c
+            n_blocks += 1
+            if npos > max_block_positions:
+                max_block_positions = int(npos)
             img_b, w_b = _gather_block(
                 images, weights, n, tw, c, iy0, ix0, w_int, a, b, x0, x1
             )
@@ -1930,6 +1938,15 @@ def reduce_spooled_tile(
         "rejected_count": int(rejected_count),
         "low_n_count": int(low_n_count),
         "degenerate_count": int(degenerate_count),
+        # Executed (measured) block geometry: what this tile REALLY reduced.
+        "batch_geometry": {
+            "column_batch": int(column_batch),
+            "interior_hw": [int(h_int), int(w_int)],
+            "rows_per_batch": int(rows_per_batch),
+            "cols_per_batch": int(cols_per_batch),
+            "n_blocks": int(n_blocks),
+            "max_block_positions": int(max_block_positions),
+        },
     }
 
 
@@ -2020,6 +2037,10 @@ def run_cell_streaming_external(
     rejected_count = 0
     low_n_count = 0
     degenerate_count = 0
+    # ZM-ZEGRID-BATCH-TRUTH-AND-USAGE: the reducer reports the block geometry it
+    # ACTUALLY formed for every tile; this is the executed batch truth, never a
+    # re-derivation from the request.
+    executed_tiles: list[dict] = []
 
     spec = ExternalSpoolSpec(
         root=spool_root,
@@ -2123,6 +2144,8 @@ def run_cell_streaming_external(
             rejected_count += int(tile["rejected_count"])
             low_n_count += int(tile["low_n_count"])
             degenerate_count += int(tile["degenerate_count"])
+            if "batch_geometry" in tile:
+                executed_tiles.append(dict(tile["batch_geometry"]))
 
         spool.finalize_manifest(
             taper_kind=taper_kind, taper_px=taper_px, taper_floor=taper_floor
@@ -2139,6 +2162,15 @@ def run_cell_streaming_external(
         if spool_out is not None:
             manifest = spool.load_manifest()
             payload = int(manifest.get("total_payload_bytes", 0))
+            _max_pos = max(
+                (int(g["max_block_positions"]) for g in executed_tiles),
+                default=0,
+            )
+            _max_tile = next(
+                (g for g in executed_tiles
+                 if int(g["max_block_positions"]) == _max_pos),
+                None,
+            )
             spool_out.update({
                 "attempt_id": str(spool.attempt_id),
                 "spool_root": str(spool.root),
@@ -2147,6 +2179,35 @@ def run_cell_streaming_external(
                 "bytes_written": int(payload),
                 "bytes_read": int(payload),
                 "tile_count": int(manifest.get("tile_count", 0)),
+                "executed_batch": {
+                    "schema": "zemosaic-zegrid-executed-batch-v1",
+                    "requested_column_batch": int(column_batch),
+                    "tiles": len(executed_tiles),
+                    "max_block_positions": int(_max_pos),
+                    "max_block_interior_hw": (
+                        None if _max_tile is None
+                        else [int(_max_tile["interior_hw"][0]),
+                              int(_max_tile["interior_hw"][1])]
+                    ),
+                    "rows_per_batch_at_max": (
+                        None if _max_tile is None
+                        else int(_max_tile["rows_per_batch"])
+                    ),
+                    "cols_per_batch_at_max": (
+                        None if _max_tile is None
+                        else int(_max_tile["cols_per_batch"])
+                    ),
+                    "max_blocks_in_one_tile": max(
+                        (int(g["n_blocks"]) for g in executed_tiles),
+                        default=0,
+                    ),
+                    "distinct_rows_per_batch": sorted({
+                        int(g["rows_per_batch"]) for g in executed_tiles
+                    }),
+                    "distinct_cols_per_batch": sorted({
+                        int(g["cols_per_batch"]) for g in executed_tiles
+                    }),
+                },
             })
     except BaseException:
         if not retain_on_failure:

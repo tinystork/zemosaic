@@ -53,6 +53,7 @@ import hashlib
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 import shutil
 import threading
@@ -3531,6 +3532,17 @@ def _run_cell_external(
             lvl="WARN",
             callback=progress_callback,
         )
+    # ZM-ZEGRID-BATCH-TRUTH-AND-USAGE: ONE source of truth at the execution
+    # boundary. ``resolve_column_batch`` (the same resolver the host model and
+    # the published clamp use) yields the batch the admission actually PRICED.
+    # Handing THAT value to the executor removes the silent divergence where an
+    # unexecutable request (a batch taller/wider than one tile interior) was
+    # recorded while a smaller resolved batch really ran. It is a no-op for the
+    # reduction: the executor already bounds every block by the tile's own
+    # interior, and the batch is a staging parameter (bit-identical payloads).
+    _executed_batch = int(column_batch)
+    if _batch_truth is not None:
+        _executed_batch = int(_batch_truth["effective_column_batch"])
     sink = None
     try:
         request = zstream.build_streaming_request(config, provider.n_frames)
@@ -3548,7 +3560,7 @@ def _run_cell_external(
         result = zext.run_cell_streaming_external(
             provider, request,
             tile_size=int(tile_size),
-            column_batch=int(column_batch),
+            column_batch=int(_executed_batch),
             spool_root=str(spool_root),
             fixed=fixed,
             rejection_sink=sink,
@@ -3592,6 +3604,23 @@ def _run_cell_external(
                         if _batch_truth is not None else column_batch
                     ),
                     "column_batch_clamped": bool(
+                        _batch_truth["column_batch_clamped"]
+                        if _batch_truth is not None else False
+                    ),
+                    "executed_column_batch": int(_executed_batch),
+                    "executed_rows_per_batch": int(
+                        _batch_truth["rows_per_batch"]
+                        if _batch_truth is not None else 0
+                    ),
+                    "executed_cols_per_batch": int(
+                        _batch_truth["cols_per_batch"]
+                        if _batch_truth is not None else 0
+                    ),
+                    "executed_batch_positions": int(
+                        _batch_truth["batch_positions"]
+                        if _batch_truth is not None else _executed_batch
+                    ),
+                    "executed_column_batch_clamped_by_tile": bool(
                         _batch_truth["column_batch_clamped"]
                         if _batch_truth is not None else False
                     ),
@@ -6056,7 +6085,18 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         reproject = zxe.get_reproject_path_stats().to_dict()
 
     core = za.crop_all_planes_to_core(mt)
-    peak_rss = zsw.peak_rss_kib()
+    # ZM-ZEGRID-BATCH-TRUTH-AND-USAGE: the per-cell memory telemetry now (a)
+    # reports a TRUE peak on every platform (never a post-hoc current-RSS
+    # sample) and (b) NAMES the process it measured. The external class runs
+    # its reduction in whichever process executes the cell task; this label
+    # makes that explicit instead of leaving a reader to guess.
+    peak_rss, peak_rss_source = zsw.peak_rss_kib_with_source()
+    _peak_pid = int(os.getpid())
+    _parent_proc = mp.parent_process()
+    _peak_role = "coordinator" if _parent_proc is None else "cell_worker"
+    _peak_parent_pid = (
+        None if _parent_proc is None else int(_parent_proc.pid)
+    )
 
     prov = _reference_provenance(
         _STACK_GLOBAL_REF, cell_frame_ids, sres.reference_frame_id,
@@ -6102,7 +6142,46 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             "column_batch_clamped": bool(
                 (external_info or {}).get("column_batch_clamped", False)
             ),
+            # ZM-ZEGRID-BATCH-TRUTH-AND-USAGE: the value the executor REALLY
+            # received (the resolved, priced batch) and the block geometry it
+            # measured. ``column_batch`` above stays the frozen/identity value.
+            "executed_column_batch": int(
+                dict(storage_info.get("external") or {}).get(
+                    "executed_column_batch",
+                    (external_info or {}).get("column_batch", 0),
+                )
+            ),
+            "executed_column_batch_clamped_by_tile": bool(
+                dict(storage_info.get("external") or {}).get(
+                    "executed_column_batch_clamped_by_tile", False
+                )
+            ),
+            # Measured by the reducer itself (one entry per tile).
+            "executed_batch": (
+                None
+                if not isinstance(storage_info.get("external_spool"), dict)
+                else dict(
+                    storage_info["external_spool"].get("executed_batch") or {}
+                ) or None
+            ),
             "spool_root": str((external_info or {}).get("spool_root")),
+        }
+        # The external Cell's headline memory number must name its process and
+        # its provenance, so a reader can never mistake the coordinator's RSS
+        # for the reducer's (or a current sample for a peak).
+        record["memory_peak"] = {
+            "schema": "zemosaic-cell-memory-peak-v1",
+            "peak_rss_kib": int(peak_rss),
+            "source": str(peak_rss_source),
+            "pid": int(_peak_pid),
+            "role": str(_peak_role),
+            "parent_pid": _peak_parent_pid,
+            "is_true_peak": bool(
+                str(peak_rss_source) in (
+                    "resource_ru_maxrss", "psutil_peak_wset",
+                    "proc_status_VmHWM",
+                )
+            ),
         }
     # Additive, request-only: honest intra-cell prefetch ledger. Absent on the
     # CPU path and on every run that did not request it (byte-identical record).
@@ -6142,6 +6221,10 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         "total_bytes": int(manifest.get("total_bytes", 0)),
         "cache_build_s": cache_build_s, "stack_s": stack_s,
         "peak_rss_kib": peak_rss, "cleanup_failed": cleanup_failed,
+        "peak_rss_source": str(peak_rss_source),
+        "peak_rss_pid": int(_peak_pid),
+        "peak_rss_role": str(_peak_role),
+        "peak_rss_parent_pid": _peak_parent_pid,
         "reproject": reproject,
         "cache_dir": str(cache_dir),
         **(
@@ -7780,6 +7863,12 @@ def _select_external_fallback(
                 "requested_column_batch": int(host["requested_column_batch"]),
                 "effective_column_batch": int(host["effective_column_batch"]),
                 "column_batch_clamped": bool(host["column_batch_clamped"]),
+                # ZM-ZEGRID-BATCH-TRUTH-AND-USAGE: the block geometry the host
+                # model PRICED and the executor therefore runs (one source of
+                # truth: ``resolve_column_batch``).
+                "executed_rows_per_batch": int(host["rows_per_batch"]),
+                "executed_cols_per_batch": int(host["cols_per_batch"]),
+                "executed_column_batch": int(host["effective_column_batch"]),
                 "spool_root": str(spool_root),
                 "pricing": pricing,
                 "budget_domain": str(budget_domain),
@@ -7972,6 +8061,35 @@ def _working_set_block(
         "class": str(working_set_class),
         "tile_size": (None if tile is None else int(tile)),
         "column_batch": (None if column_batch is None else int(column_batch)),
+        "requested_column_batch": (
+            None if external is None
+            else int(external.get("requested_column_batch") or 0)
+        ),
+        "column_batch_clamped": (
+            None if external is None
+            else bool(external.get("column_batch_clamped", False))
+        ),
+        # ZM-ZEGRID-BATCH-TRUTH-AND-USAGE: the EXECUTED (resolved, priced) batch.
+        # ``column_batch`` above keeps its historical meaning (the frozen/
+        # requested policy value used for identity and resume validation); this
+        # additive block is what actually runs, so a reader can never price the
+        # request and believe it describes execution.
+        "executed_column_batch": (
+            None if external is None
+            else int(external.get("effective_column_batch") or 0)
+        ),
+        "executed_rows_per_batch": (
+            None if external is None
+            else int(external.get("executed_rows_per_batch") or 0)
+        ),
+        "executed_cols_per_batch": (
+            None if external is None
+            else int(external.get("executed_cols_per_batch") or 0)
+        ),
+        "executed_column_batch_clamped": (
+            None if external is None
+            else bool(external.get("column_batch_clamped", False))
+        ),
         "ram_budget_bytes": int(budget_bytes),
         "raw_available_bytes": int(raw_available_bytes),
         # ZM-EXTERNAL-PHASE-BUDGET: the PHASE-LOCAL admission that actually

@@ -97,24 +97,71 @@ def required_available_bytes(n_contributors: int) -> int:
     return EXTENDED_AVAILABLE_BYTES if n_contributors > DEFAULT_MAX_CONTRIBUTORS else MIN_AVAILABLE_BYTES
 
 
-def peak_rss_kib() -> int:
-    """Peak RSS (KiB) of the current process so far (portable).
+def _proc_status_vmhwm_kib() -> int | None:
+    """Read ``VmHWM`` (Linux kernel high-water RSS) from ``/proc/self/status``."""
+    try:
+        with open("/proc/self/status", "r", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    return int(int(line.split()[1]))
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
-    Uses ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` where available (Linux) and
-    falls back to ``psutil.Process().memory_info().rss`` (current RSS, Windows /
-    non-POSIX) so reporting never crashes on Windows.
+
+def peak_rss_kib_with_source() -> tuple[int, str]:
+    """Peak RSS (KiB) of the CURRENT process, plus the source that produced it.
+
+    ZM-ZEGRID-BATCH-TRUTH-AND-USAGE: the value and its provenance travel
+    together so a published "peak" can never again be a post-hoc current-RSS
+    sample mislabelled as a peak (the historical Windows fallback did exactly
+    that: it read ``memory_info().rss`` AFTER the reduction had released its
+    arrays, which on a real external Cell reported ~1 GiB for a process that
+    had just reduced ~9 GiB).
+
+    Priority (first available wins):
+
+    1. ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` — POSIX true peak (KiB);
+    2. psutil ``memory_info().peak_wset`` — Windows true peak (bytes);
+    3. ``/proc/self/status`` ``VmHWM`` — Linux true peak without ``resource``;
+    4. current ``memory_info().rss`` — explicitly labelled ``*_not_peak``.
     """
     if resource is not None:
         try:
-            return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            if value > 0:
+                return value, "resource_ru_maxrss"
         except Exception:  # pragma: no cover - defensive
             pass
     if psutil is not None:
         try:
-            return int(psutil.Process().memory_info().rss // 1024)
+            info = psutil.Process().memory_info()
+            peak_wset = getattr(info, "peak_wset", None)
+            if peak_wset is not None and int(peak_wset) > 0:
+                return int(int(peak_wset) // 1024), "psutil_peak_wset"
         except Exception:  # pragma: no cover - defensive
             pass
-    return 0
+    hwm = _proc_status_vmhwm_kib()
+    if hwm is not None and hwm > 0:
+        return int(hwm), "proc_status_VmHWM"
+    if psutil is not None:
+        try:
+            return (
+                int(psutil.Process().memory_info().rss // 1024),
+                "psutil_rss_not_peak",
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return 0, "unavailable"
+
+
+def peak_rss_kib() -> int:
+    """Peak RSS (KiB) of the current process so far (portable).
+
+    Thin wrapper over :func:`peak_rss_kib_with_source`; callers that publish
+    the value should publish the source too.
+    """
+    return int(peak_rss_kib_with_source()[0])
 
 
 def _worker_peak_values(worker_peak_kib) -> list[int]:
