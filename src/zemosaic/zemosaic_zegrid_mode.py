@@ -4156,6 +4156,19 @@ def _working_set_downgrade_allowed(from_class, to_class) -> bool:
     return zres.is_working_set_downgrade(from_class, to_class)
 
 
+def _working_set_upgrade_allowed(from_class, to_class) -> bool:
+    """ZM-ZEGRID-CLASS-UPGRADE-RESUME: the ONE permitted class upgrade.
+
+    Thin wrapper over the SINGLE source of truth in :mod:`run_resume`. A resume
+    may leave the single-owner external spool for the RAM streaming class ONLY
+    at this boundary and ONLY after a fresh admission proved the target class
+    fits on the same frozen geometry/halo/memberships/science/tile contract.
+    It is NOT a downgrade (``_working_set_downgrade_allowed`` stays False for
+    this direction) and it is never a speculative or silent move.
+    """
+    return zres.is_working_set_upgrade(from_class, to_class)
+
+
 def _frozen_working_set_mismatch_message(from_class, to_class) -> str:
     """Accurate, actionable wording for each REFUSED transition."""
     from_class = str(from_class)
@@ -4180,10 +4193,13 @@ def _frozen_working_set_mismatch_message(from_class, to_class) -> str:
     if from_class == WORKING_SET_EXTERNAL:
         return (
             "frozen working-set class 'external_spool' cannot be re-derived as "
-            f"{to_class!r} on this resume; the external class is never left on "
-            "resume (that would silently change where the run stages its "
-            "data). Remedy: resume with the external spool available, or start "
-            "a new run/output folder."
+            f"{to_class!r} on this resume; the external class is never left "
+            "silently. The ONLY permitted exit is the approved resume upgrade "
+            "external_spool -> ram_tile, and only when a FRESH admission on "
+            "this host proves the SAME frozen geometry/halo/memberships/"
+            "science/tile contract fits. Remedy: free enough memory so the "
+            "frozen external spool fits on this host again, or start a new "
+            "run/output folder."
         )
     return (
         f"frozen working-set class {from_class!r} cannot be re-derived as "
@@ -4280,6 +4296,55 @@ def _working_set_downgrade_record(
     }
 
 
+def _working_set_upgrade_record(
+    *, frozen_ws, plan, chosen_tile, budget_bytes, raw_available_bytes
+) -> dict:
+    """The EXPLICIT record of the one approved resume class UPGRADE.
+
+    A run frozen on the single-owner ``external_spool`` class may leave the
+    spool for ``ram_tile`` ONLY when a FRESH admission on the current host
+    proves the target class fits on the SAME frozen geometry/halo/
+    memberships/science/tile contract. The record carries the from/to classes,
+    the (unchanged) frozen tile, the fresh observation and the ADMITTED
+    envelope facts that justified the move. It is persisted with the plan
+    generation and the unchanged identity digest before any pending Cell runs,
+    and it is published in the manifest/log.
+    """
+    frozen_class = str(frozen_ws.get("class"))
+    ram_tile_required = None
+    for candidate in plan.get("candidates") or ():
+        if str(candidate.get("mode")) == "stream":
+            ram_tile_required = int(candidate.get("max_bound_bytes") or 0)
+            break
+    if not ram_tile_required:
+        ram_tile_required = int(plan.get("stack_total_bytes") or 0)
+    return {
+        "from_class": frozen_class,
+        "to_class": WORKING_SET_RAM_TILE,
+        "tile_px": int(chosen_tile),
+        "column_batch": None,
+        "reason": (
+            "the frozen external_spool class is the single-owner spool and a "
+            "FRESH admission on this host proves the ram_tile class fits the "
+            "SAME frozen geometry/halo/memberships/science/tile contract; the "
+            "class was upgraded for the pending Cells (committed Cells are "
+            "untouched, the tile never grows)"
+        ),
+        "ram_observation": {
+            "raw_available_bytes": int(raw_available_bytes),
+            "plan_budget_bytes": int(budget_bytes),
+            "frozen_tile_px": int(frozen_ws["tile_px"]),
+            "frozen_column_batch": frozen_ws.get("column_batch"),
+            "ram_tile_required_bytes": int(ram_tile_required),
+            "plan_aggregate_bytes": int(plan.get("aggregate_bytes") or 0),
+            "cells_in_flight": int(plan.get("cells_in_flight") or 0),
+            "cache_workers_per_cell": int(
+                plan.get("cache_workers_per_cell") or 0
+            ),
+        },
+    }
+
+
 def _plan_bundle_auto(
     *,
     canvas,
@@ -4296,6 +4361,7 @@ def _plan_bundle_auto(
     emit=None,
     restored_geometry=None,
     frozen_admission=None,
+    allow_frozen_external_upgrade=False,
     gauge_memory_model=None,
 ):
     """Build the initial bundle; in AUTO ACTIVE mode retry bounded ONCE.
@@ -4311,6 +4377,11 @@ def _plan_bundle_auto(
     if frozen_admission is not None:
         # A resumed run's admission is REUSED verbatim (never re-derived).
         kw["frozen_admission"] = frozen_admission
+    if allow_frozen_external_upgrade:
+        # ZM-ZEGRID-CLASS-UPGRADE-RESUME: resume boundary only. The bundle
+        # builder attempts the RAM class on the SAME frozen contract and falls
+        # back to the frozen external spool when it does not fit.
+        kw["allow_frozen_external_upgrade"] = True
     if restored_geometry is not None:
         # REWORK-1: consume the frozen geometry; no layout search, no footprint
         # projection, no membership recomputation. Identity validation already
@@ -7997,6 +8068,7 @@ def _build_execution_bundle(
     normalization="sky_mean",
     weighting="noise_variance",
     force_external=False,
+    allow_frozen_external_upgrade=False,
     equalize_rgb=False,
     rejection="winsorized_sigma_clip",
     combine="mean",
@@ -8066,7 +8138,26 @@ def _build_execution_bundle(
         else str(_frozen_ws_policy.get("class"))
     )
     _frozen_external = _frozen_ws_class == WORKING_SET_EXTERNAL
-    _force_external = bool(force_external) or _frozen_external
+    # ZM-ZEGRID-CLASS-UPGRADE-RESUME: at the RESUME boundary only, a run frozen
+    # on the single-owner external spool may attempt the RAM streaming class on
+    # the SAME frozen geometry/halo/memberships/science/tile contract. The
+    # attempt is a fresh plan under the CURRENT host budget; a miss falls back
+    # to today's frozen external selection (never a refusal merely because RAM
+    # was tried). A forced external request (pre-gauge ACTIVE fallback) always
+    # wins, and a non-CPU frozen backend is never re-derived here.
+    _frozen_external_upgrade = bool(
+        allow_frozen_external_upgrade
+        and _frozen_external
+        and _frozen_admission is not None
+        and str(_frozen_admission.get("backend")) == "cpu"
+        # The external class lives on the bounded (file-backed) profile; the
+        # upgrade must stay in that SAME profile, never a dense re-derivation.
+        and zsp.is_bounded(zsp.normalize_storage_profile(_STACK_STORAGE_PROFILE))
+        and not bool(force_external)
+    )
+    _force_external = bool(force_external) or (
+        _frozen_external and not _frozen_external_upgrade
+    )
     # SINGLE-SOURCED enforcement (both directions). The bundle can never plan a
     # backend that the run's frozen identity does not own.
     gpu_used = _frozen_planning_gpu(_frozen_admission, gpu_used=bool(gpu_used))
@@ -8512,11 +8603,15 @@ def _build_execution_bundle(
             plan is None
             and not _force_external
             and _frozen_admission is not None
+            and not _frozen_external_upgrade
         ):
             # ZM-ACTIVE-RESUME-FROZEN-IDENTITY: a frozen RAM class/tile that no
             # longer fits must fail with the precise frozen-capacity refusal
             # HERE, before the external working-set selector can re-derive a
             # different class and emit a misleading class-mismatch message.
+            # ZM-ZEGRID-CLASS-UPGRADE-RESUME: an external-frozen run that is
+            # ATTEMPTING the RAM upgrade deliberately falls through to its own
+            # frozen external class below (that is today's behaviour).
             if _frozen_ws_policy is None and _bounded:
                 # Legacy identity with no working-set section: an additive class
                 # switch to the bounded EXTERNAL spool is still forbidden (never
@@ -8661,7 +8756,7 @@ def _build_execution_bundle(
                         f"{_ext_detail}",
                         candidates=(),
                     )
-                if _force_external:
+                if _force_external or _frozen_external_upgrade:
                     raise zsched.PlanRefused(
                         renv.REASON_INTERNAL_ERROR,
                         "the external working set cannot be executed at the "
@@ -9017,6 +9112,28 @@ def _build_execution_bundle(
                     and not _bounded
                 ):
                     working_set_transition = _working_set_downgrade_record(
+                        frozen_ws=_frozen_ws,
+                        plan=plan,
+                        chosen_tile=chosen_tile,
+                        budget_bytes=budget_bytes,
+                        raw_available_bytes=raw_available_bytes,
+                    )
+                elif (
+                    _frozen_external_upgrade
+                    and _working_set_upgrade_allowed(
+                        _frozen_class, stack_working_set
+                    )
+                    and str(plan.get("mode")) == "stream"
+                ):
+                    # ZM-ZEGRID-CLASS-UPGRADE-RESUME: EXACTLY ONE additional
+                    # transition is permitted at the resume boundary. The
+                    # fresh plan above already proved the RAM class fits the
+                    # SAME frozen geometry/halo/memberships/science/tile
+                    # contract; a plan that did NOT fit would have stayed on
+                    # the frozen external class (no transition here). It is
+                    # recorded explicitly in state + manifest + log, never
+                    # silent, never speculative, at most once per run.
+                    working_set_transition = _working_set_upgrade_record(
                         frozen_ws=_frozen_ws,
                         plan=plan,
                         chosen_tile=chosen_tile,
@@ -16168,6 +16285,10 @@ def _run_single(
         emit=_emit_live,
         restored_geometry=_resume_geometry,
         frozen_admission=_frozen_admission,
+        # ZM-ZEGRID-CLASS-UPGRADE-RESUME: a restored run (frozen admission) may
+        # attempt the ONE external_spool -> ram_tile upgrade at this boundary.
+        # A fresh run has no frozen admission and records nothing.
+        allow_frozen_external_upgrade=bool(_frozen_admission is not None),
     )
     try:
         with timings.timed("layout"):
@@ -16847,6 +16968,25 @@ def _run_single(
                             max_refinement_rank=_pinned_rank,
                             layout_substep=None,
                             force_external=True,
+                            # ZM-ZEGRID-CLASS-UPGRADE-RESUME: if this fallback
+                            # follows a failed external_spool -> ram_tile
+                            # upgrade, the run must return to its EXACT frozen
+                            # external contract (tile + column batch), never a
+                            # freshly re-derived spool. Frozen RAM classes are
+                            # untouched here (they keep today's re-derive).
+                            frozen_admission=(
+                                _frozen_admission
+                                if _frozen_admission is not None
+                                and str(
+                                    (
+                                        _frozen_admission.get("working_set")
+                                        or {}
+                                    ).get("class")
+                                )
+                                == WORKING_SET_EXTERNAL
+                                and not _initial_is_external
+                                else None
+                            ),
                             gauge_memory_model=(
                                 _initial_bundle.gauge_memory_model
                             ),
@@ -20695,8 +20835,24 @@ def _run_single(
             if isinstance(_ws_block_now, dict) else None
         )
         if _ws_transition_proposal:
+            # ZM-ZEGRID-CLASS-UPGRADE-RESUME: the SAME discipline covers both
+            # permitted directions. The direction decides the recorder (which
+            # enforces its own single-source allow-list), the human label and
+            # the observation fields published in the WARN line.
+            _ws_transition_upgrade = _working_set_upgrade_allowed(
+                _ws_transition_proposal.get("from_class"),
+                _ws_transition_proposal.get("to_class"),
+            )
+            _ws_transition_label = (
+                "upgrade" if _ws_transition_upgrade else "downgrade"
+            )
             try:
-                _ws_transition_record = zres.record_working_set_downgrade(
+                _ws_record_fn = (
+                    zres.record_working_set_upgrade
+                    if _ws_transition_upgrade
+                    else zres.record_working_set_downgrade
+                )
+                _ws_transition_record = _ws_record_fn(
                     _store.root,
                     transition=_ws_transition_proposal,
                     identity_sha256=zrs.identity_sha256(_store_identity),
@@ -20704,7 +20860,7 @@ def _run_single(
             except zres.ResumeError as _ws_transition_exc:
                 _emit(
                     "ZeGrid: resume REFUSED — the approved working-set class "
-                    "downgrade could not be recorded durably "
+                    f"{_ws_transition_label} could not be recorded durably "
                     f"({type(_ws_transition_exc).__name__}: "
                     f"{_ws_transition_exc}); no pending Cell was executed.",
                     lvl="ERROR",
@@ -20742,8 +20898,23 @@ def _run_single(
                     _ws_target_layout["working_set"]["transition"] = dict(
                         _ws_transition_record
                     )
+            _ws_observation_text = (
+                "frozen tile="
+                f"{_ws_transition_record['ram_observation'].get('frozen_tile_px')} "
+                "frozen column_batch="
+                f"{_ws_transition_record['ram_observation'].get('frozen_column_batch')} "
+                "plan aggregate="
+                f"{_ws_transition_record['ram_observation'].get('plan_aggregate_bytes')} B "
+                if _ws_transition_upgrade
+                else (
+                    "inmem required="
+                    f"{_ws_transition_record['ram_observation'].get('inmem_required_bytes')} B "
+                )
+            )
             _emit(
-                "ZeGrid: working-set class DOWNGRADED on resume — "
+                "ZeGrid: working-set class "
+                f"{'UPGRADED' if _ws_transition_upgrade else 'DOWNGRADED'} "
+                "on resume — "
                 f"{_ws_transition_record['from_class']} -> "
                 f"{_ws_transition_record['to_class']} "
                 f"(tile={_ws_transition_record['tile_px']}, "
@@ -20753,8 +20924,7 @@ def _run_single(
                 f"{_ws_transition_record['ram_observation'].get('raw_available_bytes')} B "
                 "plan budget="
                 f"{_ws_transition_record['ram_observation'].get('plan_budget_bytes')} B "
-                "inmem required="
-                f"{_ws_transition_record['ram_observation'].get('inmem_required_bytes')} B "
+                f"{_ws_observation_text}"
                 "ram_tile required="
                 f"{_ws_transition_record['ram_observation'].get('ram_tile_required_bytes')} B. "
                 "Committed Cells are untouched; only pending Cells run under "

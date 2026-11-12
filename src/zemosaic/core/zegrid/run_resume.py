@@ -59,13 +59,41 @@ ADMISSION_REMEDY = (
 # move to a code path whose bit-parity has not been proven here.
 WORKING_SET_TRANSITION_SCHEMA = "zegrid-working-set-transition-v1"
 WORKING_SET_DOWNGRADES = (("inmem", "ram_tile"),)
-def is_working_set_downgrade(from_class, to_class) -> bool:
-    """True only for the ONE permitted class transition (single source).
+# ZM-ZEGRID-CLASS-UPGRADE-RESUME: EXACTLY ONE additional direction is allowed,
+# and only at the resume boundary: a run frozen on the single-owner external
+# spool may leave it for the RAM streaming (ram_tile) class when a FRESH
+# admission on the current host proves the SAME frozen geometry/halo/
+# memberships/science/tile contract fits. It is not a downgrade and it is NOT
+# part of ``WORKING_SET_DOWNGRADES`` (that predicate stays the strict
+# shrink-direction source the engine and validator share).
+WORKING_SET_UPGRADES = (("external_spool", "ram_tile"),)
 
-    ``WORKING_SET_DOWNGRADES`` is the sole encoding of the permitted set; the
-    engine and the state validator both consult it through this predicate.
+def is_working_set_downgrade(from_class, to_class) -> bool:
+    """True only for the ONE permitted class downgrade (single source).
+
+    ``WORKING_SET_DOWNGRADES`` is the sole encoding of the permitted shrink
+    set; the engine and the state validator both consult it through this
+    predicate. The external_spool -> ram_tile upgrade is deliberately NOT in
+    this set: it has its own predicate and its own fresh-admission gate.
     """
     return (str(from_class), str(to_class)) in WORKING_SET_DOWNGRADES
+
+
+def is_working_set_upgrade(from_class, to_class) -> bool:
+    """True only for the ONE permitted class upgrade (single source).
+
+    ``WORKING_SET_UPGRADES`` is the sole encoding of the permitted upgrade
+    set. The engine only reaches it at the resume boundary and only after a
+    FRESH admission proved the target class fits on the frozen contract.
+    """
+    return (str(from_class), str(to_class)) in WORKING_SET_UPGRADES
+
+
+def is_working_set_transition(from_class, to_class) -> bool:
+    """True for any recorded class direction (downgrade OR upgrade)."""
+    return is_working_set_downgrade(from_class, to_class) or is_working_set_upgrade(
+        from_class, to_class
+    )
 
 
 WORKING_SET_TRANSITION_REQUIRED = (
@@ -531,11 +559,14 @@ def validate_working_set_transition(raw: Any) -> dict:
         )
     from_class = str(raw["from_class"])
     to_class = str(raw["to_class"])
-    if (from_class, to_class) not in WORKING_SET_DOWNGRADES:
+    if not is_working_set_transition(from_class, to_class):
         raise ResumeStateError(
             f"working-set transition {from_class!r} -> {to_class!r} is not an "
-            "allowed downgrade; only "
-            + ", ".join(f"{a!r} -> {b!r}" for a, b in WORKING_SET_DOWNGRADES)
+            "allowed class transition; only "
+            + ", ".join(
+                f"{a!r} -> {b!r}"
+                for a, b in WORKING_SET_DOWNGRADES + WORKING_SET_UPGRADES
+            )
             + " may be recorded"
         )
     tile_px = _as_int(
@@ -790,9 +821,10 @@ def validate_state(raw: Any) -> dict:
         if len(transitions) > 1:
             raise ResumeStateError(
                 "resume state.working_set_transitions has "
-                f"{len(transitions)} entries; exactly one downgrade per run is "
-                "permitted (a second entry would silently describe a class the "
-                "run never admitted)"
+                f"{len(transitions)} entries; exactly one class transition per "
+                "run is permitted (a second entry would silently describe a "
+                "class the run never admitted, and a run may never record both "
+                "a class upgrade and a class downgrade)"
             )
         normalised["working_set_transitions"] = [
             validate_working_set_transition(item) for item in transitions
@@ -815,6 +847,19 @@ def validate_state(raw: Any) -> dict:
                     f"{record['to_class']!r} but admission.working_set.class is "
                     f"{working_set.get('class')!r}; the state would describe a "
                     "class the admission does not claim"
+                )
+            if int(working_set.get("tile_px") or 0) != int(record["tile_px"]):
+                raise ResumeStateError(
+                    "resume state working-set transition names tile_px="
+                    f"{record['tile_px']} but admission.working_set.tile_px is "
+                    f"{working_set.get('tile_px')!r}; the state would describe "
+                    "a tile the admission does not claim"
+                )
+            if record["column_batch"] != working_set.get("column_batch"):
+                raise ResumeStateError(
+                    "resume state working-set transition names column_batch="
+                    f"{record['column_batch']!r} but admission.working_set"
+                    f".column_batch is {working_set.get('column_batch')!r}"
                 )
     # ZM-ZEGRID-FROZEN-BATCH-SHRINK: the optional, append-only audit trail of
     # SHRINK-ONLY column-batch transitions. Absent for every pre-existing store
@@ -853,22 +898,41 @@ def validate_state(raw: Any) -> dict:
                     "admission has no working-set section; the state is "
                     "internally inconsistent"
                 )
-            if str(working_set.get("class")) != "external_spool":
-                raise ResumeStateError(
-                    "resume state records a column-batch shrink but "
-                    "admission.working_set.class is "
-                    f"{working_set.get('class')!r}; only the external_spool "
-                    "class carries a column batch"
+            # ZM-ZEGRID-CLASS-UPGRADE-RESUME: a run that was shrunk while
+            # external and LATER upgraded to ram_tile keeps the batch history
+            # as immutable evidence of its external era. The live admission now
+            # carries no batch at all, so the historical chain is not compared
+            # against it (and no further shrink is possible on the RAM class).
+            upgraded = any(
+                is_working_set_upgrade(
+                    str(item["from_class"]), str(item["to_class"])
                 )
-            if int(working_set.get("column_batch") or 0) != int(
-                records[-1]["to_batch"]
-            ):
-                raise ResumeStateError(
-                    "resume state column-batch transition ends at "
-                    f"{records[-1]['to_batch']} but admission.working_set"
-                    f".column_batch is {working_set.get('column_batch')!r}; "
-                    "the state would describe a batch the run never admitted"
-                )
+                for item in normalised.get("working_set_transitions") or ()
+            )
+            if upgraded:
+                if working_set.get("column_batch") is not None:
+                    raise ResumeStateError(
+                        "resume state records a class upgrade to the tiled RAM "
+                        "class but admission.working_set.column_batch is not "
+                        "null; the upgraded class carries no column batch"
+                    )
+            else:
+                if str(working_set.get("class")) != "external_spool":
+                    raise ResumeStateError(
+                        "resume state records a column-batch shrink but "
+                        "admission.working_set.class is "
+                        f"{working_set.get('class')!r}; only the external_spool "
+                        "class carries a column batch"
+                    )
+                if int(working_set.get("column_batch") or 0) != int(
+                    records[-1]["to_batch"]
+                ):
+                    raise ResumeStateError(
+                        "resume state column-batch transition ends at "
+                        f"{records[-1]['to_batch']} but admission.working_set"
+                        f".column_batch is {working_set.get('column_batch')!r}; "
+                        "the state would describe a batch the run never admitted"
+                    )
     return normalised
 
 
@@ -977,66 +1041,68 @@ def _durable_identity_sha256(run_root: str | os.PathLike[str]) -> str:
     return zrs.identity_sha256(identity)
 
 
-def record_working_set_downgrade(
+def _record_working_set_transition(
     run_root: str | os.PathLike[str],
     *,
     transition: Mapping[str, Any],
     identity_sha256: str,
+    allowed: Sequence[tuple[str, str]],
+    kind: str,
 ) -> dict:
-    """Persist EXACTLY ONE approved working-set class downgrade on resume.
+    """Shared persistence for the ONE recorded class transition of a run.
 
-    The caller has already proven (in the planner) that the frozen ``inmem``
-    class no longer fits the observed budget while ``ram_tile`` does. This
-    function:
+    ``allowed`` is one of the two single-source direction sets
+    (:data:`WORKING_SET_DOWNGRADES` / :data:`WORKING_SET_UPGRADES`) and
+    ``kind`` is the human wording ("downgrade"/"upgrade") used in refusals.
+    Both wrappers below therefore share the SAME invariants:
 
-    * refuses anything except ``inmem`` -> ``ram_tile``;
-    * refuses a second transition (exactly one per run);
-    * preserves ``backend``/``tile_px``/``parity_qualified`` byte-for-byte;
-    * rewrites only the durable working-set class/tile of the admission;
-    * appends the explicit record (from, to, reason, RAM observation, plan
+    * refuse any direction outside ``allowed``;
+    * refuse a second transition (exactly one per run, so a run can never
+      record both an upgrade and a downgrade);
+    * preserve ``backend``/``tile_px``/``parity_qualified`` byte-for-byte;
+    * rewrite only the durable working-set class/tile of the admission;
+    * append the explicit record (from, to, reason, RAM observation, plan
       generation, identity digest, identity_unchanged) to the state.
-
-    The scientific identity is never touched: the working-set class is not
-    part of ``identity_fingerprints``.
     """
     state = read_state(run_root)
     admission = state.get("admission")
     if admission is None:
         raise ResumeStateError(
-            "cannot record a working-set downgrade: the run has no frozen "
+            f"cannot record a working-set {kind}: the run has no frozen "
             "admission"
         )
     existing = admission.get("working_set")
     if existing is None:
         raise ResumeStateError(
-            "cannot record a working-set downgrade: the frozen admission has "
+            f"cannot record a working-set {kind}: the frozen admission has "
             "no working-set section"
         )
     proposal = dict(transition)
     from_class = str(proposal.get("from_class"))
     to_class = str(proposal.get("to_class"))
-    if (from_class, to_class) not in WORKING_SET_DOWNGRADES:
+    if (from_class, to_class) not in allowed:
         raise ResumeStateError(
             f"working-set transition {from_class!r} -> {to_class!r} is not "
             "permitted on resume"
         )
     if str(existing.get("class")) != from_class:
         raise ResumeStateError(
-            "cannot record a working-set downgrade: the frozen class "
+            f"cannot record a working-set {kind}: the frozen class "
             f"{existing.get('class')!r} is not the transition's from_class "
             f"{from_class!r}"
         )
     prior = state.get("working_set_transitions") or []
     if prior:
         raise ResumeStateError(
-            "working-set downgrade already recorded for this run; exactly one "
-            "transition is permitted"
+            "a working-set class transition is already recorded for this run; "
+            "exactly one transition is permitted (a run may never record both "
+            "a class upgrade and a class downgrade)"
         )
     durable_sha = _durable_identity_sha256(run_root)
     supplied_sha = str(identity_sha256)
     if supplied_sha != durable_sha:
         raise ResumeStateError(
-            "cannot record a working-set downgrade: the supplied "
+            f"cannot record a working-set {kind}: the supplied "
             f"identity_sha256 {supplied_sha!r} does not match the store's "
             f"durable identity {durable_sha!r}; the record would carry false "
             "provenance"
@@ -1058,6 +1124,11 @@ def record_working_set_downgrade(
         "identity_unchanged": True,
         "recorded_unix_ns": int(time.time_ns()),
     }
+    if to_class == "ram_tile" and record["column_batch"] is not None:
+        raise ResumeStateError(
+            f"cannot record a working-set {kind}: the ram_tile class carries "
+            "no column batch"
+        )
     validate_working_set_transition(record)
     new_admission = build_admission(
         backend=admission["backend"],
@@ -1089,6 +1160,54 @@ def record_working_set_downgrade(
         column_batch_transitions=state.get("column_batch_transitions"),
     )
     return record
+
+
+def record_working_set_downgrade(
+    run_root: str | os.PathLike[str],
+    *,
+    transition: Mapping[str, Any],
+    identity_sha256: str,
+) -> dict:
+    """Persist EXACTLY ONE approved working-set class downgrade on resume.
+
+    The caller has already proven (in the planner) that the frozen ``inmem``
+    class no longer fits the observed budget while ``ram_tile`` does. Only
+    ``inmem`` -> ``ram_tile`` is accepted; the scientific identity is never
+    touched (the working-set class is not part of ``identity_fingerprints``).
+    """
+    return _record_working_set_transition(
+        run_root,
+        transition=transition,
+        identity_sha256=identity_sha256,
+        allowed=WORKING_SET_DOWNGRADES,
+        kind="downgrade",
+    )
+
+
+def record_working_set_upgrade(
+    run_root: str | os.PathLike[str],
+    *,
+    transition: Mapping[str, Any],
+    identity_sha256: str,
+) -> dict:
+    """Persist EXACTLY ONE approved working-set class UPGRADE on resume.
+
+    The caller has already proven (in the planner, under a FRESH admission on
+    the current host) that the frozen ``external_spool`` class can leave the
+    single-owner spool for ``ram_tile`` on the SAME frozen geometry, halo,
+    memberships, science and tile contract. Only ``external_spool`` ->
+    ``ram_tile`` is accepted. The record is additive evidence; ``backend``,
+    ``tile_px`` and ``parity_qualified`` are preserved verbatim and the
+    scientific identity is unchanged (the class is not part of
+    ``identity_fingerprints``).
+    """
+    return _record_working_set_transition(
+        run_root,
+        transition=transition,
+        identity_sha256=identity_sha256,
+        allowed=WORKING_SET_UPGRADES,
+        kind="upgrade",
+    )
 
 
 def record_column_batch_shrink(

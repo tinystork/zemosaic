@@ -630,7 +630,7 @@ def test_two_transition_entries_are_refused_on_load(tmp_path):
     with pytest.raises(zres.ResumeStateError) as excinfo:
         zres.validate_state(state)
     message = str(excinfo.value)
-    assert "exactly one downgrade per run" in message
+    assert "exactly one class transition per" in message
     assert "2 entries" in message
 
 
@@ -643,7 +643,7 @@ def test_wrong_transition_pair_is_refused_on_load(tmp_path):
     state["working_set_transitions"] = [bad]
     with pytest.raises(zres.ResumeStateError) as excinfo:
         zres.validate_state(state)
-    assert "is not an allowed downgrade" in str(excinfo.value)
+    assert "is not an allowed class transition" in str(excinfo.value)
 
 
 def test_transition_contradicting_admission_class_is_refused_on_load(tmp_path):
