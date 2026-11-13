@@ -1301,6 +1301,22 @@ def external_cell_host_components(
     finalize = persistent + finalize_total
     peak = max(first_write, write_phase, reduce_phase, finalize)
 
+    # ZM-ZEGRID-PEAK-ATTRIBUTION: the spool tile and the source windows are
+    # MEMORY-MAPPED. Their resident file-backed pages count in the process
+    # working set (Windows ``peak_wset``, Linux ``RssFile``/``VmRSS``) but they
+    # are NOT owned memory and are deliberately not part of ``peak_bytes``.
+    # They are named here, additively, so a working-set peak can be compared
+    # honestly: ``peak_bytes`` prices OWNED arrays only.
+    #
+    # sc: the spool payload is ``images (n, th, tw, c) f32`` + ``weights
+    # (n, th, tw) f32`` = ``4*c + 4`` bytes per pixel per frame. The WRITE phase
+    # maps (and dirties) the extended tile; the REDUCE phase maps only the
+    # interior rows/columns it actually reads. The mapping is released per
+    # tile, so the per-tile surface bounds the simultaneous residency.
+    bytes_per_px_frame = 4 * c + 4
+    mapped_write = n * tile_px * bytes_per_px_frame
+    mapped_read = n * interior_px * bytes_per_px_frame
+
     return {
         "schema": EXTERNAL_HOST_MODEL_SCHEMA,
         "observation_domain": "net_available",
@@ -1356,6 +1372,12 @@ def external_cell_host_components(
         "peak_bytes": int(peak),
         # Spool/disk bytes are intentionally NOT a host component.
         "disk_bytes_in_host_peak": 0,
+        # Mapped file-backed surface (diagnostic, additive, never in the peak):
+        # these pages live in the WORKING SET but are not owned memory.
+        "priced_domain": "owned_anonymous_live_arrays",
+        "mapped_spool_bytes_per_tile_read": int(mapped_read),
+        "mapped_spool_bytes_per_tile_write": int(mapped_write),
+        "mapped_pages_in_host_peak": 0,
     }
 
 
@@ -1462,6 +1484,15 @@ def estimate_external_working_set(
             "host_peak_bytes": int(host["peak_bytes"]),
             "host_fixed_peak_bytes": int(host["fixed_peak_bytes"]),
             "host_reduce_fixed_bytes": int(host["reduce_fixed_bytes"]),
+            # ZM-ZEGRID-PEAK-ATTRIBUTION: what the peak does and does not price.
+            "priced_domain": "owned_anonymous_live_arrays",
+            "mapped_spool_bytes_per_tile_read": int(
+                host["mapped_spool_bytes_per_tile_read"]
+            ),
+            "mapped_spool_bytes_per_tile_write": int(
+                host["mapped_spool_bytes_per_tile_write"]
+            ),
+            "mapped_pages_in_host_peak": 0,
             "independent_of_patch_area": True,
             "host_peak_depends_on_patch_area": True,
             "depends_on": ["n_frames", "column_batch", "tile_area"],
@@ -1974,12 +2005,18 @@ def run_cell_streaming_external(
     stale_policy: str = "discard",
     retain_on_failure: bool = False,
     gpu_fallback_out: dict | None = None,
+    memory_probe=None,
 ) -> CanonicalStackResult:
     """External-working-set execution of ONE canonical request.
 
     Bit-equivalent to ``run_canonical_stack_streaming(..., tile_size=tile_size)``
     for the same provider/request/fixed/sink, but the per-tile N-axis values are
     spooled to disk and reduced in column rows.
+
+    ``memory_probe`` (ZM-ZEGRID-PEAK-ATTRIBUTION) is an OPTIONAL phase hook: it
+    is called as ``memory_probe(label)`` at the ``write`` / ``reduce`` /
+    ``finalize`` phase boundaries so telemetry can attribute memory per phase.
+    It defaults to ``None`` and can never change the computation.
     """
     if not isinstance(request, CanonicalStackRequest):
         raise CanonicalStackValidationError(
@@ -2061,8 +2098,19 @@ def run_cell_streaming_external(
     )
     spool = ExternalSpool(spec)
     gpu_fallback_tiles = []
+
+    def _probe(label: str) -> None:
+        # Additive diagnostics only: the hook may never affect the cell.
+        if memory_probe is None:
+            return
+        try:
+            memory_probe(label)
+        except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+            pass
+
     try:
         for (y0, y1, x0, x1) in _iter_tiles(h, w, tile_size):
+            _probe("write")
             handle = spool.write_tile(
                 provider, p1, y0, y1, x0, x1,
                 taper_kind=taper_kind,
@@ -2073,6 +2121,7 @@ def run_cell_streaming_external(
             sink_cp = (
                 rejection_sink.checkpoint() if rejection_sink is not None else None
             )
+            _probe("reduce")
             try:
                 if gpu_active:
                     try:
@@ -2220,6 +2269,7 @@ def run_cell_streaming_external(
     if cleanup_on_success and not keep_spool:
         spool.cleanup()
 
+    _probe("finalize")
     (science, weight_sum, valid_mask, surviving, support_w1, support_w2, n_eff, agg) = (
         _finalize_phase2_outputs(
             p1,

@@ -143,6 +143,7 @@ from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
 from .core.zegrid import external_stream as zext
+from .core.zegrid import memory_peak as zmem
 from .core.zegrid import sweep as zsw
 from .core.zegrid.executor import ExecutorConfig
 
@@ -3557,22 +3558,44 @@ def _run_cell_external(
         )
         spool_info = {}
         gpu_fallback = {}
-        result = zext.run_cell_streaming_external(
-            provider, request,
-            tile_size=int(tile_size),
-            column_batch=int(_executed_batch),
-            spool_root=str(spool_root),
-            fixed=fixed,
-            rejection_sink=sink,
-            cell_id=str(cell_id),
-            attempt_id=_attempt_id,
-            cleanup_on_success=not bool(retain_for_commit),
-            spool_out=spool_info,
-            owner_token=owner_token,
-            owner_record=owner_record,
-            owner_liveness=owner_liveness,
-            gpu_fallback_out=gpu_fallback,
-        )
+        # ZM-ZEGRID-PEAK-ATTRIBUTION: additive component telemetry. A passive
+        # sampler records the OWNED (anonymous/private) and FILE-BACKED mapped
+        # peaks, per phase, so a working-set peak can never again be compared
+        # to an owned-array model without decomposition. It cannot fail a cell.
+        _mem_tracker = None
+        _mem_components = None
+        try:
+            _mem_tracker = zmem.PeakMemorySampler()
+            _mem_tracker.start()
+        except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+            _mem_tracker = None
+        try:
+            result = zext.run_cell_streaming_external(
+                provider, request,
+                tile_size=int(tile_size),
+                column_batch=int(_executed_batch),
+                spool_root=str(spool_root),
+                fixed=fixed,
+                rejection_sink=sink,
+                cell_id=str(cell_id),
+                attempt_id=_attempt_id,
+                cleanup_on_success=not bool(retain_for_commit),
+                spool_out=spool_info,
+                owner_token=owner_token,
+                owner_record=owner_record,
+                owner_liveness=owner_liveness,
+                gpu_fallback_out=gpu_fallback,
+                memory_probe=(
+                    _mem_tracker.mark if _mem_tracker is not None else None
+                ),
+            )
+        finally:
+            if _mem_tracker is not None:
+                try:
+                    _mem_tracker.stop()
+                    _mem_components = _mem_tracker.result()
+                except Exception:  # noqa: BLE001 - telemetry only
+                    _mem_components = None
         if storage_info is not None:
             storage_info.update({
                 "profile": _profile,
@@ -3630,6 +3653,11 @@ def _run_cell_external(
                     ),
                 },
                 "external_spool": dict(spool_info),
+                # ZM-ZEGRID-PEAK-ATTRIBUTION: owned vs file-backed peaks per
+                # phase (additive; None when the sampler is unavailable).
+                "memory_peak_components": (
+                    None if _mem_components is None else dict(_mem_components)
+                ),
                 # F8: publish the GPU->CPU fallback truth collected by the
                 # executor (fallback_count == number of replayed tiles). This is
                 # diagnostic/manifest data, never a silent blend claim.
@@ -6183,6 +6211,58 @@ def _consume_stack_cell(prepared, *, tile_size=None):
                 )
             ),
         }
+        # ZM-ZEGRID-PEAK-ATTRIBUTION: the headline number above is a WORKING
+        # SET. Publish its decomposition additively: OWNED (anonymous/private)
+        # vs FILE-BACKED mapped pages (spool tiles, mapped source windows). The
+        # two component maxima are NOT summed (they can occur at different
+        # instants); ``at_total_peak_kib`` is the single observed instant.
+        _mem_components = dict(
+            (storage_info or {}).get("memory_peak_components") or {}
+        )
+        if _mem_components:
+            def _kib(value):
+                return None if value is None else int(int(value) // 1024)
+
+            _at_peak = dict(_mem_components.get("at_total_peak") or {})
+            _caps = dict(_mem_components.get("capability") or {})
+            record["memory_peak"].update({
+                "observation_domain": "process_working_set_decomposed",
+                "total_peak_kib": _kib(
+                    _mem_components.get("total_peak_bytes")
+                ),
+                "owned_peak_kib": _kib(
+                    _mem_components.get("owned_peak_bytes")
+                ),
+                "file_backed_peak_kib": _kib(
+                    _mem_components.get("file_backed_peak_bytes")
+                ),
+                "shared_peak_kib": _kib(
+                    _mem_components.get("shared_peak_bytes")
+                ),
+                "at_total_peak_kib": {
+                    "total": _kib(_at_peak.get("total_bytes")),
+                    "owned": _kib(_at_peak.get("owned_bytes")),
+                    "file_backed": _kib(_at_peak.get("file_backed_bytes")),
+                    "shared": _kib(_at_peak.get("shared_bytes")),
+                    "unaccounted": _kib(_at_peak.get("unaccounted_bytes")),
+                    "phase": _at_peak.get("phase"),
+                },
+                "component_sources": {
+                    "owned": _caps.get("owned_source"),
+                    "file_backed": _caps.get("file_backed_source"),
+                    "total": _caps.get("total_source"),
+                },
+                "missing_instruments": list(
+                    _mem_components.get("missing_instruments") or []
+                ),
+                "phases": dict(_mem_components.get("phases") or {}),
+                "sampling": {
+                    "samples": int(_mem_components.get("samples", 0)),
+                    "interval_s": float(
+                        _mem_components.get("interval_s", 0.0)
+                    ),
+                },
+            })
     # Additive, request-only: honest intra-cell prefetch ledger. Absent on the
     # CPU path and on every run that did not request it (byte-identical record).
     if storage_info.get("tile_prefetch") is not None:
