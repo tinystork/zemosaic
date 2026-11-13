@@ -730,6 +730,120 @@ def membership_load(nx: int, ny: int, counts: Sequence[int]) -> MembershipLoad:
     )
 
 
+OBSERVED_ENVELOPE_MARGIN = 0.15
+OBSERVED_N_EXTRAPOLATION_FACTOR = 1.5
+OBSERVED_ENVELOPE_MAX_FACTOR = 3.0
+
+
+def reservation_bytes(
+    n_contributors: int,
+    patch_area_px: int,
+    mode_bound_bytes: int,
+    *,
+    observations=None,
+    margin: float = OBSERVED_ENVELOPE_MARGIN,
+    n_extrapolation: float = OBSERVED_N_EXTRAPOLATION_FACTOR,
+    max_envelope_factor: float = OBSERVED_ENVELOPE_MAX_FACTOR,
+) -> int:
+    """Per-CELL reservation: the cell's own execution-mode bound, floored by the
+    measured envelope.
+
+    ``mode_bound_bytes`` is the bound of the mode the cell ACTUALLY executes
+    (streaming for ``external_spool``, the in-memory model for ``inmem``).
+    Feeding an in-memory bound to a streaming cell is the category error that
+    produced one 13.55 GiB constant for every cell.
+
+    ``observations`` is an optional iterable of ``(n, area_px, owned_peak_bytes)``
+    (or mappings with those keys) from committed cells of the SAME run/store:
+
+    * envelope = max(observed owned peak) x (1 + margin);
+    * N <= the largest observed N: ``max(mode_bound, envelope)``;
+    * N > largest observed N: ``max(mode_bound, envelope x 1.5)`` (documented,
+      capped at 3 x envelope);
+    * area beyond the largest observed area scales the envelope linearly and
+      the cap with it (monotone non-decreasing in N and area).
+
+    No observations -> the mode bound (``source=model``) and nothing is invented.
+    """
+    model = max(0, int(mode_bound_bytes))
+    if not observations:
+        return model
+    rows = []
+    for item in observations:
+        if isinstance(item, dict):
+            rows.append(
+                (int(item["n_contributors"]), int(item["patch_area_px"]),
+                 int(item["owned_peak_bytes"]))
+            )
+        else:
+            rows.append((int(item[0]), int(item[1]), int(item[2])))
+    if not rows:
+        return model
+    ref_n, ref_area, ref_peak = max(rows, key=lambda row: row[2])
+    if ref_area <= 0 or ref_peak <= 0:
+        return model
+    envelope = int(ref_peak * (1.0 + float(margin)))
+    area_factor = max(1.0, float(int(patch_area_px)) / float(ref_area))
+    n_factor = 1.0 if int(n_contributors) <= ref_n else float(n_extrapolation)
+    target = envelope * area_factor * n_factor
+    cap = envelope * float(max_envelope_factor) * area_factor
+    return int(max(model, min(target, cap)))
+
+
+def memory_observations_from_commit_records(records) -> list[dict]:
+    """Per-committed-CELL peak observations for RESUME / replan only.
+
+    Reads the DURABLE commit manifests (``iter_commit_records()``) and returns
+    ``[{"n_contributors", "patch_area_px", "owned_peak_bytes"}]`` for every
+    committed cell that recorded a usable peak. The OWNED (anonymous/private)
+    peak is preferred: it is the component a cell reservation can actually
+    bound, while the file-backed one is the spool/window mapping. ``peak_rss_kib``
+    is the fallback for older records without the decomposition.
+
+    A fresh run has NO durable commits, so this returns ``[]`` and the planner
+    stays on ``source="model"``. Malformed/partial rows are SKIPPED, never
+    guessed (the reservation stays the conservative model bound for that cell).
+    """
+    out: list[dict] = []
+    for record in records or ():
+        manifest = getattr(record, "manifest", None)
+        if not isinstance(manifest, dict):
+            continue
+        meta = manifest.get("payload_meta")
+        if not isinstance(meta, dict):
+            continue
+        row = meta.get("record")
+        if not isinstance(row, dict):
+            continue
+        peak_kib = None
+        mem = meta.get("memory_peak")
+        if isinstance(mem, dict):
+            peak_kib = mem.get("owned_peak_kib")
+            if peak_kib is None:
+                peak_kib = mem.get("peak_rss_kib")
+        if peak_kib is None:
+            continue
+        hw = row.get("patch_shape_hw")
+        n = row.get("n_contributors", row.get("n_patch_contributors"))
+        try:
+            n = int(n)
+            h = int(hw[0])
+            w = int(hw[1])
+            peak = int(peak_kib)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if n <= 0 or h <= 0 or w <= 0 or peak <= 0:
+            continue
+        out.append(
+            {
+                "n_contributors": n,
+                "patch_area_px": int(w) * int(h),
+                "owned_peak_bytes": int(peak) * 1024,
+            }
+        )
+    return out
+
+
 def load_signal_is_material(
     load: MembershipLoad, trigger: float = LOAD_IMBALANCE_TRIGGER
 ) -> bool:

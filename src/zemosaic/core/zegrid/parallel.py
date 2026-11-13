@@ -282,6 +282,12 @@ def cells_in_flight(
 _PLANNER_INMEM_COST = 1.0
 _PLANNER_STREAM_COST = 1.2
 
+# ZM-ZEGRID-CELL-MEMORY-BOUND: the concurrency DECISION keeps 10 % of the plan
+# budget in reserve (allocator/OS headroom, and the Windows working-set
+# overshoot). It is a decision headroom, never a smaller published budget: a
+# one-cell reservation that only fits the FULL budget still runs, serially.
+RESERVATION_BUDGET_HEADROOM_FRAC = 0.10
+
 
 class ModeInfeasible(RuntimeError):
     """Raised when NO stacking mode fits the RAM budget (ZM-ZEGRID-R36).
@@ -305,6 +311,9 @@ def _plan_cell_concurrency_phases(
     cache_worker_footprint_bytes: int | None,
     cache_worker_px: int | None,
     max_cells_in_flight: int | None = None,
+    cell_reservations=None,
+    reservation_source: str = "model",
+    reservation_cell_id: str | None = None,
 ) -> dict:
     """ZM-ZEGRID-R41 opt-in phase accounting for :func:`plan_cell_concurrency`.
 
@@ -333,6 +342,25 @@ def _plan_cell_concurrency_phases(
         for a, b in cell_bounds
     ]
     n_cells = len(bounds)
+    # ZM-ZEGRID-CELL-MEMORY-BOUND: per-CELL reservations (opt-in). Each entry is
+    # the ONE cell's own bound for the mode it will actually execute. ``None``
+    # keeps the historical plan-wide worst-cell constant.
+    reservations = None
+    if cell_reservations is not None:
+        reservations = [
+            rcontract.require_nonneg_int(r, "cell_reservations")
+            for r in cell_reservations
+        ]
+        if len(reservations) != n_cells:
+            raise ValueError(
+                "cell_reservations must have one entry per cell "
+                f"({len(reservations)} != {n_cells})"
+            )
+        if str(reservation_source) not in ("model", "measured"):
+            raise ValueError(
+                "reservation_source must be 'model' or 'measured', got "
+                f"{reservation_source!r}"
+            )
     # M-1: validate the RAW values BEFORE any int()/max() coercion. ``cpu=None`` is
     # the only tolerated sentinel (os.cpu_count robustness) and conservatively
     # becomes 1; otherwise CPU must be a non-negative int (bool refused), with an
@@ -434,6 +462,19 @@ def _plan_cell_concurrency_phases(
 
     max_inmem = max(a for a, _b in bounds)
     max_stream = max(b for _a, b in bounds)
+    # The STREAM candidate is bounded by the PER-CELL reservations when they are
+    # supplied; without them the plan-wide worst streaming bound is used (the
+    # in-memory candidate is never changed by reservations).
+    stream_bound_bytes = (
+        max(reservations) if reservations else int(max_stream)
+    )
+    # 10 % decision headroom: K is chosen against 90 % of the plan budget. The
+    # FULL budget still governs the one-cell feasibility fallback below.
+    decision_budget = (
+        None
+        if ram_budget is None
+        else int(ram_budget * (1.0 - RESERVATION_BUDGET_HEADROOM_FRAC))
+    )
 
     cpu_budget = max(1, cpu - _CPU_OS_RESERVE)
     max_k = max(1, min(cpu_budget, n_cells))
@@ -447,16 +488,20 @@ def _plan_cell_concurrency_phases(
         waves = (n_cells + k - 1) // k
         return waves * cost
 
-    def _search(bound: int) -> dict:
+    def _search(bound: int, budget=None, max_k_override=None) -> dict:
         # ZM-ZEGRID-R41-B (rework-2): REUSE the established per-mode concurrency
         # seam as a conservative INITIAL cap (so an existing
         # ``zpar.cells_in_flight`` monkeypatch keeps governing K), then let the
         # simultaneous phase accounting REDUCE K further. K can only go DOWN.
-        _seam_budget = ram_budget if (ram_budget or 0) > 0 else None
+        # ``budget`` defaults to the plan budget; the reservation path passes
+        # the 90 % decision budget. ``max_k`` never GROWS (cap untouched).
+        _budget = ram_budget if budget is None else budget
+        _seam_budget = _budget if (_budget or 0) > 0 else None
         _seam_cap = cells_in_flight(cpu, _seam_budget, int(bound))
-        mode_max_k = max(1, min(int(max_k), int(_seam_cap), n_cells))
+        _cap_k = int(max_k) if max_k_override is None else int(max_k_override)
+        mode_max_k = max(1, min(_cap_k, int(_seam_cap), n_cells))
         k, st, ct, agg, cpc, w = rcontract.feasible_concurrency(
-            budget_bytes=ram_budget,
+            budget_bytes=_budget,
             shared_bytes=shared,
             stack_per_cell_bound_bytes=int(bound),
             process_baseline_bytes=pb,
@@ -465,7 +510,8 @@ def _plan_cell_concurrency_phases(
             max_k=mode_max_k,
         )
         return {"k": int(k), "stack_total": st, "cache_total": ct, "aggregate": agg,
-                "cache_per_cell": cpc, "cache_workers": w, "bound": int(bound)}
+                "cache_per_cell": cpc, "cache_workers": w, "bound": int(bound),
+                "decision_budget": _budget}
 
     def _candidate(mode: str, res: dict, cost: float) -> dict:
         feasible = res["k"] >= 1
@@ -557,21 +603,69 @@ def _plan_cell_concurrency_phases(
                 "shared counted once"
             ),
             "candidates": candidates,
+            "reservation": {
+                "budget_bytes": (None if ram_budget is None else int(ram_budget)),
+                "decision_budget_bytes": (
+                    None if decision_budget is None else int(decision_budget)
+                ),
+                "headroom_fraction": 0.0,
+                "reservation_bytes": int(stream_bound_bytes),
+                "source": str(reservation_source) if reservations else "model",
+                "cell_id": (reservation_cell_id if reservations else None),
+                "cells_in_flight": 1,
+                "reason": "GPU backend is single-owner: K == 1 by contract",
+            },
             **_phase_keys(k=1, w=w, cpc=cpc, st=st, ct=ct, agg=agg),
         }
 
     inmem = _search(max_inmem)
-    stream = _search(max_stream)
+    reservation_note = None
+    if reservations:
+        # The per-cell reservation bounds the STREAM candidate, and K is chosen
+        # against the 90 % decision budget. A single reservation that only fits
+        # the FULL budget still runs: serial K == 1, with the reason recorded.
+        stream = _search(
+            int(stream_bound_bytes),
+            budget=(decision_budget if decision_budget is not None else 0),
+        )
+        if stream["k"] < 1 and (
+            ram_budget is None or int(stream_bound_bytes) <= ram_budget
+        ):
+            w1 = _cache_workers_for_k(1)
+            cpc1 = rcontract.cache_per_cell_bytes(pb, int(w1), cwf)
+            st1 = rcontract.stack_phase_total_bytes(shared, 1, int(stream_bound_bytes))
+            ct1 = rcontract.cache_phase_total_bytes(shared, 1, cpc1)
+            agg1 = rcontract.aggregate_phase_bytes(st1, ct1)
+            if ram_budget is None or agg1 <= ram_budget:
+                stream = {
+                    "k": 1, "stack_total": st1, "cache_total": ct1,
+                    "aggregate": agg1, "cache_per_cell": cpc1,
+                    "cache_workers": int(w1), "bound": int(stream_bound_bytes),
+                    "decision_budget": decision_budget,
+                }
+                reservation_note = (
+                    f"one-cell reservation {int(stream_bound_bytes) / 2**20:.1f} MiB "
+                    f"exceeds the "
+                    f"{100.0 * (1.0 - RESERVATION_BUDGET_HEADROOM_FRAC):.0f}% decision "
+                    f"budget; serial K=1 under the full budget {_budget_txt()}"
+                )
+    else:
+        stream = _search(max_stream)
     inmem_feasible = inmem["k"] >= 1
     stream_feasible = stream["k"] >= 1
 
     if not inmem_feasible and not stream_feasible:
+        _stream_num = (
+            f"one-cell reservation {int(stream_bound_bytes) / 2**20:.1f} MiB "
+            "(per-cell reservations)"
+            if reservations
+            else f"one-cell aggregate >= {(shared + max_stream) / 2**20:.1f} MiB"
+        )
         raise ModeInfeasible(
             "no stacking mode fits the host phase aggregate budget "
             f"{_budget_txt()}: in-memory one-cell aggregate "
-            f">= {(shared + max_inmem) / 2**20:.1f} MiB and streaming one-cell "
-            f"aggregate >= {(shared + max_stream) / 2**20:.1f} MiB both exceed it "
-            f"(n_cells={n_cells})"
+            f">= {(shared + max_inmem) / 2**20:.1f} MiB and streaming {_stream_num} "
+            f"both exceed it (n_cells={n_cells})"
         )
 
     inmem_ms = _makespan(inmem["k"], _PLANNER_INMEM_COST) if inmem_feasible else None
@@ -626,6 +720,28 @@ def _plan_cell_concurrency_phases(
             _candidate("inmem", inmem, _PLANNER_INMEM_COST),
             _candidate("stream", stream, _PLANNER_STREAM_COST),
         ],
+        "reservation": {
+            "budget_bytes": (None if ram_budget is None else int(ram_budget)),
+            "decision_budget_bytes": (
+                None
+                if decision_budget is None
+                else int(decision_budget)
+            ),
+            "headroom_fraction": (
+                RESERVATION_BUDGET_HEADROOM_FRAC if reservations else 0.0
+            ),
+            # The number that bounded K: the per-cell reservation for the
+            # STREAM plan, the plan-wide in-memory bound for an in-memory plan.
+            "reservation_bytes": int(
+                stream_bound_bytes if mode == "stream" else max_inmem
+            ),
+            "source": (
+                str(reservation_source) if reservations else "model"
+            ),
+            "cell_id": (reservation_cell_id if reservations else None),
+            "cells_in_flight": int(res["k"]),
+            "reason": reservation_note,
+        },
         **_phase_keys(
             k=res["k"], w=res["cache_workers"], cpc=res["cache_per_cell"],
             st=res["stack_total"], ct=res["cache_total"], agg=res["aggregate"],
@@ -645,6 +761,9 @@ def plan_cell_concurrency(
     cache_worker_px: int | None = None,
     process_baseline_bytes: int | None = None,
     max_cells_in_flight: int | None = None,
+    cell_reservations=None,
+    reservation_source: str = "model",
+    reservation_cell_id: str | None = None,
 ) -> dict:
     """Joint mode + concurrency planner (replaces the R20 two-step trap).
 
@@ -681,6 +800,14 @@ def plan_cell_concurrency(
     :func:`_plan_cell_concurrency_phases`) and adds explicit per-phase keys to the
     result; otherwise it runs the legacy path verbatim (no new keys).
 
+    ``cell_reservations`` / ``reservation_source`` / ``reservation_cell_id``
+    (ZM-ZEGRID-CELL-MEMORY-BOUND, opt-in) replace the plan-wide worst-cell
+    constant on the STREAM path by one reservation per ACTIVE cell (see
+    :func:`zemosaic.core.zegrid.auto_layout.reservation_bytes`). K is then chosen
+    against 90 % of the plan budget (10 % headroom) and the plan carries an
+    auditable ``reservation`` block. ``None``/omitted makes the phase path
+    compute the historical plan-wide stream bound, unchanged.
+
     ``max_cells_in_flight`` (ZM-ZEGRID-R41-B, opt-in, default ``None``) is a
     hard UPPER BOUND on the chosen concurrency, applied on BOTH branches. It is
     used by a bounded replan so a later (larger) observation can never buy a
@@ -692,6 +819,7 @@ def plan_cell_concurrency(
         or cache_worker_footprint_bytes is not None
         or cache_worker_px is not None
         or process_baseline_bytes is not None  # L-1: supplied alone MUST activate
+        or cell_reservations is not None
     ):
         # M-1: hand the RAW arguments to the strict helper (no int()/max()
         # pre-coercion in the outer hand-off).
@@ -706,6 +834,9 @@ def plan_cell_concurrency(
             cache_worker_footprint_bytes=cache_worker_footprint_bytes,
             cache_worker_px=cache_worker_px,
             max_cells_in_flight=max_cells_in_flight,
+            cell_reservations=cell_reservations,
+            reservation_source=reservation_source,
+            reservation_cell_id=reservation_cell_id,
         )
     bounds = [(int(a), int(b)) for a, b in cell_bounds]
     n_cells = len(bounds)
@@ -912,6 +1043,38 @@ def plan_cell_concurrency(
         "chosen_reason": chosen_reason,
         "candidates": candidates,
     }
+
+
+def reservation_log_line(plan) -> str | None:
+    """One auditable line per plan: budget, reservation, source, K, cell.
+
+    ZM-ZEGRID-CELL-MEMORY-BOUND: the line names the CELL whose reservation bound
+    K, so a later reader never has to guess whether a single plan-wide constant
+    governed the concurrency (the defect this replaces).
+    """
+    if not isinstance(plan, dict):
+        return None
+    res = plan.get("reservation")
+    if not isinstance(res, dict):
+        return None
+
+    def _mib(value):
+        return "unbounded" if value is None else f"{int(value) / 2**20:.1f}MiB"
+
+    return (
+        "ZeGrid: cell memory reservation — "
+        f"budget={_mib(res.get('budget_bytes'))} "
+        f"decision_budget={_mib(res.get('decision_budget_bytes'))} "
+        f"reservation={_mib(res.get('reservation_bytes'))} "
+        f"source={res.get('source', 'model')} "
+        f"K={int(plan.get('cells_in_flight', res.get('cells_in_flight', 0)) or 0)} "
+        f"cell={res.get('cell_id')}"
+        + (
+            f" — {res['reason']}"
+            if res.get("reason")
+            else ""
+        )
+    )
 
 
 def _parent_is_daemonic() -> bool:

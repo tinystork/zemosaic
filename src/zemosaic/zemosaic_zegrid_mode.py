@@ -8620,6 +8620,7 @@ def _build_execution_bundle(
     rejection="winsorized_sigma_clip",
     combine="mean",
     halo_policy=None,
+    memory_observations=None,
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -9015,7 +9016,34 @@ def _build_execution_bundle(
         if effective_gpu:
             gpu_stream_by_idx = None
 
-        def _plan_for(pairs, backend_gpu, cells_in_flight_cap):
+        # ZM-ZEGRID-CELL-MEMORY-BOUND: ONE reservation per ACTIVE cell, from the
+        # cell's OWN bound for the mode it will execute (streaming bound for the
+        # tile under trial), floored by the measured envelope when the durable
+        # store carries committed peaks (RESUME/replan only). A fresh run has no
+        # observations, so ``source`` stays "model" and nothing is invented.
+        _memory_observations = list(memory_observations or ())
+        _reservation_source = "measured" if _memory_observations else "model"
+
+        def _reservations_for(stream_by_idx):
+            rows = [
+                int(
+                    zal.reservation_bytes(
+                        int(n), int(area), int(stream_by_idx[idx]),
+                        observations=_memory_observations,
+                    )
+                )
+                for idx, n, _hw, area in active
+            ]
+            if not rows:
+                return None, None
+            _best = max(range(len(rows)), key=lambda i: rows[i])
+            _cid = str(cell_ctxs[int(active[_best][0])][2].cell_id)
+            return rows, _cid
+
+        def _plan_for(
+            pairs, backend_gpu, cells_in_flight_cap,
+            reservations=None, reservation_cell_id=None,
+        ):
             return zpar.plan_cell_concurrency(
                 pairs, cpu_count, budget_bytes,
                 gpu_backend=bool(backend_gpu),
@@ -9023,6 +9051,9 @@ def _build_execution_bundle(
                 shared_bytes=shared_bytes,
                 cache_worker_px=int(worst_patch_px),
                 max_cells_in_flight=cells_in_flight_cap,
+                cell_reservations=reservations,
+                reservation_source=_reservation_source,
+                reservation_cell_id=reservation_cell_id,
             )
 
         plan = None
@@ -9048,9 +9079,11 @@ def _build_execution_bundle(
                 _host_peak = int(
                     max((b for _a, b in gpu_pairs), default=0)
                 )
+                _gpu_res, _gpu_res_cid = _reservations_for(_streams)
                 try:
                     _gpu_plan = _plan_for(
-                        gpu_pairs, True, max_cells_in_flight
+                        gpu_pairs, True, max_cells_in_flight,
+                        _gpu_res, _gpu_res_cid,
                     )
                 except zpar.ModeInfeasible as exc:
                     gpu_tile_trials.append(
@@ -9101,8 +9134,12 @@ def _build_execution_bundle(
                 stream_by_idx = _stream_by_idx(t)
                 pairs = [(planning_inmem_by_idx[i], stream_by_idx[i]) for i, _n, _hw, _a in active]
                 worst_stream = int(max((b for _a, b in pairs), default=0))
+                _cpu_res, _cpu_res_cid = _reservations_for(stream_by_idx)
                 try:
-                    candidate = _plan_for(pairs, False, max_cells_in_flight)
+                    candidate = _plan_for(
+                        pairs, False, max_cells_in_flight,
+                        _cpu_res, _cpu_res_cid,
+                    )
                 except zpar.ModeInfeasible as exc:
                     cpu_refusal = exc
                     tile_trials.append({
@@ -9129,8 +9166,12 @@ def _build_execution_bundle(
                 stream_by_idx = _stream_by_idx(t)
                 pairs = [(planning_inmem_by_idx[i], stream_by_idx[i]) for i, _n, _hw, _a in active]
                 worst_stream = int(max((b for _a, b in pairs), default=0))
+                _fb_res, _fb_res_cid = _reservations_for(stream_by_idx)
                 try:
-                    cpu_fallback_plan = _plan_for(pairs, False, max_cells_in_flight)
+                    cpu_fallback_plan = _plan_for(
+                        pairs, False, max_cells_in_flight,
+                        _fb_res, _fb_res_cid,
+                    )
                 except zpar.ModeInfeasible as exc:
                     cpu_refusal = exc
                     tile_trials.append({
@@ -16995,9 +17036,30 @@ def _run_single(
     # for the stable layout sub-steps (footprints, candidate scan, chosen cells).
     # It emits ONLY log/durable-detail events (never GUI stage/percent).
     layout_substep = zobs.SubstepReporter(_emit_live, log_line=_log_line)
+    # ZM-ZEGRID-CELL-MEMORY-BOUND: a RESUME/replan may size each cell's
+    # reservation from the peaks its OWN committed cells really reached. A fresh
+    # run has no durable commits -> no observations -> source="model". Reading
+    # the store here is a pure observation: any failure falls back to the model
+    # bound (never a plan-time crash, never an invented number).
+    _memory_observations: list[dict] = []
+    if _resume_boot is not None:
+        try:
+            _memory_observations = zal.memory_observations_from_commit_records(
+                _resume_boot.store.iter_commit_records()
+            )
+        except Exception:
+            _memory_observations = []
+        if _memory_observations:
+            _emit(
+                "ZeGrid: cell memory reservations seeded from "
+                f"{len(_memory_observations)} committed cell peak(s) "
+                "(source=measured)",
+                callback=progress_callback,
+            )
     _bundle_common = dict(
         cpu_count=os.cpu_count(),
         gpu_used=bool(gpu_used),
+        memory_observations=list(_memory_observations),
         vram_budget_bytes=(gpu_ctx or {}).get("vram_budget_bytes"),
         cache_root=cache_root,
         halo_px=int(halo_px),
@@ -18399,6 +18461,9 @@ def _run_single(
         f"gpu_serialized={_plan['gpu_serialized']} — {_plan['chosen_reason']}",
         callback=progress_callback,
     )
+    _res_line = zpar.reservation_log_line(_plan)
+    if _res_line:
+        _emit(_res_line, callback=progress_callback)
     for c in _plan["candidates"]:
         _mk = c.get("makespan_rel")
         _feas = c.get("feasible", True)
