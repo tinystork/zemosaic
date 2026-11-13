@@ -7664,6 +7664,12 @@ class ExecutionBundle:
     # producer, consumed verbatim by every later gate; ``None`` only for
     # historical fixtures that never build a gauge phase.
     gauge_memory_model: dict | None = None
+    # ZM-ZEGRID-PER-CELL-SCHEDULER: ONE reservation per ACTIVE cell (from the
+    # SAME ``auto_layout.reservation_bytes`` path the planner used) and the
+    # plan-time dispatch cap. Both are consumed verbatim by the per-cell
+    # dispatcher; a missing/empty map keeps the historical whole-batch pmap.
+    cell_reservations: dict = dataclasses.field(default_factory=dict)
+    cell_dispatch_cap: int | None = None
     # R55-E8: exact device workspace of the selected GPU tile and the bounded
     # per-tile host/device trial trail used by the shared GPU ladder. ``None``
     # for pure CPU bundles so every existing consumer keeps its semantics.
@@ -9533,6 +9539,22 @@ def _build_execution_bundle(
                  inmem_b, stream_b, gpu_stream_b)
             )
 
+        # ZM-ZEGRID-PER-CELL-SCHEDULER: persist ONE reservation per ACTIVE cell
+        # for the dispatcher, from the SAME ``reservation_bytes`` inputs the
+        # planner used (mode bound of the cell at the CHOSEN tile + measured
+        # observations). No second formula, no re-derivation.
+        _cell_reservations = {}
+        for _cs_cell, _cs_patch, _cs_mem, _cs_cd, _cs_inmem, _cs_stream, _cs_gpu in cell_specs:
+            if _cs_inmem is None:
+                continue
+            _cell_reservations[str(_cs_cell.cell_id)] = int(
+                zal.reservation_bytes(
+                    int(len(_cs_mem.patch_ids)),
+                    int(_cs_patch.patch.width) * int(_cs_patch.patch.height),
+                    int(_cs_stream),
+                    observations=_memory_observations,
+                )
+            )
         cell_tasks = []
         _external_task_info = None
         _owner_token, _owner_record = _external_owner_identity()
@@ -9882,6 +9904,10 @@ def _build_execution_bundle(
             gauge_memory_model=dict(_gauge_memory_model),
             worker_budget_bytes=int(worker_budget),
             attempts=attempts,
+            cell_reservations=dict(_cell_reservations),
+            cell_dispatch_cap=int(
+                (plan.get("reservation") or {}).get("dispatch_cap") or 0
+            ) or None,
             gpu_device_workspace_bytes=(
                 None
                 if gpu_device_workspace_bytes is None
@@ -18125,6 +18151,20 @@ def _run_single(
     cpu_streaming_tile = int(_final.cpu_streaming_tile)
     cell_specs = _final.cell_specs
     cell_tasks = _final.cell_tasks
+    # ZM-ZEGRID-PER-CELL-SCHEDULER: the per-cell dispatch queue's immutable
+    # inputs, fixed ONCE from the final admitted bundle (never re-derived, never
+    # grown). ``cells_in_flight`` stays the published plan-wide K; the CAP below
+    # is the plan-time CPU/cache bound within which individual cells are
+    # admitted by their OWN reservation.
+    _dispatch_reservations = dict(
+        getattr(_final, "cell_reservations", {}) or {}
+    )
+    _dispatch_cap = int(getattr(_final, "cell_dispatch_cap", 0) or 0)
+    _dispatch_shared = int(getattr(_final, "shared_bytes", 0) or 0)
+    _dispatch_budget = int(
+        int(_final.envelope.budget_bytes)
+        * (1.0 - zpar.RESERVATION_BUDGET_HEADROOM_FRAC)
+    )
     chosen_mode = _final.chosen_mode
     cells_in_flight = int(_final.cells_in_flight)
     cache_workers_per_cell = int(_final.cache_workers_per_cell)
@@ -18793,16 +18833,51 @@ def _run_single(
             global_reference_frame_id, tile_size, _cache_workers,
             _r40_coords_by_cell, _STACK_PHASE_PROFILING,
         )
+        # ZM-ZEGRID-PER-CELL-SCHEDULER: admit each CELL against the remaining
+        # budget instead of sizing the pool by the WORST cell. The dispatcher
+        # uses the SAME worker, the SAME tasks and the SAME order, so results
+        # are byte-identical to the sequential path; it is CPU-only (a GPU
+        # batch keeps its single-owner executor).
+        _res_list = None
+        if (
+            not gpu_attempt
+            and _dispatch_reservations
+            and _dispatch_cap > 1
+            and len(_tasks) > 1
+        ):
+            _res_list = [
+                int(_dispatch_reservations.get(str(t[0].cell_id), -1))
+                for t in _tasks
+            ]
+            if any(r < 0 for r in _res_list):
+                # A cell with no reservation keeps the historical executor: no
+                # guess, no invented bound.
+                _res_list = None
         try:
-            _res = zpar.pmap(
-                _stack_cell, _tasks, workers=_workers,
-                progress_callback=_progress, emit=_emit_live, meta=_meta,
-                initializer=_init_stack_worker,
-                initargs=_initargs,
-                serial_fallback=not gpu_attempt,
-                heartbeat=heartbeat,
-                heartbeat_interval_s=heartbeat_interval_s,
-            )
+            if _res_list is not None:
+                _res = zpar.pmap_reserved(
+                    _stack_cell, _tasks, _res_list,
+                    shared_bytes=_dispatch_shared,
+                    decision_budget_bytes=_dispatch_budget,
+                    workers=_dispatch_cap,
+                    cell_ids=[str(t[0].cell_id) for t in _tasks],
+                    progress_callback=_progress, emit=_emit_live, meta=_meta,
+                    initializer=_init_stack_worker,
+                    initargs=_initargs,
+                    serial_fallback=not gpu_attempt,
+                    heartbeat=heartbeat,
+                    heartbeat_interval_s=heartbeat_interval_s,
+                )
+            else:
+                _res = zpar.pmap(
+                    _stack_cell, _tasks, workers=_workers,
+                    progress_callback=_progress, emit=_emit_live, meta=_meta,
+                    initializer=_init_stack_worker,
+                    initargs=_initargs,
+                    serial_fallback=not gpu_attempt,
+                    heartbeat=heartbeat,
+                    heartbeat_interval_s=heartbeat_interval_s,
+                )
         except Exception as _batch_exc:
             _quarantine_payload_failure(
                 _batch_exc, input_folder, progress_callback, phase="cell cache"

@@ -483,6 +483,20 @@ def _plan_cell_concurrency_phases(
         # when a later observation finds MORE RAM than the plan budget assumed.
         _cap = rcontract.require_nonneg_int(max_cells_in_flight, "max_cells_in_flight")
         max_k = max(1, min(max_k, max(1, int(_cap))))
+    # ZM-ZEGRID-PER-CELL-SCHEDULER: the CONCURRENCY CAP of the per-cell dispatch
+    # queue, computed ONCE here (it may only shrink on a bounded replan). It is
+    # the CPU cap, further bounded by the CACHE phase: K cells x cache_per_cell
+    # (built with the single-cell worker count, the conservative case) must fit
+    # the same decision budget. Memory itself is gated per cell at dispatch.
+    _cpc_for_cap = rcontract.cache_per_cell_bytes(
+        pb, max(1, int(cache_build_workers)), cwf
+    )
+    _cache_cap = (
+        int(max_k)
+        if decision_budget is None
+        else max(1, (max(0, int(decision_budget) - int(shared))) // max(1, int(_cpc_for_cap)))
+    )
+    dispatch_cap = int(max(1, min(int(max_k), int(_cache_cap), n_cells)))
 
     def _makespan(k: int, cost: float) -> float:
         waves = (n_cells + k - 1) // k
@@ -613,6 +627,7 @@ def _plan_cell_concurrency_phases(
                 "source": str(reservation_source) if reservations else "model",
                 "cell_id": (reservation_cell_id if reservations else None),
                 "cells_in_flight": 1,
+                "dispatch_cap": 1,
                 "reason": "GPU backend is single-owner: K == 1 by contract",
             },
             **_phase_keys(k=1, w=w, cpc=cpc, st=st, ct=ct, agg=agg),
@@ -740,6 +755,7 @@ def _plan_cell_concurrency_phases(
             ),
             "cell_id": (reservation_cell_id if reservations else None),
             "cells_in_flight": int(res["k"]),
+            "dispatch_cap": int(dispatch_cap),
             "reason": reservation_note,
         },
         **_phase_keys(
@@ -1045,6 +1061,347 @@ def plan_cell_concurrency(
     }
 
 
+DISPATCH_REASON_NOTHING_FITS = "nothing_fits_serial_k1"
+
+
+def dispatch_fits(running_bytes, reservation_bytes, shared_bytes, budget_bytes):
+    """True when a NEW cell fits the remaining decision budget.
+
+    ``budget_bytes is None`` is explicit UNBOUNDED. ``running_bytes`` is the sum
+    of the reservations already in flight (shared is counted ONCE, outside).
+    """
+    if budget_bytes is None:
+        return True
+    return (
+        int(shared_bytes) + int(running_bytes) + int(reservation_bytes)
+        <= int(budget_bytes)
+    )
+
+
+def dispatch_log_line(cell_id, reservation_bytes, running_bytes, k, budget_bytes,
+                      reason=None):
+    """ONE deterministic dispatch line (budget/reservation/cell/k)."""
+
+    def _mib(value):
+        return "unbounded" if value is None else f"{int(value) / 2**20:.1f}MiB"
+
+    return (
+        f"ZeGrid: cell dispatch — cell={cell_id} "
+        f"reservation={_mib(reservation_bytes)} "
+        f"running={_mib(running_bytes)} k={int(k)} "
+        f"budget={_mib(budget_bytes)}"
+        + (f" — {reason}" if reason else "")
+    )
+
+
+def pmap_reserved(
+    worker,
+    tasks,
+    reservations,
+    *,
+    shared_bytes=0,
+    decision_budget_bytes=None,
+    workers=1,
+    cell_ids=None,
+    progress_callback=None,
+    initializer=None,
+    initargs=(),
+    emit=None,
+    meta=None,
+    serial_fallback=True,
+    heartbeat=None,
+    heartbeat_interval_s=5.0,
+):
+    """Per-CELL dispatch under a reservation budget (ZM-ZEGRID-PER-CELL-SCHEDULER).
+
+    Unlike :func:`pmap` (a fixed pool of ``workers`` sized by the WORST cell),
+    every cell is admitted only when ITS OWN reservation fits the remaining
+    budget::
+
+        shared + running_sum + reservation(cell) <= decision_budget
+
+    A cell that does not fit is SKIPPED, never blocking the queue; the scan
+    resumes at the next pending cell. When nothing is in flight and NOTHING
+    fits, the first pending cell runs ALONE (the historical serial K=1) with an
+    explicit reason. ``workers`` is the plan-time CPU/cache/dispatch cap and
+    never grows here.
+
+    Results are returned in TASK ORDER, exactly like :func:`pmap`, and every
+    cell runs the SAME ``worker`` on the SAME task: the dispatched path is
+    byte-identical to the sequential one.
+    """
+    tasks = list(tasks)
+    reservations = [int(r) for r in reservations]
+    total = len(tasks)
+    if len(reservations) != total:
+        raise ValueError(
+            "reservations must have one entry per task "
+            f"({len(reservations)} != {total})"
+        )
+    if any(r < 0 for r in reservations):
+        raise ValueError("reservations must be non-negative")
+    if cell_ids is None:
+        cell_ids = [str(i) for i in range(total)]
+    else:
+        cell_ids = [str(c) for c in cell_ids]
+        if len(cell_ids) != total:
+            raise ValueError("cell_ids must have one entry per task")
+    shared = max(0, int(shared_bytes))
+    cap = max(1, int(workers))
+    budget = None if decision_budget_bytes is None else int(decision_budget_bytes)
+    interval_s = (
+        _heartbeat_interval(heartbeat_interval_s) if heartbeat is not None else None
+    )
+    t0 = time.perf_counter()
+
+    if meta is not None:
+        meta["scheduler"] = "per_cell_reservation"
+        meta["workers"] = int(cap)
+        meta["tasks"] = int(total)
+        meta["shared_bytes"] = int(shared)
+        meta["decision_budget_bytes"] = budget
+        meta["events"] = []
+        meta["dispatches"] = 0
+        meta["max_concurrent"] = 0
+        meta["heartbeat_calls"] = 0
+        meta["heartbeat_errors"] = 0
+        meta["heartbeat_mode"] = "none" if heartbeat is None else "pending"
+        meta["heartbeat_interval_s"] = interval_s
+
+    def _report(done):
+        if progress_callback is not None:
+            try:
+                progress_callback(int(done), int(total))
+            except Exception:  # noqa: BLE001 - progress is never fatal
+                pass
+
+    def _surf(msg, lvl="INFO"):
+        if emit is not None:
+            try:
+                emit(msg, lvl)
+            except Exception:  # noqa: BLE001 - surfacing is never fatal
+                pass
+
+    def _dispatch(idx, running_sum, k, reason=None):
+        _surf(
+            dispatch_log_line(
+                cell_ids[idx], reservations[idx], running_sum + reservations[idx],
+                k, budget, reason=reason,
+            )
+        )
+        if meta is not None:
+            meta["dispatches"] = int(meta.get("dispatches", 0)) + 1
+            if k > int(meta.get("max_concurrent", 0)):
+                meta["max_concurrent"] = int(k)
+            meta["events"].append(
+                {
+                    "event": "dispatch",
+                    "index": int(idx),
+                    "cell_id": cell_ids[idx],
+                    "reservation_bytes": int(reservations[idx]),
+                    "running_bytes": int(running_sum + reservations[idx]),
+                    "k": int(k),
+                    "reason": reason,
+                }
+            )
+
+    def _done(idx):
+        if meta is not None:
+            meta["events"].append(
+                {"event": "done", "index": int(idx), "cell_id": cell_ids[idx]}
+            )
+
+    def _finish(meta_dict, n_units):
+        if meta_dict is None:
+            return
+        elapsed = float(time.perf_counter() - t0)
+        meta_dict["seconds"] = elapsed
+        meta_dict["seconds_per_unit"] = elapsed / max(1, n_units)
+
+    # The parent initializer runs up-front exactly like pmap (serial/thread
+    # paths depend on it); children get the same initializer.
+    if initializer is not None:
+        try:
+            initializer(*tuple(initargs))
+        except Exception as exc:  # noqa: BLE001 - never fatal
+            log.warning("[ZEGRID] pmap_reserved initializer failed: %s", exc)
+
+    parent_daemon = _parent_is_daemonic()
+
+    def _run_serial():
+        monitor = None
+        if heartbeat is not None:
+            monitor = _HeartbeatMonitor(heartbeat, interval_s)
+            monitor.start()
+            if meta is not None:
+                meta["heartbeat_mode"] = "serial_thread"
+        out = []
+        try:
+            for i, task in enumerate(tasks):
+                _dispatch(i, 0, 1, reason="serial_path")
+                out.append(worker(task))
+                _done(i)
+                _report(i + 1)
+        finally:
+            if monitor is not None:
+                monitor.stop_and_join()
+                if meta is not None:
+                    meta["heartbeat_calls"] = int(monitor.calls)
+                    meta["heartbeat_errors"] = int(monitor.errors)
+                    meta["heartbeat_last_error"] = monitor.last_error
+        return out
+
+    if cap <= 1 or total < 2:
+        if meta is not None:
+            meta["executor"] = "serial"
+            meta["fallback"] = False
+        _surf(f"[ZEGRID] per-cell dispatch: serial (cap={cap}, tasks={total})")
+        out = _run_serial()
+        _finish(meta, total)
+        return out
+
+    if parent_daemon:
+        from concurrent.futures import ThreadPoolExecutor
+
+        Executor = ThreadPoolExecutor
+        kind = "thread"
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+
+        Executor = ProcessPoolExecutor
+        kind = "process"
+    if meta is not None:
+        meta["executor"] = kind
+        meta["fallback"] = False
+
+    try:
+        if kind == "thread":
+            pool = Executor(max_workers=cap)
+        else:
+            pool = Executor(
+                max_workers=cap, initializer=initializer, initargs=tuple(initargs)
+            )
+    except Exception as exc:  # noqa: BLE001 - executor creation only
+        if not serial_fallback:
+            raise
+        log.warning(
+            "[ZEGRID] per-cell dispatch pool unavailable (%s: %s); serial",
+            type(exc).__name__, exc,
+        )
+        _surf(
+            f"[ZEGRID] per-cell dispatch pool unavailable "
+            f"({type(exc).__name__}: {exc}); falling back to SERIAL",
+            lvl="WARN",
+        )
+        if meta is not None:
+            meta["executor"] = "serial"
+            meta["fallback"] = True
+            meta["fallback_reason"] = f"{type(exc).__name__}: {exc}"
+        out = _run_serial()
+        _finish(meta, total)
+        return out
+
+    out = [None] * total
+    pending = list(range(total))
+    running = {}
+    running_sum = 0
+    reported = 0
+    last_call = time.monotonic() if heartbeat is not None else None
+    try:
+        while pending or running:
+            progressed = True
+            while pending and progressed:
+                progressed = False
+                if len(running) >= cap:
+                    break
+                for pos, idx in enumerate(pending):
+                    reservation = reservations[idx]
+                    if dispatch_fits(
+                        running_sum, reservation, shared, budget
+                    ):
+                        pending.pop(pos)
+                        _dispatch(idx, running_sum, len(running) + 1)
+                        running_sum += reservation
+                        try:
+                            fut = pool.submit(worker, tasks[idx])
+                        except Exception as exc:  # noqa: BLE001
+                            raise ParallelPoolError(
+                                "per-cell dispatch submit failed for cell "
+                                f"{cell_ids[idx]} ({type(exc).__name__}: {exc})"
+                            ) from exc
+                        running[fut] = idx
+                        progressed = True
+                        break
+                if not running:
+                    # Nothing is in flight and the head does not fit: run the
+                    # FIRST pending cell ALONE (historical serial K=1).
+                    idx = pending.pop(0)
+                    _dispatch(
+                        idx, 0, 1, reason=DISPATCH_REASON_NOTHING_FITS
+                    )
+                    running_sum = reservations[idx]
+                    fut = pool.submit(worker, tasks[idx])
+                    running[fut] = idx
+                    progressed = True
+                elif not progressed:
+                    break
+            if not running:
+                # nothing submitted and nothing running cannot loop forever:
+                # the block above always starts one cell.
+                continue
+            timeout = None
+            if heartbeat is not None:
+                now = time.monotonic()
+                if now - last_call >= interval_s:
+                    try:
+                        heartbeat()
+                        if meta is not None:
+                            meta["heartbeat_calls"] = int(
+                                meta.get("heartbeat_calls", 0)
+                            ) + 1
+                    except Exception as exc:  # noqa: BLE001
+                        if meta is not None:
+                            meta["heartbeat_errors"] = int(
+                                meta.get("heartbeat_errors", 0)
+                            ) + 1
+                            meta["heartbeat_last_error"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                    last_call = time.monotonic()
+                timeout = max(0.0, interval_s - (time.monotonic() - last_call))
+            done, _ = concurrent.futures.wait(
+                list(running),
+                timeout=timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for fut in done:
+                idx = running.pop(fut)
+                running_sum -= reservations[idx]
+                try:
+                    out[idx] = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    for other in running:
+                        other.cancel()
+                    if _is_broken_pool_error(exc):
+                        raise ParallelPoolError(
+                            "executor failed while collecting cell "
+                            f"{cell_ids[idx]} ({type(exc).__name__}: {exc})",
+                            index=idx, task=tasks[idx],
+                        ) from exc
+                    raise ParallelTaskError(idx, tasks[idx], exc) from exc
+                _done(idx)
+                while reported < total and out[reported] is not None:
+                    reported += 1
+                    _report(reported)
+    finally:
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        except Exception:  # noqa: BLE001 - shutdown is best-effort
+            pass
+    _finish(meta, total)
+    return out
+
+
 def reservation_log_line(plan) -> str | None:
     """One auditable line per plan: budget, reservation, source, K, cell.
 
@@ -1068,6 +1425,7 @@ def reservation_log_line(plan) -> str | None:
         f"reservation={_mib(res.get('reservation_bytes'))} "
         f"source={res.get('source', 'model')} "
         f"K={int(plan.get('cells_in_flight', res.get('cells_in_flight', 0)) or 0)} "
+        f"dispatch_cap={int(res.get('dispatch_cap') or 0)} "
         f"cell={res.get('cell_id')}"
         + (
             f" — {res['reason']}"
