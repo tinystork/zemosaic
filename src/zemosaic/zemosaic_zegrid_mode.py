@@ -16709,6 +16709,26 @@ def _run_single(
                 "resume — the frozen store owns its own gauge artifact, so the "
                 "provenance would be ambiguous. Nothing was written."
             )
+        # REWORK-1: ONE representation of the REQUESTED cell-gauge mode for
+        # BOTH artifact checks. An absent request is the engine's "auto"
+        # (undecided): it is resolved MUCH LATER, only after the global gauge
+        # and the layout membership exist, and may switch the whole run to
+        # per_cell. It is NEVER coerced to a decided "global" here.
+        _requested_cell_gauge_mode = getattr(
+            science_config, "cell_gauge_mode", None
+        )
+        _requested_cell_gauge_mode = (
+            "auto"
+            if _requested_cell_gauge_mode is None
+            else str(_requested_cell_gauge_mode)
+        )
+        _gauge_import_params = _r55_digest_tree(vars(science_config))
+        if isinstance(_gauge_import_params, dict):
+            # The same token the artifact checks receive, so the science
+            # comparison and the gauge-mode check can never disagree.
+            _gauge_import_params["cell_gauge_mode"] = (
+                _requested_cell_gauge_mode
+            )
         try:
             # FAIL-FAST (ZM-ZEGRID-GAUGE-IMPORT-FAILFAST): every cheap contract
             # is verified BEFORE any frame is read. The whole corpus is hashed
@@ -16724,11 +16744,8 @@ def _run_single(
                     str(d.frame_id.logical_path) for d in descs
                 ],
                 expected_canvas=_r55_canvas_identity_block(canvas),
-                expected_science_params=_r55_digest_tree(vars(science_config)),
-                expected_mode=str(
-                    getattr(science_config, "cell_gauge_mode", "global")
-                    or "global"
-                ),
+                expected_science_params=_gauge_import_params,
+                expected_mode=_requested_cell_gauge_mode,
             )
             _frame_input_rows_for_run = _r55_frame_input_rows(descs)
             _import_gauge_obj, _import_ids, _import_ref, _import_prov = (
@@ -16743,13 +16760,8 @@ def _run_single(
                         str(d.frame_id.logical_path) for d in descs
                     ],
                     expected_canvas=_r55_canvas_identity_block(canvas),
-                    expected_science_params=_r55_digest_tree(
-                        vars(science_config)
-                    ),
-                    expected_mode=str(
-                        getattr(science_config, "cell_gauge_mode", "global")
-                        or "global"
-                    ),
+                    expected_science_params=_gauge_import_params,
+                    expected_mode=_requested_cell_gauge_mode,
                 )
             )
         except Exception as _import_exc:

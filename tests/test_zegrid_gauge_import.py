@@ -46,14 +46,14 @@ MIB = 2 ** 20
 MANIFEST = "zegrid_manifest.json"
 
 
-def _config(store, layout, resume_mode="never"):
+def _config(store, layout, resume_mode="never", gauge_mode="global"):
     return SimpleNamespace(
         zegrid_scheduler_mode="active",
         zegrid_durable_store_dir=str(store),
         zegrid_resume_run_id=None,
         zegrid_durable_store_budget_bytes=64 * MIB,
         zegrid_layout=layout,
-        zegrid_cell_gauge_mode="global",
+        zegrid_cell_gauge_mode=gauge_mode,
         zegrid_resource_recovery_enabled=False,
         zegrid_resource_recovery_deadline_s=None,
         zegrid_sip_mode="keep",
@@ -62,11 +62,12 @@ def _config(store, layout, resume_mode="never"):
     )
 
 
-def _run(corpus, out, store, layout, *, gauge_import=None, overrides=None):
+def _run(corpus, out, store, layout, *, gauge_import=None, overrides=None,
+         gauge_mode="global"):
     logs = []
     zz.run_zegrid_mode(
         str(corpus), str(out), lambda *args, **_kw: logs.append(str(args[0])),
-        zconfig=_config(store, layout),
+        zconfig=_config(store, layout, gauge_mode=gauge_mode),
         zegrid_halo_px=8,
         use_gpu=False,
         zegrid_gauge_import=gauge_import,
@@ -586,7 +587,11 @@ def test_precheck_science_mismatch_refuses_with_zero_hashes(computed, monkeypatc
             **_precheck_kwargs(computed, expected_science_params=params),
         )
     assert exc.value.reasons[0]["section"] == "science"
-    assert "'cell_gauge_mode'" in str(exc.value)
+    message = str(exc.value)
+    assert "the origin run used cell_gauge_mode='global'" in message
+    assert "engine default (auto)" in message
+    assert "may resolve to per_cell" in message
+    assert "Select 'Global (one gauge)' explicitly" in message
     assert calls == [], "a science mismatch must not read/hash any frame"
 
 
@@ -660,6 +665,72 @@ def test_end_to_end_science_mismatch_hashes_no_frame(
             overrides={"cell_gauge_mode": "auto"},
         )
     assert exc.value.reasons[0]["section"] == "science"
-    assert "cell_gauge_mode" in str(exc.value)
+    message = str(exc.value)
+    assert "the origin run used cell_gauge_mode='global'" in message
+    assert "may resolve to per_cell" in message
     assert calls == [], "the import refusal must happen before any frame read"
     assert not (out / MANIFEST).is_file()
+
+
+def test_precheck_per_cell_vs_global_is_refused_distinguishably(computed, monkeypatch):
+    """A decided per_cell request is a DIFFERENT case from an undecided one."""
+    calls = _no_hash(monkeypatch)
+    kwargs = _precheck_kwargs(computed)
+    params = dict(kwargs["expected_science_params"])
+    params["cell_gauge_mode"] = "per_cell"
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        zart.precheck_gauge_import(
+            str(computed["store"] / "gauge.json"),
+            **{**kwargs, "expected_science_params": params,
+               "expected_mode": "per_cell"},
+        )
+    assert exc.value.reasons[0]["section"] == "science"
+    message = str(exc.value)
+    assert "the photometric parameters differ on 'cell_gauge_mode'" in message
+    assert "engine default (auto)" not in message
+    assert calls == []
+
+
+def test_explicit_global_is_accepted_and_verifies_every_digest(
+    tmp_path, corpus, computed, monkeypatch
+):
+    """Explicit global-vs-global: accepted, one hash per frame, digests checked."""
+    calls = _no_hash(monkeypatch)
+    result = _run(
+        corpus, tmp_path / "out", tmp_path / "store", "2x2",
+        gauge_import={
+            "gauge_path": str(computed["store"] / "gauge.json"),
+            "origin_run_json": str(computed["store"] / "run.json"),
+        },
+        gauge_mode="global",
+    )
+    n_frames = len(computed["identity"]["science_contract"]["inputs"]["frames"])
+    assert len(calls) == n_frames, "the authority must verify every frame once"
+    assert result["identity"]["science_contract"]["gauge"]["sha256"] == (
+        computed["identity"]["science_contract"]["gauge"]["sha256"])
+    assert result["manifest"]["photometric_gauge"]["source"] == "imported_artifact"
+
+
+def test_expected_mode_is_auto_for_an_absent_request(tmp_path, corpus, computed, monkeypatch):
+    """The value reaching the artifact checks is 'auto', never 'global'."""
+    captured = {}
+    real = zart.precheck_gauge_import
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(zart, "precheck_gauge_import", spy)
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        _run(
+            corpus, tmp_path / "out", tmp_path / "store", "2x2",
+            gauge_import={
+                "gauge_path": str(computed["store"] / "gauge.json"),
+                "origin_run_json": str(computed["store"] / "run.json"),
+            },
+            gauge_mode=None,
+        )
+    assert captured["expected_mode"] == "auto"
+    assert captured["expected_science_params"]["cell_gauge_mode"] == "auto"
+    assert exc.value.reasons[0]["section"] == "science"
+    assert "may resolve to per_cell" in str(exc.value)

@@ -1051,6 +1051,28 @@ def _verify_gauge_import(
             key for key in set(origin_params) | set(current_params)
             if origin_params.get(key) != current_params.get(key)
         )
+        # REWORK-1: an UNDECIDED cell-gauge request is not "a photometric
+        # parameter that differs": the engine default (auto) is resolved only
+        # after the gauge and membership exist and may switch the run to
+        # per_cell, so a global-gauge artifact must not be imported blindly.
+        # Keep the section, make the detail actionable (and never coerce).
+        if differing == ["cell_gauge_mode"]:
+            _origin_mode = origin_params.get("cell_gauge_mode")
+            _current_mode = current_params.get("cell_gauge_mode")
+            if _current_mode in (None, "auto") and _origin_mode not in (
+                None, "auto"
+            ):
+                raise _gauge_import_refusal(
+                    "science",
+                    "the origin run used cell_gauge_mode="
+                    f"{_origin_mode!r}; this run leaves it at the engine "
+                    "default (auto), which may resolve to per_cell. Select "
+                    "'Global (one gauge)' explicitly to reuse this global "
+                    "gauge artifact.",
+                    fields=differing,
+                    origin_mode=_origin_mode,
+                    current_mode=_current_mode,
+                )
         raise _gauge_import_refusal(
             "science",
             "the photometric parameters differ on "

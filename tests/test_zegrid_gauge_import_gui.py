@@ -243,3 +243,33 @@ def test_cli_maps_the_option_and_refuses_bad_paths(tmp_path, monkeypatch):
         "--gauge-import", str(tmp_path), "--gauge-origin", str(origin),
     ])
     assert code == zcli.EXIT_REFUSED and calls == []
+
+
+def test_gui_refuses_import_with_the_engine_default_gauge_mode(
+    tmp_path, monkeypatch
+):
+    """REWORK-1: an undecided cell-gauge mode is refused BEFORE any worker."""
+    gauge, origin = _options(tmp_path)
+    output_dir = tmp_path / "out"
+    warnings: list = []
+    monkeypatch.setattr(
+        gui.QMessageBox, "warning",
+        staticmethod(lambda *args, **_kw: warnings.append(str(args[-1]))),
+    )
+    win = _make_window(tmp_path, monkeypatch, {
+        "zegrid_gauge_import_enabled": True,
+        "zegrid_gauge_import_path": str(gauge),
+        "zegrid_gauge_origin_run_json": str(origin),
+        "output_dir": str(output_dir),
+        # zegrid_cell_gauge_mode deliberately absent => engine default.
+    })
+    win._mode_checkboxes["zegrid"].setChecked(True)
+    assert win._validate_zegrid_policy_for_start() is False
+    assert warnings
+    message = warnings[-1]
+    assert "Cell gauge mode" in message
+    assert "engine default (auto)" in message
+    assert "may resolve to per_cell" in message
+    assert "Global (one gauge)" in message
+    assert not output_dir.exists()
+    assert getattr(win, "is_processing", False) is False

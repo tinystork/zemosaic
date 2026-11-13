@@ -3512,6 +3512,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     "qt_zegrid_gauge_import_unreadable",
                     "Gauge import: {field} is not readable ({path}).",
                 ).format(field=shown, path=str(path))
+        # REWORK-1: an undecided cell-gauge mode cannot import a global-gauge
+        # artifact (the engine default may resolve to per_cell), and the engine
+        # would only say so after the whole corpus was hashed. Refuse BEFORE
+        # any worker is spawned, with the same actionable advice.
+        requested_mode = self.config.get("zegrid_cell_gauge_mode")
+        if requested_mode is None or str(requested_mode).strip() in ("", "auto"):
+            return self._tr(
+                "qt_zegrid_gauge_import_mode_undecided",
+                "Gauge import: 'Cell gauge mode' is left at the engine default "
+                "(auto), which may resolve to per_cell. Select 'Global (one "
+                "gauge)' explicitly to reuse this global gauge artifact.",
+            )
         return None
 
     def _apply_zegrid_policy_control_state(self, running: bool | None = None) -> None:
