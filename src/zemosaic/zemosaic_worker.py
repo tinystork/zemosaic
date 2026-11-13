@@ -31124,6 +31124,9 @@ def run_hierarchical_mosaic(
     zegrid_durable_store_dir: Any = _ZEGRID_POLICY_UNSET,
     zegrid_resume_mode: Any = _ZEGRID_POLICY_UNSET,
     zegrid_resume_run_id: Any = _ZEGRID_POLICY_UNSET,
+    # ZM-ZEGRID-GAUGE-IMPORT-GUI: explicit GUI/CLI transport of the verified
+    # gauge-import option. ``None`` = absent (historical behaviour).
+    zegrid_gauge_import: Any = None,
     # ZM-ZEGRID-M6-QT-STOP-RESUME: spawn-safe cooperative stop endpoint created
     # by the caller with the SAME multiprocessing context as this worker's
     # queue/process. ZeGrid only; every other mode ignores it. It is NOT a
@@ -31466,6 +31469,9 @@ def run_hierarchical_mosaic(
                     # reaches the engine ONLY here (ZeGrid). Classic/SDS paths
                     # never receive it.
                     stop_channel=zegrid_stop_channel,
+                    # ZM-ZEGRID-GAUGE-IMPORT-GUI: explicit pass-through (never
+                    # swallowed by a generic **kwargs filter).
+                    zegrid_gauge_import=zegrid_gauge_import,
                     zconfig=zconfig,
                     telemetry=_zg_telemetry,
                 )

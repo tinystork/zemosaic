@@ -157,6 +157,13 @@ DEFAULT_CONFIG = {
     # historical behaviour); a positive integer caps the store's own disk
     # reservations. Never enabled implicitly.
     "zegrid_durable_store_budget_bytes": None,
+    # ZM-ZEGRID-GAUGE-IMPORT-GUI: additive, opt-in exposure of the verified
+    # gauge-import feature. Disabled by default; both paths are required when
+    # enabled. The engine verifies everything deeply; the GUI only pre-checks
+    # that the two files are readable before launching.
+    "zegrid_gauge_import_enabled": False,
+    "zegrid_gauge_import_path": None,
+    "zegrid_gauge_origin_run_json": None,
     # ZM-ZEGRID-M6-QT-STOP-RESUME: GUI-only, explicit opt-in for durable
     # checkpoint saving on ZeGrid runs. OFF by default. It never changes the
     # engine/CLI defaults: the engine still opens a durable store only when a

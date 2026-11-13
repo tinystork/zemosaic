@@ -2249,6 +2249,158 @@ class ZeMosaicQtMainWindow(QMainWindow):
         layout.addRow(QLabel(""), checkpoint_info)
         self._zegrid_checkpoint_info_label = checkpoint_info
 
+        # ZM-ZEGRID-GAUGE-IMPORT-GUI: compact opt-in block. Default OFF; the
+        # engine (a757f8b) verifies the artifact deeply, so the GUI only asks
+        # for the two files and pre-checks readability.
+        gauge_import_check = QCheckBox(
+            self._tr(
+                "qt_field_zegrid_gauge_import_label",
+                "Import an existing gauge artifact (fresh run)",
+            )
+        )
+        gauge_import_check.setToolTip(
+            self._tr(
+                "qt_field_zegrid_gauge_import_tip",
+                "Reuse the global photometric gauge computed by another run "
+                "instead of recomputing it (hours on a 20k-frame corpus). The "
+                "origin must use the SAME frames (ids and content), canvas and "
+                "photometric parameters; the halo and layout MAY differ. The "
+                "output folder must be NEW. Off by default.",
+            )
+        )
+        layout.addRow(gauge_import_check)
+        self._zegrid_gauge_import_checkbox = gauge_import_check
+
+        gauge_import_label = QLabel(
+            self._tr("qt_field_zegrid_gauge_import_path_label", "Gauge artifact (gauge.json)")
+        )
+        gauge_import_edit = QLineEdit()
+        gauge_import_edit.setPlaceholderText(
+            self._tr("qt_field_zegrid_gauge_import_path_placeholder", "path to gauge.json")
+        )
+        gauge_import_browse = QPushButton(self._tr("qt_browse", "Browse…"))
+        gauge_import_row = QWidget()
+        gauge_import_row_layout = QHBoxLayout(gauge_import_row)
+        gauge_import_row_layout.setContentsMargins(0, 0, 0, 0)
+        gauge_import_row_layout.addWidget(gauge_import_edit, 1)
+        gauge_import_row_layout.addWidget(gauge_import_browse, 0)
+        try:
+            gauge_import_label.setBuddy(gauge_import_edit)
+        except Exception:
+            pass
+        layout.addRow(gauge_import_label, gauge_import_row)
+        self._zegrid_gauge_import_label = gauge_import_label
+        self._zegrid_gauge_import_edit = gauge_import_edit
+        self._zegrid_gauge_import_browse = gauge_import_browse
+
+        gauge_origin_label = QLabel(
+            self._tr("qt_field_zegrid_gauge_origin_label", "Origin run identity (run.json)")
+        )
+        gauge_origin_edit = QLineEdit()
+        gauge_origin_edit.setPlaceholderText(
+            self._tr("qt_field_zegrid_gauge_origin_placeholder", "path to the origin run.json")
+        )
+        gauge_origin_browse = QPushButton(self._tr("qt_browse", "Browse…"))
+        gauge_origin_row = QWidget()
+        gauge_origin_row_layout = QHBoxLayout(gauge_origin_row)
+        gauge_origin_row_layout.setContentsMargins(0, 0, 0, 0)
+        gauge_origin_row_layout.addWidget(gauge_origin_edit, 1)
+        gauge_origin_row_layout.addWidget(gauge_origin_browse, 0)
+        try:
+            gauge_origin_label.setBuddy(gauge_origin_edit)
+        except Exception:
+            pass
+        layout.addRow(gauge_origin_label, gauge_origin_row)
+        self._zegrid_gauge_origin_label = gauge_origin_label
+        self._zegrid_gauge_origin_edit = gauge_origin_edit
+        self._zegrid_gauge_origin_browse = gauge_origin_browse
+
+        gauge_import_help = QLabel(
+            self._tr(
+                "qt_field_zegrid_gauge_import_help",
+                "The origin must share the frames, canvas and photometric "
+                "parameters. Halo and layout may differ. Use a NEW output folder.",
+            )
+        )
+        gauge_import_help.setWordWrap(True)
+        gauge_import_help.setStyleSheet("color: #555555; font-size: 11px;")
+        layout.addRow(QLabel(""), gauge_import_help)
+        self._zegrid_gauge_import_help = gauge_import_help
+
+        def _browse_gauge_artifact():
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                self._tr("qt_field_zegrid_gauge_import_path_label", "Gauge artifact (gauge.json)"),
+                str(Path(gauge_import_edit.text() or ".").expanduser()),
+                "JSON (*.json);;All files (*)",
+            )
+            if path:
+                gauge_import_edit.setText(path)
+                self._on_zegrid_policy_text_edited(
+                    "zegrid_gauge_import_path", user_edit=True
+                )
+
+        def _browse_gauge_origin():
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                self._tr("qt_field_zegrid_gauge_origin_label", "Origin run identity (run.json)"),
+                str(Path(gauge_origin_edit.text() or ".").expanduser()),
+                "JSON (*.json);;All files (*)",
+            )
+            if path:
+                gauge_origin_edit.setText(path)
+                self._on_zegrid_policy_text_edited(
+                    "zegrid_gauge_origin_run_json", user_edit=True
+                )
+
+        gauge_import_browse.clicked.connect(_browse_gauge_artifact)  # type: ignore[arg-type]
+        gauge_origin_browse.clicked.connect(_browse_gauge_origin)  # type: ignore[arg-type]
+
+        self._config_fields["zegrid_gauge_import_enabled"] = {
+            "kind": "checkbox",
+            "widget": gauge_import_check,
+            "type": bool,
+        }
+        self._config_fields["zegrid_gauge_import_path"] = {
+            "kind": "line_edit",
+            "widget": gauge_import_edit,
+            "type": str,
+            "value_getter": lambda: (gauge_import_edit.text().strip() or None),
+        }
+        self._config_fields["zegrid_gauge_origin_run_json"] = {
+            "kind": "line_edit",
+            "widget": gauge_origin_edit,
+            "type": str,
+            "value_getter": lambda: (gauge_origin_edit.text().strip() or None),
+        }
+        gauge_import_check.toggled.connect(  # type: ignore[arg-type]
+            lambda _checked=None: self._on_zegrid_gauge_import_toggled()
+        )
+        gauge_import_edit.textEdited.connect(
+            lambda _text=None: self._on_zegrid_policy_text_edited(
+                "zegrid_gauge_import_path", user_edit=True
+            )
+        )
+        gauge_origin_edit.textEdited.connect(
+            lambda _text=None: self._on_zegrid_policy_text_edited(
+                "zegrid_gauge_origin_run_json", user_edit=True
+            )
+        )
+
+        # Persisted values are restored EXPLICITLY here (additive keys; absent
+        # keys mean disabled/empty, never a silently reused path).
+        _cfg_gauge_enabled = bool(
+            self.config.get("zegrid_gauge_import_enabled", False)
+        )
+        gauge_import_check.setChecked(_cfg_gauge_enabled)
+        gauge_import_edit.setText(
+            str(self.config.get("zegrid_gauge_import_path") or "")
+        )
+        gauge_origin_edit.setText(
+            str(self.config.get("zegrid_gauge_origin_run_json") or "")
+        )
+        self._apply_zegrid_gauge_import_control_state()
+
         gauge_label = QLabel(
             self._tr("qt_field_zegrid_cell_gauge_label", "Cell gauge mode")
         )
@@ -2884,6 +3036,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "zegrid_durable_store_dir": store_dir,
             "zegrid_resume_mode": mode,
             "zegrid_resume_run_id": run_id,
+            # ZM-ZEGRID-GAUGE-IMPORT-GUI: the ONE transport the worker kwargs
+            # and the snapshot both consume. None = toggle OFF => no key sent.
+            "zegrid_gauge_import": self._gauge_import_transport(),
             "resume": (
                 self._zegrid_generic_resume_intent()
                 if self._selected_processing_mode() == "zegrid"
@@ -3279,6 +3434,86 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._sync_config_key_from_widget(key)
         self._refresh_zegrid_policy_invalid_state()
 
+    def _on_zegrid_gauge_import_toggled(self) -> None:
+        self._sync_config_key_from_widget("zegrid_gauge_import_enabled")
+        self._apply_zegrid_gauge_import_control_state()
+
+    def _apply_zegrid_gauge_import_control_state(self) -> None:
+        checkbox = getattr(self, "_zegrid_gauge_import_checkbox", None)
+        enabled = bool(checkbox is not None and checkbox.isChecked())
+        for name in (
+            "_zegrid_gauge_import_edit",
+            "_zegrid_gauge_import_browse",
+            "_zegrid_gauge_import_label",
+            "_zegrid_gauge_origin_edit",
+            "_zegrid_gauge_origin_browse",
+            "_zegrid_gauge_origin_label",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _gauge_import_transport(self):
+        """The opt-in gauge-import mapping, or None when disabled/incomplete."""
+        try:
+            enabled = bool(self.config.get("zegrid_gauge_import_enabled", False))
+        except Exception:
+            enabled = False
+        if not enabled:
+            return None
+        gauge_path = str(self.config.get("zegrid_gauge_import_path") or "").strip()
+        origin = str(
+            self.config.get("zegrid_gauge_origin_run_json") or ""
+        ).strip()
+        if not gauge_path or not origin:
+            return None
+        return {"gauge_path": gauge_path, "origin_run_json": origin}
+
+    def _validate_gauge_import_for_start(self):
+        """Pre-launch pre-check only: empty / unreadable / directory paths."""
+        try:
+            enabled = bool(self.config.get("zegrid_gauge_import_enabled", False))
+        except Exception:
+            enabled = False
+        if not enabled:
+            return None
+        for key, label, label_key in (
+            ("zegrid_gauge_import_path", "Gauge artifact (gauge.json)",
+             "qt_field_zegrid_gauge_import_path_label"),
+            ("zegrid_gauge_origin_run_json", "Origin run identity (run.json)",
+             "qt_field_zegrid_gauge_origin_label"),
+        ):
+            raw = str(self.config.get(key) or "").strip()
+            shown = self._tr(label_key, label)
+            if not raw:
+                return self._tr(
+                    "qt_zegrid_gauge_import_missing",
+                    "Gauge import is enabled but {field} is empty. Select the file "
+                    "or turn the import off.",
+                ).format(field=shown)
+            path = Path(raw).expanduser()
+            if path.is_dir():
+                return self._tr(
+                    "qt_zegrid_gauge_import_is_dir",
+                    "Gauge import: {field} points to a folder ({path}). Select "
+                    "the JSON file itself.",
+                ).format(field=shown, path=str(path))
+            if not path.is_file():
+                return self._tr(
+                    "qt_zegrid_gauge_import_unreadable",
+                    "Gauge import: {field} does not exist or is not a file "
+                    "({path}).",
+                ).format(field=shown, path=str(path))
+            try:
+                with path.open("rb") as handle:
+                    handle.read(1)
+            except OSError:
+                return self._tr(
+                    "qt_zegrid_gauge_import_unreadable",
+                    "Gauge import: {field} is not readable ({path}).",
+                ).format(field=shown, path=str(path))
+        return None
+
     def _apply_zegrid_policy_control_state(self, running: bool | None = None) -> None:
         """Disable the policy controls outside ZeGrid / while running.
 
@@ -3358,6 +3593,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     except Exception:
                         message = str(template)
 
+        if message is None:
+            message = self._validate_gauge_import_for_start()
         if message is not None:
             if not getattr(self, "_zegrid_policy_start_warning_logged", False):
                 self._append_log(message, level="warning")
@@ -9910,6 +10147,20 @@ class ZeMosaicQtMainWindow(QMainWindow):
         worker_kwargs["zegrid_resume_run_id"] = transport[
             "zegrid_resume_run_id"
         ]
+        # ZM-ZEGRID-GAUGE-IMPORT-GUI: the mapping is transported ONLY when the
+        # toggle is ON and both files are set; OFF sends no key at all.
+        gauge_import = transport.get("zegrid_gauge_import")
+        if gauge_import is not None:
+            worker_kwargs["zegrid_gauge_import"] = dict(gauge_import)
+            try:
+                self._append_log(
+                    "ZeGrid: gauge_source=imported_artifact — imported gauge "
+                    f"artifact {gauge_import['gauge_path']} (origin identity "
+                    f"{gauge_import['origin_run_json']})",
+                    level="info",
+                )
+            except Exception:
+                pass
 
         return (), worker_kwargs
 
@@ -9971,6 +10222,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         """
         snapshot = self._serialize_config_for_save()
         self._apply_effective_zegrid_resume_to_snapshot(snapshot)
+        gauge_import = self._gauge_import_transport()
+        if gauge_import is not None:
+            # Additive, only when the feature is used: a later reader of the
+            # snapshot must never think the gauge was computed.
+            snapshot["zegrid_gauge_import"] = dict(gauge_import)
+            snapshot["gauge_source"] = "imported_artifact"
         return snapshot
 
     def _log_run_config_snapshot(self, snapshot: Dict[str, Any]) -> None:

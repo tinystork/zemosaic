@@ -150,6 +150,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="pinned layout 'NXxNY' (default: RAM-adaptive)",
     )
     parser.add_argument(
+        "--gauge-import", dest="gauge_import", default=None, metavar="PATH",
+        help=(
+            "import a VERIFIED global gauge artifact (gauge.json) from another "
+            "run of the same frames/canvas/photometry, instead of recomputing "
+            "it. Requires --gauge-origin."
+        ),
+    )
+    parser.add_argument(
+        "--gauge-origin", dest="gauge_origin", default=None, metavar="PATH",
+        help=(
+            "origin run.json identity that proves the imported gauge; required "
+            "with --gauge-import (same frame ids AND content digests, canvas "
+            "and photometric parameters; halo/layout may differ)"
+        ),
+    )
+    parser.add_argument(
         "--json-summary", default=None,
         help="optional path for a machine-readable JSON summary",
     )
@@ -483,6 +499,43 @@ def _write_set_fingerprint(output_dir: Path) -> dict:
     return fingerprint
 
 
+def resolve_gauge_import(args) -> dict | None:
+    """Map --gauge-import/--gauge-origin to the engine option, or refuse.
+
+    Pre-work, cheap checks only (the engine performs the deep verification):
+    both options or neither, each an existing readable FILE (never a folder).
+    """
+    gauge = getattr(args, "gauge_import", None)
+    origin = getattr(args, "gauge_origin", None)
+    if not gauge and not origin:
+        return None
+    if not gauge or not origin:
+        raise RefusedOption(
+            "--gauge-import and --gauge-origin must be given together"
+        )
+    resolved = {}
+    for flag, raw, key, label in (
+        ("--gauge-import", gauge, "gauge_path", "gauge artifact"),
+        ("--gauge-origin", origin, "origin_run_json", "origin run.json"),
+    ):
+        path = Path(str(raw)).expanduser()
+        if path.is_dir():
+            raise RefusedOption(
+                f"{flag} points to a folder ({path}); give the {label} file"
+            )
+        if not path.is_file():
+            raise RefusedOption(
+                f"{flag} does not exist or is not a file ({path})"
+            )
+        try:
+            with path.open("rb") as handle:
+                handle.read(1)
+        except OSError:
+            raise RefusedOption(f"{flag} is not readable ({path})") from None
+        resolved[key] = str(path)
+    return resolved
+
+
 def _build_config(args, resolved) -> SimpleNamespace:
     from .zemosaic_config import DEFAULT_CONFIG, validate_zegrid_run_policy
 
@@ -574,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         resolved = validate_options(args)
+        gauge_import = resolve_gauge_import(args)
     except RefusedOption as exc:
         sys.stderr.write(f"[zegrid] REFUSED: {exc}\n")
         return EXIT_REFUSED
@@ -597,6 +651,7 @@ def main(argv: list[str] | None = None) -> int:
         "resource_recovery_enabled": bool(args.resource_recovery),
         "resource_recovery_deadline_s": args.resource_recovery_deadline_s,
         "overwrite": bool(args.overwrite),
+        "gauge_import": gauge_import,
         "previous_publication": {
             "found": bool(resolved["previous"]["found"]),
             "zegrid": bool(resolved["previous"]["zegrid"]),
@@ -655,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
             storage_profile=args.storage_profile,
             cell_gauge_mode=args.gauge_mode,
             zegrid_halo_px=resolved["halo_px"],
+            zegrid_gauge_import=gauge_import,
             use_gpu=False,
             zconfig=config,
             stop_channel=channel,
