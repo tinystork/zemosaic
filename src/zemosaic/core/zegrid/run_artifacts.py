@@ -873,18 +873,25 @@ def _gauge_import_refusal(section: str, detail: str, **facts):
     )
 
 
-def import_gauge_artifact(
+def _verify_gauge_import(
     gauge_path: str | os.PathLike[str],
     *,
     origin_identity: Mapping[str, Any],
     origin_run_json_path: str | None,
-    expected_frame_rows: Sequence[Mapping[str, Any]],
+    expected_frame_rows: Sequence[Mapping[str, Any]] | None,
     expected_frame_ids: Sequence[str],
     expected_canvas: Mapping[str, Any],
     expected_science_params: Mapping[str, Any],
     expected_mode: str,
 ) -> tuple[Any, tuple[str, ...], str | None, dict]:
-    """Verify and import a global gauge artifact produced by ANOTHER run.
+    """ONE verification body shared by the pre-check and the full import.
+
+    ``expected_frame_rows=None`` means the caller cannot hash the corpus yet:
+    the frame COUNT, every ``frame_id``/``order``/``role`` and the id order are
+    still verified, but ``content_sha256``/``nbytes`` are NOT (unavailable).
+    :func:`import_gauge_artifact` ALWAYS passes the rows, so the content digests
+    are always verified before any gauge is imported — the pre-check is never
+    the only gate.
 
     Opt-in only: the caller passes an explicit artifact path and the origin
     ``run.json`` identity. Every check below is the SAME validator the resume
@@ -972,7 +979,19 @@ def import_gauge_artifact(
         raise _gauge_import_refusal(
             "inputs", "the origin identity carries no frames inputs section"
         )
-    expected = [dict(row) for row in expected_frame_rows]
+    if expected_frame_rows is None:
+        # Fail-fast path: no per-frame content digests are available yet.
+        # Verify every field that does NOT require reading the corpus.
+        expected = [
+            {"frame_id": str(frame_id), "order": int(index), "role": "light"}
+            for index, frame_id in enumerate(expected_frame_ids)
+        ]
+        compared_fields = ("frame_id", "order", "role")
+    else:
+        expected = [dict(row) for row in expected_frame_rows]
+        compared_fields = (
+            "frame_id", "content_sha256", "nbytes", "order", "role"
+        )
     if len(origin_rows) != len(expected):
         raise _gauge_import_refusal(
             "inputs",
@@ -982,7 +1001,7 @@ def import_gauge_artifact(
             current_frames=len(expected),
         )
     for index, (stored, current) in enumerate(zip(origin_rows, expected)):
-        for field in ("frame_id", "content_sha256", "nbytes", "order", "role"):
+        for field in compared_fields:
             if stored.get(field) != current.get(field):
                 raise _gauge_import_refusal(
                     "inputs",
@@ -1129,6 +1148,84 @@ def import_gauge_artifact(
         "mode": str(parsed["mode"]),
     }
     return gauge, frame_ids, reference_frame_id, provenance
+
+
+def import_gauge_artifact(
+    gauge_path: str | os.PathLike[str],
+    *,
+    origin_identity: Mapping[str, Any],
+    origin_run_json_path: str | None,
+    expected_frame_rows: Sequence[Mapping[str, Any]] | None,
+    expected_frame_ids: Sequence[str],
+    expected_canvas: Mapping[str, Any],
+    expected_science_params: Mapping[str, Any],
+    expected_mode: str,
+) -> tuple[Any, tuple[str, ...], str | None, dict]:
+    """Verify and import a global gauge artifact produced by ANOTHER run.
+
+    Opt-in only: the caller passes an explicit artifact path and the origin
+    ``run.json`` identity. Every check is the SAME validator the resume path
+    already trusts (artifact self-digest/schema, origin identity + binding,
+    frame ids/order/content digests/sizes, canvas, photometry with ``backend``
+    excluded, gauge fingerprint).
+
+    The artifact is only READ (no write, no repair, no normalisation). Returns
+    ``(gauge, frame_ids, reference_frame_id, provenance)``.
+
+    This is the AUTHORITY: the per-frame content rows are mandatory and their
+    ``content_sha256``/``nbytes`` are always verified. The fail-fast
+    :func:`precheck_gauge_import` exists only to refuse cheap mismatches before
+    the corpus is hashed; it never replaces this check.
+    """
+    if expected_frame_rows is None:
+        raise _gauge_import_refusal(
+            "inputs",
+            "the full import requires the per-frame content rows; refusing "
+            "without them (the content digests are the authority, never the "
+            "pre-check alone)",
+        )
+    return _verify_gauge_import(
+        gauge_path,
+        origin_identity=origin_identity,
+        origin_run_json_path=origin_run_json_path,
+        expected_frame_rows=expected_frame_rows,
+        expected_frame_ids=expected_frame_ids,
+        expected_canvas=expected_canvas,
+        expected_science_params=expected_science_params,
+        expected_mode=expected_mode,
+    )
+
+
+def precheck_gauge_import(
+    gauge_path: str | os.PathLike[str],
+    *,
+    origin_identity: Mapping[str, Any],
+    origin_run_json_path: str | None,
+    expected_frame_ids: Sequence[str],
+    expected_canvas: Mapping[str, Any],
+    expected_science_params: Mapping[str, Any],
+    expected_mode: str,
+) -> dict:
+    """FAIL-FAST pre-check: every cheap contract, ZERO frame hashing.
+
+    Runs the artifact/identity/frame-ids/canvas/photometry/gauge checks before
+    the caller reads and hashes the corpus, so a policy-token mismatch refuses
+    in seconds instead of after a full-corpus read. Returns the provenance dict
+    (identical to the full import's). It does NOT verify content digests — the
+    caller must still call :func:`import_gauge_artifact` with the rows, which
+    re-verifies everything and is the only gate that authorises the import.
+    """
+    _gauge, _frame_ids, _reference, provenance = _verify_gauge_import(
+        gauge_path,
+        origin_identity=origin_identity,
+        origin_run_json_path=origin_run_json_path,
+        expected_frame_rows=None,
+        expected_frame_ids=expected_frame_ids,
+        expected_canvas=expected_canvas,
+        expected_science_params=expected_science_params,
+        expected_mode=expected_mode,
+    )
+    return provenance
 
 
 # ---------------------------------------------------------------------------

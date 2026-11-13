@@ -16709,8 +16709,28 @@ def _run_single(
                 "resume — the frozen store owns its own gauge artifact, so the "
                 "provenance would be ambiguous. Nothing was written."
             )
-        _frame_input_rows_for_run = _r55_frame_input_rows(descs)
         try:
+            # FAIL-FAST (ZM-ZEGRID-GAUGE-IMPORT-FAILFAST): every cheap contract
+            # is verified BEFORE any frame is read. The whole corpus is hashed
+            # only when this passes; the full import below stays the authority
+            # and re-verifies the content digests.
+            zart.precheck_gauge_import(
+                _gauge_import_option["gauge_path"],
+                origin_identity=_gauge_import_option["origin_run_json"],
+                origin_run_json_path=_gauge_import_option[
+                    "origin_run_json_path"
+                ],
+                expected_frame_ids=[
+                    str(d.frame_id.logical_path) for d in descs
+                ],
+                expected_canvas=_r55_canvas_identity_block(canvas),
+                expected_science_params=_r55_digest_tree(vars(science_config)),
+                expected_mode=str(
+                    getattr(science_config, "cell_gauge_mode", "global")
+                    or "global"
+                ),
+            )
+            _frame_input_rows_for_run = _r55_frame_input_rows(descs)
             _import_gauge_obj, _import_ids, _import_ref, _import_prov = (
                 zart.import_gauge_artifact(
                     _gauge_import_option["gauge_path"],

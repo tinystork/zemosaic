@@ -544,3 +544,122 @@ def test_l2_refusal_never_deletes_a_preexisting_output_folder(
     # No layout/cache artifact was created before the refusal.
     assert not (out / "zegrid-cache").exists()
     assert not (out / MANIFEST).exists()
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-GAUGE-IMPORT-FAILFAST — cheap checks refuse with ZERO hashing
+# ---------------------------------------------------------------------------
+
+def _precheck_kwargs(computed, **overrides):
+    kwargs = _origin(computed)
+    out = {
+        "origin_identity": kwargs["origin_identity"],
+        "origin_run_json_path": kwargs["origin_run_json_path"],
+        "expected_frame_ids": kwargs["expected_frame_ids"],
+        "expected_canvas": kwargs["expected_canvas"],
+        "expected_science_params": kwargs["expected_science_params"],
+        "expected_mode": kwargs["expected_mode"],
+    }
+    out.update(overrides)
+    return out
+
+
+def _no_hash(monkeypatch):
+    calls = []
+    real = zrs.content_sha256_file
+
+    def spy(path):
+        calls.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(zrs, "content_sha256_file", spy)
+    return calls
+
+
+def test_precheck_science_mismatch_refuses_with_zero_hashes(computed, monkeypatch):
+    calls = _no_hash(monkeypatch)
+    params = dict(_precheck_kwargs(computed)["expected_science_params"])
+    params["cell_gauge_mode"] = None  # origin carries "global"
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        zart.precheck_gauge_import(
+            str(computed["store"] / "gauge.json"),
+            **_precheck_kwargs(computed, expected_science_params=params),
+        )
+    assert exc.value.reasons[0]["section"] == "science"
+    assert "'cell_gauge_mode'" in str(exc.value)
+    assert calls == [], "a science mismatch must not read/hash any frame"
+
+
+def test_precheck_canvas_mismatch_refuses_with_zero_hashes(computed, monkeypatch):
+    calls = _no_hash(monkeypatch)
+    canvas = dict(_precheck_kwargs(computed)["expected_canvas"])
+    canvas["shape"] = [canvas["shape"][0] + 1, canvas["shape"][1]]
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        zart.precheck_gauge_import(
+            str(computed["store"] / "gauge.json"),
+            **_precheck_kwargs(computed, expected_canvas=canvas),
+        )
+    assert exc.value.reasons[0]["section"] == "canvas"
+    assert calls == []
+
+
+def test_precheck_frame_order_mismatch_refuses_with_zero_hashes(computed, monkeypatch):
+    calls = _no_hash(monkeypatch)
+    ids = list(_precheck_kwargs(computed)["expected_frame_ids"])
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        zart.precheck_gauge_import(
+            str(computed["store"] / "gauge.json"),
+            **_precheck_kwargs(computed, expected_frame_ids=list(reversed(ids))),
+        )
+    assert exc.value.reasons[0]["section"] == "inputs"
+    assert calls == []
+
+
+def test_precheck_gauge_mode_mismatch_refuses_with_zero_hashes(computed, monkeypatch):
+    calls = _no_hash(monkeypatch)
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        zart.precheck_gauge_import(
+            str(computed["store"] / "gauge.json"),
+            **_precheck_kwargs(computed, expected_mode="per_cell"),
+        )
+    assert exc.value.reasons[0]["section"] == "gauge"
+    assert calls == []
+
+
+def test_import_still_requires_the_content_rows_no_hole(computed):
+    kwargs = _origin(computed)
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        zart.import_gauge_artifact(
+            str(computed["store"] / "gauge.json"),
+            **{**kwargs, "expected_frame_rows": None},
+        )
+    assert exc.value.reasons[0]["section"] == "inputs"
+    truncated = list(kwargs["expected_frame_rows"])[:-1]
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        zart.import_gauge_artifact(
+            str(computed["store"] / "gauge.json"),
+            **{**kwargs, "expected_frame_rows": truncated},
+        )
+    assert exc.value.reasons[0]["section"] == "inputs"
+    assert "frame count differs" in str(exc.value)
+
+
+def test_end_to_end_science_mismatch_hashes_no_frame(
+    tmp_path, corpus, computed, monkeypatch
+):
+    """The real defect: the whole corpus was read before a one-token refusal."""
+    calls = _no_hash(monkeypatch)
+    out, store = tmp_path / "out", tmp_path / "store"
+    with pytest.raises(zres.ResumeIncompatible) as exc:
+        _run(
+            corpus, out, store, "2x2",
+            gauge_import={
+                "gauge_path": str(computed["store"] / "gauge.json"),
+                "origin_run_json": str(computed["store"] / "run.json"),
+            },
+            overrides={"cell_gauge_mode": "auto"},
+        )
+    assert exc.value.reasons[0]["section"] == "science"
+    assert "cell_gauge_mode" in str(exc.value)
+    assert calls == [], "the import refusal must happen before any frame read"
+    assert not (out / MANIFEST).is_file()
