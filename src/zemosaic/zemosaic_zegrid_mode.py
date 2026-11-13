@@ -1976,6 +1976,13 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
     worst = None
     inmem_worst = 0
     stream_worst_by_tile = {int(t): 0 for t in CPU_STREAMING_TILE_LADDER}
+    # ZM-ZEGRID-LAYOUT-LOAD-BALANCE: the per-Cell membership counts are already
+    # computed by this SINGLE pass (``_iter_cell_bounds_mode_aware`` reuses the
+    # R28 once-projected polygons). Accumulate their exact total/max here so the
+    # load signal costs NO extra projection and NO extra intersection pass.
+    load_total = 0
+    load_max = 0
+    load_cells = 0
     for c in _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
         cheaper = min(c["inmem_bound_bytes"], c["stream_bound_bytes"])
         if worst is None or cheaper > worst["cheaper_bound_bytes"]:
@@ -1985,6 +1992,10 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
             inmem_worst = int(c["inmem_bound_bytes"])
         hw = tuple(c["patch_hw"])
         n = c["n"]
+        load_total += int(n)
+        load_cells += 1
+        if int(n) > load_max:
+            load_max = int(n)
         for t in CPU_STREAMING_TILE_LADDER:
             b = int(_profile_stream_bytes(n, hw, int(t), _STACK_STORAGE_PROFILE))
             if b > stream_worst_by_tile[int(t)]:
@@ -1992,6 +2003,12 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
     worst = worst or {}
     worst["inmem_worst_bytes"] = int(inmem_worst)
     worst["stream_worst_by_tile"] = stream_worst_by_tile
+    # Exact membership LOAD of this candidate (aggregate I/O + serial tail).
+    worst["membership_load"] = zal.MembershipLoad(
+        nx=int(nx), ny=int(ny), cells=int(load_cells),
+        total_slots=int(load_total), max_slots=int(load_max),
+        mean_slots=(float(load_total) / float(load_cells)) if load_cells else 0.0,
+    )
     return worst
 
 
@@ -2161,6 +2178,247 @@ def _run_halo_overhead_policy(halo_provenance) -> str:
         return halo_overhead_policy_for_source(_source)
     except ZeGridHaloError:
         return HALO_OVERHEAD_POLICY_HARD_FLOOR
+
+
+def _load_candidate_family(canvas, mw, mh, nx, ny, floors, halo_px, halo_advisory):
+    """Bounded, deterministic family of EXTRA grids for the load pass.
+
+    Ordered, deduped, floor-filtered and capped by
+    :data:`zal.LOAD_MAX_EXTRA_CANDIDATES`:
+
+    1. the four immediate grid-space neighbours of the chosen grid (alignment /
+       aspect tuning — the ladder is not nested, so a neighbouring grid may
+       split the heavy Cells differently at almost the same cell count);
+    2. the next candidates of the historical ``REFINEMENT_FACTORS`` ladder that
+       are FINER than the chosen grid (more Cells -> smaller patches -> a
+       shorter tail), in the historical enumeration order.
+
+    Every candidate must pass the SAME scientific floors as the forward scan
+    (``min_patch_area``, plus ``max_halo_overhead`` unless the halo policy is
+    advisory). Nothing finer than the floor is ever generated, and the family is
+    finite and ordered, so the added scan cost is bounded and reproducible.
+    """
+    out = []
+    seen = set()
+
+    def _push(cx, cy):
+        cx = int(cx)
+        cy = int(cy)
+        if cx < 1 or cy < 1:
+            return
+        cx = min(cx, int(canvas.width))
+        cy = min(cy, int(canvas.height))
+        if (cx, cy) in seen:
+            return
+        geom = zal._nominal_geometry(canvas, cx, cy, halo_px)
+        if geom["min_patch_area"] < floors.min_patch_area_px:
+            return
+        if (not halo_advisory) and geom["halo_overhead"] > floors.max_halo_overhead:
+            return
+        seen.add((cx, cy))
+        out.append((cx, cy))
+
+    for cx, cy in ((nx, ny + 1), (nx + 1, ny), (nx, ny - 1), (nx - 1, ny)):
+        _push(cx, cy)
+    chosen_rank = int(nx) * int(ny)
+    for factor in zal.REFINEMENT_FACTORS:
+        cx = max(1, int(math.ceil(canvas.width / (mw / factor))))
+        cy = max(1, int(math.ceil(canvas.height / (mh / factor))))
+        if cx * cy <= chosen_rank:
+            continue
+        _push(cx, cy)
+        if len(out) >= int(zal.LOAD_MAX_EXTRA_CANDIDATES):
+            break
+    return tuple(out[: int(zal.LOAD_MAX_EXTRA_CANDIDATES)])
+
+
+def _admit_load_candidate(
+    canvas, footprints, nx, ny, halo_px, tile_size, ram_budget,
+    available_bytes, gauge_footprint_bytes, mw=0.0, floors=None,
+    halo_advisory=False,
+):
+    """Evaluate ONE extra grid with the EXACT production admission rule.
+
+    Mirrors the forward scan byte for byte: the mode-aware cheaper bound, the
+    adaptive CPU streaming tile, the joint plan aggregate and the same
+    ``inmem_ok or selected_tile is not None`` memory-admission rule. Returns a
+    candidate dict shaped exactly like a forward-scan candidate so it can replace
+    the chosen one without any downstream special case.
+
+    The scientific floors are re-checked here (fail-closed): even a family
+    construction bug can never make the load pass adopt a grid below
+    ``min_patch_area`` (or above ``max_halo_overhead`` under the hard-floor
+    policy). A floor-violating grid is returned with ``admissible=False``.
+    """
+    geom = zal._nominal_geometry(canvas, nx, ny, halo_px)
+    floors = floors or zal.ScientificFloors()
+    floors_ok = geom["min_patch_area"] >= floors.min_patch_area_px
+    if (not halo_advisory) and geom["halo_overhead"] > floors.max_halo_overhead:
+        floors_ok = False
+    worst = _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
+    selected_tile, trials, sel_reason = _select_cpu_streaming_tile(
+        worst["stream_worst_by_tile"], ram_budget
+    )
+    inmem_ok = (not zsp.is_bounded(_STACK_STORAGE_PROFILE)) and (
+        (ram_budget is None) or (worst["inmem_worst_bytes"] <= ram_budget)
+    )
+    memory_ok = inmem_ok or (selected_tile is not None)
+    joint_probe = None
+    admissible = bool(memory_ok)
+    if (
+        memory_ok
+        and ram_budget is not None
+        and (zsp.is_bounded(_STACK_STORAGE_PROFILE) or not inmem_ok)
+    ):
+        joint_probe = _layout_joint_plan_probe(
+            canvas_px=int(canvas.width) * int(canvas.height),
+            canvas_hw=(int(canvas.height), int(canvas.width)),
+            patch_hw=tuple(int(v) for v in worst["patch_hw"]),
+            n_frames=max(1, int(worst["n"])),
+            cell_count=int(nx) * int(ny),
+            layout=(int(nx), int(ny)),
+            halo_px=int(halo_px),
+            budget_bytes=int(ram_budget),
+            available_bytes=(
+                None if available_bytes is None else int(available_bytes)
+            ),
+            storage_profile=str(_STACK_STORAGE_PROFILE),
+            stream_added_by_tile={
+                int(t): max(1, int(v) - int(rcontract.PROCESS_BASELINE_BYTES))
+                for t, v in worst["stream_worst_by_tile"].items()
+            },
+            refinement_rank=int(nx) * int(ny),
+            pinned=False,
+            gauge_footprint_bytes=int(gauge_footprint_bytes),
+        )
+        admissible = bool(joint_probe["ok"])
+    if not floors_ok:
+        # Never relax a scientific floor, whatever the load signal says.
+        admissible = False
+    return {
+        # Effective refinement factor under the historical ``target = median /
+        # factor`` convention (same formula as the coarser-rescue provenance).
+        "factor": round(float(mw) * float(nx) / float(canvas.width), 6),
+        "nx": int(nx), "ny": int(ny),
+        "bound": int(worst["cheaper_bound_bytes"]),
+        "worst_cell": worst,
+        "memory_ok": bool(memory_ok),
+        "admissible": bool(admissible),
+        "floors_ok": bool(floors_ok),
+        "joint": joint_probe,
+        "geom": geom,
+        "inmem_ok": bool(inmem_ok),
+        "selected_tile": selected_tile,
+        "trials": trials,
+        "selection_reason": sel_reason,
+    }
+
+
+def _load_aware_select(
+    canvas, footprints, chosen, *, mw, mh, ram_budget, available_bytes,
+    tile_size, halo_px, floors, halo_advisory, gauge_footprint_bytes,
+):
+    """Membership-load pass over a BOUNDED extra candidate family.
+
+    Returns ``None`` when the historical choice is not materially imbalanced
+    (the load signal is neutral: legacy / degenerate / well-covered corpora keep
+    the historical grid and NO extra grid is scanned). Otherwise returns the
+    published provenance block; its ``"chosen_state"`` key carries the candidate
+    dict to adopt (the historical one when nothing improves on it).
+
+    The rule is explicit and deterministic:
+
+    * family — :func:`_load_candidate_family` (finite, ordered, floors-gated);
+    * admission — EXACTLY the production rule (:func:`_admit_load_candidate`);
+    * guards — the tail may never grow, and the aggregate may grow at most
+      ``LOAD_TAIL_WEIGHT`` slots per slot removed from the tail (exactly the
+      score-improvement inequality — the published exchange rate is the only
+      tunable);
+    * score — ``total_slots + LOAD_TAIL_WEIGHT * max_slots`` (lower is better),
+      tie-broken by fewer total slots, lower tail, fewer Cells, ``(nx, ny)``.
+    """
+    baseline = chosen["worst_cell"]["membership_load"]
+    if not zal.load_signal_is_material(baseline):
+        return None
+
+    records = []
+    best_state = chosen
+    best_load = baseline
+    family = _load_candidate_family(
+        canvas, mw, mh, chosen["nx"], chosen["ny"], floors, halo_px, halo_advisory
+    )
+    for cx, cy in family:
+        state = _admit_load_candidate(
+            canvas, footprints, cx, cy, halo_px, tile_size, ram_budget,
+            available_bytes, gauge_footprint_bytes, mw=mw,
+            floors=floors, halo_advisory=halo_advisory,
+        )
+        load = state["worst_cell"]["membership_load"]
+        acceptable = bool(state["admissible"]) and zal.load_candidate_is_acceptable(
+            load, baseline
+        )
+        take = acceptable and zal.better_load(load, best_load)
+        records.append({
+            "nx": int(cx), "ny": int(cy), "cells": int(load.cells),
+            "total_slots": int(load.total_slots),
+            "max_slots": int(load.max_slots),
+            "mean_slots": round(float(load.mean_slots), 6),
+            "max_over_mean": round(float(load.imbalance), 6),
+            "score": int(load.score()),
+            "admissible": bool(state["admissible"]),
+            "floors_ok": bool(state.get("floors_ok", True)),
+            "acceptable": bool(acceptable),
+            "selected": bool(take),
+        })
+        if take:
+            best_state = state
+            best_load = load
+
+    applied = (int(best_state["nx"]), int(best_state["ny"])) != (
+        int(chosen["nx"]), int(chosen["ny"])
+    )
+    # Mark EXACTLY the adopted grid (the sequential scan may have adopted an
+    # intermediate candidate before a better one).
+    for rec in records:
+        rec["selected"] = bool(
+            (rec["nx"], rec["ny"]) == (int(best_load.nx), int(best_load.ny))
+        )
+    if applied:
+        if (int(best_load.total_slots) < int(baseline.total_slots)
+                and int(best_load.max_slots) < int(baseline.max_slots)):
+            reason = "load_balanced_lower_total_and_tail"
+        elif int(best_load.max_slots) < int(baseline.max_slots):
+            reason = "load_balanced_lower_tail"
+        else:
+            reason = "load_balanced_lower_total_slots"
+    elif not family:
+        reason = "no_extra_candidate_within_floors"
+    else:
+        reason = "no_candidate_improved_score"
+    n_frames = len(footprints)
+    return {
+        "policy": "membership_load_v1",
+        "applied": bool(applied),
+        "reason": reason,
+        "imbalance_trigger": float(zal.LOAD_IMBALANCE_TRIGGER),
+        "tail_weight": int(zal.LOAD_TAIL_WEIGHT),
+        "score_rule": "total_slots + tail_weight * max_slots (lower is better)",
+        "total_growth_bound_rule": (
+            "total_slots <= baseline_total_slots + tail_weight * "
+            "(baseline_max_slots - candidate_max_slots)"
+        ),
+        "tail_never_grows": True,
+        "n_frames": int(n_frames),
+        # A Cell that is a member of EVERY frame pins the tail at the input
+        # ceiling: depth(p*) is the physical lower bound of max_slots for ANY
+        # partition (the Cell containing the densest sky point is a member of
+        # every frame covering it), so max_slots cannot be lowered by the grid.
+        "tail_pinned_at_all_frames": bool(int(baseline.max_slots) >= int(n_frames)),
+        "baseline": baseline.to_dict(),
+        "chosen": best_load.to_dict(),
+        "candidates": records,
+        "chosen_state": best_state,
+    }
 
 
 def _choose_layout_mode_aware(
@@ -3155,6 +3413,67 @@ def _choose_layout_mode_aware(
         else:
             raise zal.LayoutInfeasible(msg, refusal=_refusal)
 
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-LAYOUT-LOAD-BALANCE — membership-load aware selection
+    # ------------------------------------------------------------------
+    # The forward scan takes the FIRST (coarsest) admissible grid, i.e. it
+    # minimises PEAK MEMORY and ignores how many frame memberships each Cell
+    # carries. When the resulting grid is materially IMBALANCED, a bounded,
+    # deterministic family of neighbouring / finer grids is evaluated with the
+    # SAME admission rule and the explicit load score. The pass never relaxes a
+    # floor or the RAM envelope, never increases the tail, bounds the aggregate
+    # growth, and is skipped entirely (historical grid byte for byte) for a
+    # neutral signal, a pinned grid, a coarser rescue or a refinement-rank
+    # window. Existing runs are FROZEN: only NEW runs can differ.
+    load_selection = None
+    if (
+        chosen is not None
+        and rescue_record is None
+        and min_refinement_rank is None
+        and max_refinement_rank is None
+    ):
+        load_selection = _load_aware_select(
+            canvas, footprints, chosen,
+            mw=mw, mh=mh, ram_budget=ram_budget,
+            available_bytes=available_bytes, tile_size=tile_size,
+            halo_px=halo_px, floors=floors, halo_advisory=_halo_advisory,
+            gauge_footprint_bytes=_gauge_memory_fp,
+        )
+        if load_selection is not None:
+            _base = load_selection["baseline"]
+            _pick = load_selection["chosen"]
+            _log(
+                "layout load: baseline {bx}x{by} ({bc} cells) total_slots={bt} "
+                "max_slots={bmax} mean_slots={bmean:.1f} max/mean={bratio:.2f} "
+                "-> {decision} {px}x{py} total_slots={pt} max_slots={pmax} "
+                "mean_slots={pmean:.1f} max/mean={pratio:.2f} "
+                "(rule: {rule}; reason: {reason}; tail_pinned_at_all_frames={pinned})"
+                .format(
+                    bx=_base["nx"], by=_base["ny"], bc=_base["cells"],
+                    bt=_base["total_slots"], bmax=_base["max_slots"],
+                    bmean=_base["mean_slots"], bratio=_base["max_over_mean"],
+                    decision=("CHOSEN" if load_selection["applied"] else "KEPT"),
+                    px=_pick["nx"], py=_pick["ny"], pt=_pick["total_slots"],
+                    pmax=_pick["max_slots"], pmean=_pick["mean_slots"],
+                    pratio=_pick["max_over_mean"],
+                    rule=load_selection["score_rule"],
+                    reason=load_selection["reason"],
+                    pinned=load_selection["tail_pinned_at_all_frames"],
+                )
+            )
+            for _rec in load_selection["candidates"]:
+                _log(
+                    "layout load: candidate {nx}x{ny} cells={cells} "
+                    "total_slots={total_slots} max_slots={max_slots} "
+                    "mean_slots={mean_slots:.1f} max/mean={max_over_mean:.2f} "
+                    "score={score} admissible={admissible} "
+                    "acceptable={acceptable} selected={selected}".format(**_rec)
+                )
+            if load_selection["applied"]:
+                chosen = load_selection.pop("chosen_state")
+            else:
+                load_selection.pop("chosen_state", None)
+
     cells = list(_iter_cell_bounds_mode_aware(
         canvas, footprints, chosen["nx"], chosen["ny"], halo_px, tile_size
     ))
@@ -3244,6 +3563,11 @@ def _choose_layout_mode_aware(
             "min_contributors": {"value": max_n, "limit": floors.min_contributors, "ok": contrib_ok},
         },
         **({"layout_rescue": rescue_record} if rescue_record is not None else {}),
+        # ZM-ZEGRID-LAYOUT-LOAD-BALANCE: additive diagnostics ONLY, published
+        # only when the load signal was material (a neutral/legacy run keeps the
+        # exact historical layout-dict shape).
+        **({"membership_load": load_selection}
+           if load_selection is not None else {}),
     }
 
 
@@ -24403,6 +24727,11 @@ def _manifest_layout_block(nx, ny, layout):
         ),
         **({"layout_rescue": layout["layout_rescue"]}
            if layout.get("layout_rescue") else {}),
+        # ZM-ZEGRID-LAYOUT-LOAD-BALANCE: additive, inside the EXISTING ``layout``
+        # block (never a new top-level manifest key). Absent unless the load pass
+        # engaged, so a neutral/legacy run keeps its historical shape.
+        **({"membership_load": dict(layout["membership_load"])}
+           if layout.get("membership_load") else {}),
     }
 
 

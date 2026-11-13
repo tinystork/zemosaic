@@ -570,6 +570,167 @@ def _cell_contributor_count(footprints, canvas, bounds: zg.GlobalBounds) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Membership LOAD (ZM-ZEGRID-LAYOUT-LOAD-BALANCE) — pure scoring helpers
+# ---------------------------------------------------------------------------
+#
+# A Cell is not "one frame": the same frame footprint is a MEMBER of every Cell
+# whose patch it touches, and each membership is reprojected + reduced. The
+# per-Cell workload is therefore the number of MEMBERSHIP SLOTS of that Cell,
+# and the cost of a run is:
+#
+#   * aggregate work  ~ sum_c slots(c)   (total slots: total I/O),
+#   * makespan        ~ max_c slots(c)   (the tail Cell is serial).
+#
+# The historical policy ranks candidates by peak MEMORY only and takes the
+# FIRST (coarsest) admissible grid, which says nothing about either quantity.
+# The functions below make the load explicit and comparable. They are PURE
+# functions of integer slot counts: no projection, no membership recomputation,
+# no randomness, no filesystem order — the caller must feed counts derived from
+# the run's SINGLE footprint projection (R28).
+
+#: The load pass is only engaged when the historical (first-admissible) grid is
+#: MATERIALLY imbalanced: ``max_slots / mean_slots`` above this ratio. A corpus
+#: where every Cell sees every frame (ratio 1.0) and every legacy/degenerate
+#: case stay on the historical grid byte for byte.
+LOAD_IMBALANCE_TRIGGER = 2.0
+
+#: Weight of the tail (``max_slots``) in the scalar score. DERIVED from the
+#: makespan proxy ``max(total/P, max)`` for a nominal parallelism P=4: the
+#: aggregate term is ``total/4`` and the tail term ``max``, so comparing
+#: ``total + 4*max`` is the same ordering in integer-friendly units. P=4 is the
+#: smallest worker class the resource contract admits; a larger P only raises the
+#: tail weight, so 4 is the CONSERVATIVE (least tail-biased) choice.
+LOAD_TAIL_WEIGHT = 4
+
+#: Bounded size of the extra candidate family evaluated by the load pass.
+LOAD_MAX_EXTRA_CANDIDATES = 6
+
+
+@dataclass(frozen=True)
+class MembershipLoad:
+    """Exact per-Cell membership load of one ``nx x ny`` grid.
+
+    ``total_slots`` is the sum of the per-Cell membership counts (aggregate I/O),
+    ``max_slots`` the heaviest Cell (the serial tail that sets the makespan) and
+    ``mean_slots`` the arithmetic mean over ALL Cells (empty Cells included: they
+    are real Cells of the partition even though they carry no work).
+    """
+
+    nx: int
+    ny: int
+    cells: int
+    total_slots: int
+    max_slots: int
+    mean_slots: float
+
+    @property
+    def imbalance(self) -> float:
+        """``max / mean`` (0.0 for a load-free grid; 1.0 when perfectly flat)."""
+        if self.mean_slots <= 0.0:
+            return 0.0
+        return float(self.max_slots) / float(self.mean_slots)
+
+    def score(self, tail_weight: int = LOAD_TAIL_WEIGHT) -> int:
+        """Deterministic integer score: lower is better.
+
+        ``total_slots + tail_weight * max_slots`` — rewards a lower aggregate load
+        AND a lower tail, and is exact integer arithmetic (no float rounding).
+        """
+        return int(self.total_slots) + int(tail_weight) * int(self.max_slots)
+
+    def to_dict(self) -> dict:
+        return {
+            "nx": int(self.nx),
+            "ny": int(self.ny),
+            "cells": int(self.cells),
+            "total_slots": int(self.total_slots),
+            "max_slots": int(self.max_slots),
+            "mean_slots": round(float(self.mean_slots), 6),
+            "max_over_mean": round(float(self.imbalance), 6),
+            "score": self.score(),
+        }
+
+
+def membership_load(nx: int, ny: int, counts: Sequence[int]) -> MembershipLoad:
+    """Build a :class:`MembershipLoad` from the per-Cell slot counts.
+
+    ``counts`` must be the per-Cell membership counts produced by the SAME single
+    footprint projection the layout decision uses (R28). Pure integer arithmetic:
+    same counts -> same load, always.
+    """
+    vals = [int(c) for c in counts]
+    cells = len(vals)
+    total = int(sum(vals))
+    mx = int(max(vals)) if vals else 0
+    mean = (float(total) / float(cells)) if cells else 0.0
+    return MembershipLoad(
+        nx=int(nx), ny=int(ny), cells=int(cells),
+        total_slots=total, max_slots=mx, mean_slots=mean,
+    )
+
+
+def load_signal_is_material(
+    load: MembershipLoad, trigger: float = LOAD_IMBALANCE_TRIGGER
+) -> bool:
+    """True when the load signal is material enough to justify the load pass.
+
+    Neutral cases (a corpus where every Cell sees every frame, a grid with no
+    memberships, a single Cell) are NOT material, so the historical grid is kept
+    and no extra candidate is ever scanned.
+    """
+    if load.cells <= 1 or load.total_slots <= 0:
+        return False
+    return float(load.imbalance) > float(trigger)
+
+
+def load_candidate_is_acceptable(
+    candidate: MembershipLoad,
+    baseline: MembershipLoad,
+    tail_weight: int = LOAD_TAIL_WEIGHT,
+) -> bool:
+    """Hard guards a load-aware choice must satisfy against the historical grid.
+
+    * the tail may NEVER grow (``max_slots <= baseline.max_slots``);
+    * the aggregate may grow at most by ``tail_weight`` slots per slot removed
+      from the tail, i.e. ``total <= baseline_total + tail_weight * (baseline_max
+      - candidate_max)`` — EXACTLY the score-improvement inequality, so the
+      published exchange rate is the only tunable and no second cap can disagree
+      with it.
+
+    On a dense field the two objectives trade inversely (a Cell covering fewer
+    frames implies more Cells touched per frame), so this is the honest
+    formulation: the rule may buy a shorter tail, but never at a price above the
+    published ``tail_weight`` exchange rate, and never by lengthening the tail.
+    """
+    if int(candidate.max_slots) > int(baseline.max_slots):
+        return False
+    saved_tail = int(baseline.max_slots) - int(candidate.max_slots)
+    allowed_total = int(baseline.total_slots) + int(tail_weight) * saved_tail
+    return int(candidate.total_slots) <= int(allowed_total)
+
+
+def better_load(
+    candidate: MembershipLoad,
+    incumbent: MembershipLoad,
+    tail_weight: int = LOAD_TAIL_WEIGHT,
+) -> bool:
+    """True when ``candidate`` should REPLACE ``incumbent`` under the rule.
+
+    Deterministic total order: acceptance guards first, then the integer score
+    (STRICTLY lower), then (tie-breaks) fewer total slots, lower tail, fewer
+    Cells, and finally the lexicographic ``(nx, ny)``. Two runs on the same
+    inputs always return the same grid.
+    """
+    if not load_candidate_is_acceptable(candidate, incumbent, tail_weight):
+        return False
+    a = (candidate.score(), candidate.total_slots, candidate.max_slots,
+         candidate.cells, candidate.nx, candidate.ny)
+    b = (incumbent.score(), incumbent.total_slots, incumbent.max_slots,
+         incumbent.cells, incumbent.nx, incumbent.ny)
+    return a < b
+
+
+# ---------------------------------------------------------------------------
 # Layout decision + choose_layout
 # ---------------------------------------------------------------------------
 
