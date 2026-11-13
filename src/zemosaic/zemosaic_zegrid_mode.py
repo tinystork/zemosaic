@@ -9302,6 +9302,33 @@ def _build_execution_bundle(
                     "external": True,
                 }
                 chosen_tile = int(external_selection["tile"])
+                # ZM-ZEGRID-PER-CELL-SCHEDULER (rework-2): the EXTERNAL class is
+                # the one the user's real run admitted, so it publishes the SAME
+                # per-cell reservation block as a phase plan — from the SAME
+                # ``reservation_bytes`` inputs (stream bound of the tile under
+                # trial + measured observations). No sound reservation => no
+                # block => the historical serial cell path (never a guess).
+                _ext_stream_bounds = _stream_by_idx(chosen_tile)
+                _ext_reservations = {
+                    str(cell_ctxs[int(_idx)][2].cell_id): int(
+                        zal.reservation_bytes(
+                            int(_n), int(_area), int(_ext_stream_bounds[int(_idx)]),
+                            observations=_memory_observations,
+                        )
+                    )
+                    for _idx, _n, _hw, _area in active
+                }
+                _ext_block = zpar.external_dispatch_reservation(
+                    reservations_by_cell=_ext_reservations,
+                    budget_bytes=int(budget_bytes),
+                    shared_bytes=int(shared_bytes),
+                    cpu_count=cpu_count,
+                    cells_in_flight=int(plan.get("cells_in_flight", 1)),
+                    source=("measured" if _memory_observations else "model"),
+                    n_cells=len(_ext_reservations),
+                )
+                if _ext_block is not None:
+                    plan["reservation"] = _ext_block
                 # F4: the external pseudo-plan is CPU-only (spool + exact
                 # column reduction). A GPU was detected but is NOT part of
                 # this admission: clear the GPU execution facts so no downstream
@@ -18509,6 +18536,13 @@ def _run_single(
     _res_line = zpar.reservation_log_line(_plan)
     if _res_line:
         _emit(_res_line, callback=progress_callback)
+    elif str(_plan.get("mode")) == "external":
+        _emit(
+            "ZeGrid: cell memory reservation — unavailable for this external "
+            "plan; the historical serial cell path is kept (never a guessed "
+            "cap)",
+            lvl="WARN", callback=progress_callback,
+        )
     for c in _plan["candidates"]:
         _mk = c.get("makespan_rel")
         _feas = c.get("feasible", True)

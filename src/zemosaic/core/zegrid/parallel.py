@@ -1067,7 +1067,7 @@ DISPATCH_REASON_NOTHING_FITS = "nothing_fits_serial_k1"
 # pool for the STREAMING execution mode. An in-memory plan sized K from the
 # IN-MEMORY bounds, so dispatching it against stream-sized reservations would
 # oversubscribe RAM; it keeps the historical whole-batch ``pmap`` untouched.
-DISPATCH_EXECUTION_MODES = ("stream",)
+DISPATCH_EXECUTION_MODES = ("stream", "external")
 
 THREAD_EXECUTOR_WARNING = (
     "ZeGrid: cell dispatch — thread executor (no process parallelism)"
@@ -1088,6 +1088,64 @@ def dispatch_is_applicable(chosen_mode, reservations, cap, n_tasks) -> bool:
         and int(cap) > 1
         and int(n_tasks) > 1
     )
+
+
+def external_dispatch_reservation(
+    *,
+    reservations_by_cell,
+    budget_bytes,
+    shared_bytes,
+    cpu_count,
+    cells_in_flight=1,
+    source="model",
+    n_cells=None,
+):
+    """Reservation block for the EXTERNAL pseudo-plan (same shape as a phase plan).
+
+    The external class streams from disk: its per-cell reservation is the
+    external host bound of the tile/batch the cell actually executes. The cap is
+    derived ONCE here and is shrink-only: the CPU cap, further bounded by how
+    many reservations fit the decision budget (90 % of the plan budget)::
+
+        cap = min(cpu_cap, (decision - shared) // max_reservation, n_cells)
+
+    Returns ``None`` when no sound reservation exists (empty map, a zero bound,
+    or a non-positive budget): the caller then keeps the historical serial path
+    rather than guessing.
+    """
+    rows = {
+        str(cid): int(res)
+        for cid, res in dict(reservations_by_cell or {}).items()
+    }
+    if not rows or any(v <= 0 for v in rows.values()):
+        return None
+    if budget_bytes is None:
+        return None
+    budget = int(budget_bytes)
+    if budget <= 0:
+        return None
+    shared = max(0, int(shared_bytes))
+    decision = int(budget * (1.0 - RESERVATION_BUDGET_HEADROOM_FRAC))
+    max_res = max(rows.values())
+    cell_id = max(rows, key=lambda cid: rows[cid])
+    n = int(n_cells) if n_cells is not None else len(rows)
+    cpu_cap = max(1, min(max(1, int(cpu_count or 1) - _CPU_OS_RESERVE), max(1, n)))
+    by_budget = max(1, (max(0, decision - shared)) // max(1, max_res))
+    cap = int(max(1, min(cpu_cap, by_budget, max(1, n))))
+    return {
+        "budget_bytes": int(budget),
+        "decision_budget_bytes": int(decision),
+        "headroom_fraction": float(RESERVATION_BUDGET_HEADROOM_FRAC),
+        "reservation_bytes": int(max_res),
+        "source": str(source),
+        "cell_id": str(cell_id),
+        "cells_in_flight": int(cells_in_flight),
+        "dispatch_cap": int(cap),
+        "reason": (
+            f"external dispatch cap = min(cpu {cpu_cap}, budget {by_budget}, "
+            f"cells {n}) = {cap} (per-cell reservation, 90% headroom)"
+        ),
+    }
 
 
 def dispatch_reservation_bound(inmem_bound_bytes, stream_bound_bytes, chosen_mode):

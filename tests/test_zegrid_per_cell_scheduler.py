@@ -267,3 +267,91 @@ def test_thread_executor_fallback_warns_once_and_completes(monkeypatch):
         if lvl == "WARN" and "thread executor" in msg
     ]
     assert warnings == [zpar.THREAD_EXECUTOR_WARNING]
+
+
+# ---------------------------------------------------------------------------
+# Rework-2: the EXTERNAL class (the user's real run) must dispatch per cell
+# ---------------------------------------------------------------------------
+
+def _external_block(n_cells=8, reservation=2 * GIB, budget=16667 * MIB):
+    return zpar.external_dispatch_reservation(
+        reservations_by_cell={f"cell-{i}": reservation for i in range(n_cells)},
+        budget_bytes=budget,
+        shared_bytes=0,
+        cpu_count=16,
+        cells_in_flight=1,
+        source="model",
+    )
+
+
+def test_external_plan_publishes_a_sound_reservation_block_and_log_line():
+    block = _external_block()
+    assert block is not None
+    assert block["reservation_bytes"] == 2 * GIB
+    assert block["decision_budget_bytes"] == int(16667 * MIB * 0.9)
+    assert block["dispatch_cap"] > 1
+    # cap = min(cpu 14, (decision // 2 GiB) = 7, 8 cells) = 7
+    assert block["dispatch_cap"] == 7
+    assert "external dispatch cap" in block["reason"]
+
+    line = zpar.reservation_log_line(
+        {"mode": "external", "cells_in_flight": 1, "reservation": block}
+    )
+    assert line is not None
+    assert "dispatch_cap=7" in line
+    assert "cell=cell-0" in line
+    assert "budget=16667.0MiB" in line
+
+    # no sound reservation => None (the caller keeps the historical serial path)
+    assert zpar.external_dispatch_reservation(
+        reservations_by_cell={}, budget_bytes=1 * GIB, shared_bytes=0, cpu_count=16
+    ) is None
+    assert zpar.external_dispatch_reservation(
+        reservations_by_cell={"c": 0}, budget_bytes=1 * GIB, shared_bytes=0, cpu_count=16
+    ) is None
+
+
+def test_external_mode_dispatches_per_cell():
+    assert zpar.dispatch_is_applicable(
+        "external", {"a": 1 * GIB}, 7, 8
+    ) is True
+    # inmem stays structurally excluded (M1 regression)
+    assert zpar.dispatch_is_applicable(
+        "inmem", {"a": 1 * GIB}, 7, 8
+    ) is False
+    out, meta, logs = _run(
+        [2 * GIB] * 6, budget=16667 * MIB, cap=6, sleep=0.5
+    )
+    assert [r["index"] for r in out] == list(range(6))
+    assert meta["scheduler"] == "per_cell_reservation"
+    assert meta["max_concurrent"] > 1
+
+
+def test_external_concurrent_reservations_never_exceed_the_decision_budget():
+    # ``decision_budget_bytes`` is ALREADY the 90 % figure (the production
+    # caller passes 0.9 x plan budget, exactly like the phase planner).
+    decision = int(16667 * MIB * 0.9)
+    out, meta, logs = _run(
+        [2 * GIB] * 8, budget=decision, cap=8, sleep=0.5
+    )
+    assert [r["index"] for r in out] == list(range(8))
+    for event in meta["events"]:
+        if event["event"] == "dispatch":
+            assert event["running_bytes"] <= decision
+    # 7 x 2 GiB fits (14 GiB <= 14.65 GiB), an 8th does not
+    assert meta["max_concurrent"] == 7
+
+
+def test_external_path_is_byte_identical_sequential_vs_dispatched():
+    tasks = _tasks(6)
+    seq = [zpar.pmap(_plane_worker, [t], workers=1)[0] for t in tasks]
+    meta = {}
+    sched = zpar.pmap_reserved(
+        _plane_worker, tasks, [2 * GIB] * 6,
+        shared_bytes=0, decision_budget_bytes=int(16667 * MIB * 0.9), workers=6,
+        cell_ids=[t["cell"] for t in tasks], meta=meta,
+    )
+    assert zpar.dispatch_is_applicable("external", {"x": 1}, 6, 6)
+    assert [s["digest"] for s in sched] == [s["digest"] for s in seq]
+    assert [s["nbytes"] for s in sched] == [s["nbytes"] for s in seq]
+    assert meta["max_concurrent"] > 1
