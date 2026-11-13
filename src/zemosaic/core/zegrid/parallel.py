@@ -1090,6 +1090,24 @@ def dispatch_is_applicable(chosen_mode, reservations, cap, n_tasks) -> bool:
     )
 
 
+def dispatch_wave_bound(chosen_mode, dispatch_cap, units_in_flight) -> int:
+    """How many cells ONE wave may contain (ZM-ZEGRID-PER-CELL-SCHEDULER).
+
+    The WAVE DRIVER must slice by the dispatch cap, never by the plan-wide K:
+    for the external class the plan K is 1, and slicing by it made every wave a
+    single cell, starving the per-cell queue (production defect #5). A
+    non-dispatchable plan (in-memory, missing cap) keeps the historical K.
+    """
+    try:
+        cap = int(dispatch_cap or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    k = max(1, int(units_in_flight or 1))
+    if str(chosen_mode) in DISPATCH_EXECUTION_MODES and cap > 1:
+        return int(cap)
+    return int(k)
+
+
 def external_dispatch_reservation(
     *,
     reservations_by_cell,

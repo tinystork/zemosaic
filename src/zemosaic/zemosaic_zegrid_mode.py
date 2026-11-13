@@ -19568,7 +19568,16 @@ def _run_single(
                     1 for step in record["shrink_steps"] if step["accepted"]
                 )
 
-            units_bound = int(mapping["units_in_flight"])
+            # ZM-ZEGRID-PER-CELL-SCHEDULER (rework-4): a WAVE is sliced by the
+            # DISPATCH cap, never by the plan-wide K. The external class has
+            # K == 1, and slicing by it made every wave ONE cell — the queue was
+            # downstream of a size-1 wave and could never engage. A
+            # non-dispatchable plan (in-memory, no cap) keeps the historical K.
+            units_bound = zpar.dispatch_wave_bound(
+                bundle.chosen_mode,
+                getattr(bundle, "cell_dispatch_cap", 0),
+                int(mapping["units_in_flight"]),
+            )
             start, end = zrt.next_wave_bound(
                 offset, total_tasks, units_bound
             )

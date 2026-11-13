@@ -26,6 +26,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from zemosaic.core.zegrid import parallel as zpar  # noqa: E402
+from zemosaic.core.zegrid import runtime_control as zrt  # noqa: E402
 
 MIB = 2 ** 20
 GIB = 2 ** 30
@@ -413,3 +414,64 @@ def test_heavy_tail_cap_is_cpu_bound_and_lights_still_overlap():
     for e in events:
         if e["event"] == "dispatch":
             assert e["running_bytes"] <= int(16667 * MIB * 0.9)
+
+
+# ---------------------------------------------------------------------------
+# Rework-4: the WAVE must be sliced by the DISPATCH cap, not the plan-wide K
+# ---------------------------------------------------------------------------
+
+def test_dispatchable_plan_slices_waves_by_the_dispatch_cap():
+    # Production defect #5: the external plan has K=1, so every wave was ONE
+    # cell and pmap ran serial (tasks=1). The wave bound is now the cap.
+    assert zpar.dispatch_wave_bound("external", 6, 1) == 6
+    assert zpar.dispatch_wave_bound("stream", 6, 1) == 6
+
+    total, cap = 12, 6
+    offset, waves = 0, []
+    while offset < total:
+        bound = zpar.dispatch_wave_bound("external", cap, 1)
+        start, end = zrt.next_wave_bound(offset, total, bound)
+        waves.append((start, end))
+        offset = end
+    # two waves of six cells, never twelve waves of one
+    assert waves == [(0, 6), (6, 12)]
+    assert [end - start for start, end in waves] == [6, 6]
+
+    # …and a wave of six really overlaps when dispatched
+    out, meta, logs = _run([2 * GIB] * 6, budget=int(16667 * MIB * 0.9), cap=6,
+                           sleep=0.4)
+    assert [r["index"] for r in out] == list(range(6))
+    assert meta["max_concurrent"] > 1
+
+
+def test_non_dispatchable_plan_keeps_the_historical_wave_bound():
+    # inmem: plan-wide K governs (M1 stays closed)
+    assert zpar.dispatch_wave_bound("inmem", 6, 1) == 1
+    # no cap published / cap of 1: historical K
+    assert zpar.dispatch_wave_bound("stream", 0, 3) == 3
+    assert zpar.dispatch_wave_bound("external", 1, 4) == 4
+    # a legacy/unknown mode keeps the historical K
+    assert zpar.dispatch_wave_bound("legacy", 8, 2) == 2
+
+
+def test_multi_wave_run_is_byte_identical_to_the_sequential_run():
+    tasks = _tasks(12)
+    seq = [zpar.pmap(_plane_worker, [t], workers=1)[0] for t in tasks]
+    out = []
+    meta_all = []
+    for start in (0, 6):
+        meta = {}
+        out.extend(
+            zpar.pmap_reserved(
+                _plane_worker, tasks[start:start + 6], [2 * GIB] * 6,
+                shared_bytes=0,
+                decision_budget_bytes=int(16667 * MIB * 0.9),
+                workers=zpar.dispatch_wave_bound("external", 6, 1),
+                cell_ids=[t["cell"] for t in tasks[start:start + 6]],
+                meta=meta,
+            )
+        )
+        meta_all.append(meta)
+    assert [r["index"] for r in out] == list(range(12))
+    assert [r["digest"] for r in out] == [r["digest"] for r in seq]
+    assert all(m["max_concurrent"] > 1 for m in meta_all)
