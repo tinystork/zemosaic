@@ -1130,8 +1130,12 @@ def external_dispatch_reservation(
     cell_id = max(rows, key=lambda cid: rows[cid])
     n = int(n_cells) if n_cells is not None else len(rows)
     cpu_cap = max(1, min(max(1, int(cpu_count or 1) - _CPU_OS_RESERVE), max(1, n)))
-    by_budget = max(1, (max(0, decision - shared)) // max(1, max_res))
-    cap = int(max(1, min(cpu_cap, by_budget, max(1, n))))
+    # ZM-ZEGRID-PER-CELL-SCHEDULER (rework-3): ``dispatch_cap`` is ONLY the pool
+    # size / worker upper bound — the CPU cap. The BUDGET is enforced per cell at
+    # dispatch time by ``dispatch_fits(shared, running, reservation, decision)``,
+    # so deriving the cap from the MAX reservation would silently reinstate the
+    # plan-wide-worst-cell defect (one 14 GiB tail cell -> cap 1 -> no queue).
+    cap = int(max(1, min(cpu_cap, max(1, n))))
     return {
         "budget_bytes": int(budget),
         "decision_budget_bytes": int(decision),
@@ -1142,8 +1146,9 @@ def external_dispatch_reservation(
         "cells_in_flight": int(cells_in_flight),
         "dispatch_cap": int(cap),
         "reason": (
-            f"external dispatch cap = min(cpu {cpu_cap}, budget {by_budget}, "
-            f"cells {n}) = {cap} (per-cell reservation, 90% headroom)"
+            f"external dispatch cap = min(cpu {cpu_cap}, cells {n}) = {cap} "
+            "(budget enforced per cell at dispatch, 90% headroom on "
+            f"decision {decision} B)"
         ),
     }
 

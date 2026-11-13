@@ -290,15 +290,16 @@ def test_external_plan_publishes_a_sound_reservation_block_and_log_line():
     assert block["reservation_bytes"] == 2 * GIB
     assert block["decision_budget_bytes"] == int(16667 * MIB * 0.9)
     assert block["dispatch_cap"] > 1
-    # cap = min(cpu 14, (decision // 2 GiB) = 7, 8 cells) = 7
-    assert block["dispatch_cap"] == 7
+    # rework-3: the cap is the CPU bound (min(cpu 14, 8 cells) = 8), NOT the
+    # reservation-derived budget: the budget is enforced per cell at dispatch.
+    assert block["dispatch_cap"] == 8
     assert "external dispatch cap" in block["reason"]
 
     line = zpar.reservation_log_line(
         {"mode": "external", "cells_in_flight": 1, "reservation": block}
     )
     assert line is not None
-    assert "dispatch_cap=7" in line
+    assert "dispatch_cap=8" in line
     assert "cell=cell-0" in line
     assert "budget=16667.0MiB" in line
 
@@ -355,3 +356,60 @@ def test_external_path_is_byte_identical_sequential_vs_dispatched():
     assert [s["digest"] for s in sched] == [s["digest"] for s in seq]
     assert [s["nbytes"] for s in sched] == [s["nbytes"] for s in seq]
     assert meta["max_concurrent"] > 1
+
+
+# ---------------------------------------------------------------------------
+# Rework-3: HEAVY-TAIL regression — the cap must not be reservation-derived
+# ---------------------------------------------------------------------------
+
+def test_heavy_tail_cap_is_cpu_bound_and_lights_still_overlap():
+    heavy = 14 * GIB
+    light = 2 * GIB
+    reservations = [heavy] + [light] * 7
+    block = zpar.external_dispatch_reservation(
+        reservations_by_cell={
+            f"cell-{i}": r for i, r in enumerate(reservations)
+        },
+        budget_bytes=16667 * MIB,
+        shared_bytes=0,
+        cpu_count=8,
+        cells_in_flight=1,
+        n_cells=len(reservations),
+    )
+    assert block is not None
+    # CPU cap = min(8 - 2 OS reserve, 8 cells) = 6 — NOT 1 from the 14 GiB cell.
+    assert block["dispatch_cap"] == 6
+    assert block["dispatch_cap"] > 1
+    # the max reservation and its cell are still published (informative)
+    assert block["reservation_bytes"] == heavy
+    assert block["cell_id"] == "cell-0"
+
+    tasks = _tasks(8)
+    tasks[0]["sleep"] = 0.7
+    for t in tasks[1:]:
+        t["sleep"] = 0.35
+    out, meta, logs = _run(
+        reservations, budget=int(16667 * MIB * 0.9), cap=block["dispatch_cap"],
+        tasks=tasks,
+    )
+    assert [r["index"] for r in out] == list(range(8))
+    events = meta["events"]
+    first = events[0]
+    assert first["event"] == "dispatch" and first["index"] == 0
+    assert first["k"] == 1                      # the heavy cell runs ALONE
+    done_heavy = next(
+        i for i, e in enumerate(events)
+        if e["event"] == "done" and e["index"] == 0
+    )
+    light_dispatches = [
+        i for i, e in enumerate(events)
+        if e["event"] == "dispatch" and e["index"] != 0
+    ]
+    assert light_dispatches and min(light_dispatches) > done_heavy
+    # …then the light cells overlap (up to the CPU cap)
+    assert meta["max_concurrent"] >= 2
+    assert meta["max_concurrent"] == 6
+    # and no dispatch ever exceeded the decision budget
+    for e in events:
+        if e["event"] == "dispatch":
+            assert e["running_bytes"] <= int(16667 * MIB * 0.9)
