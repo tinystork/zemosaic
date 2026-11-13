@@ -9551,7 +9551,12 @@ def _build_execution_bundle(
                 zal.reservation_bytes(
                     int(len(_cs_mem.patch_ids)),
                     int(_cs_patch.patch.width) * int(_cs_patch.patch.height),
-                    int(_cs_stream),
+                    # The bound of the mode this cell ACTUALLY executes. An
+                    # in-memory plan must never be described by a stream bound
+                    # (the M1 oversubscription class).
+                    zpar.dispatch_reservation_bound(
+                        _cs_inmem, _cs_stream, chosen_mode
+                    ),
                     observations=_memory_observations,
                 )
             )
@@ -18841,9 +18846,9 @@ def _run_single(
         _res_list = None
         if (
             not gpu_attempt
-            and _dispatch_reservations
-            and _dispatch_cap > 1
-            and len(_tasks) > 1
+            and zpar.dispatch_is_applicable(
+                chosen_mode, _dispatch_reservations, _dispatch_cap, len(_tasks)
+            )
         ):
             _res_list = [
                 int(_dispatch_reservations.get(str(t[0].cell_id), -1))

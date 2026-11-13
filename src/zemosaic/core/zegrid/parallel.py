@@ -1063,6 +1063,39 @@ def plan_cell_concurrency(
 
 DISPATCH_REASON_NOTHING_FITS = "nothing_fits_serial_k1"
 
+# ZM-ZEGRID-PER-CELL-SCHEDULER: the per-cell queue only replaces the plan-wide
+# pool for the STREAMING execution mode. An in-memory plan sized K from the
+# IN-MEMORY bounds, so dispatching it against stream-sized reservations would
+# oversubscribe RAM; it keeps the historical whole-batch ``pmap`` untouched.
+DISPATCH_EXECUTION_MODES = ("stream",)
+
+THREAD_EXECUTOR_WARNING = (
+    "ZeGrid: cell dispatch — thread executor (no process parallelism)"
+)
+
+
+def dispatch_is_applicable(chosen_mode, reservations, cap, n_tasks) -> bool:
+    """True only when the per-cell queue may replace the historical ``pmap``.
+
+    Structural guard for the OOM class found in review: an in-memory plan's K
+    was derived from the in-memory bounds, so it may NEVER be dispatched against
+    streaming reservations. Missing reservations, a single cell or a cap of 1
+    keep the historical executor too.
+    """
+    return (
+        str(chosen_mode) in DISPATCH_EXECUTION_MODES
+        and bool(reservations)
+        and int(cap) > 1
+        and int(n_tasks) > 1
+    )
+
+
+def dispatch_reservation_bound(inmem_bound_bytes, stream_bound_bytes, chosen_mode):
+    """The bound of the mode the cell ACTUALLY executes (never the other one)."""
+    if str(chosen_mode) == "inmem":
+        return int(inmem_bound_bytes)
+    return int(stream_bound_bytes)
+
 
 def dispatch_fits(running_bytes, reservation_bytes, shared_bytes, budget_bytes):
     """True when a NEW cell fits the remaining decision budget.
@@ -1273,6 +1306,10 @@ def pmap_reserved(
     if meta is not None:
         meta["executor"] = kind
         meta["fallback"] = False
+    if kind == "thread":
+        # A CPU-bound batch on threads does not parallelise (GIL): say it ONCE,
+        # loudly, so a silent placebo can never be mistaken for a speed-up.
+        _surf(THREAD_EXECUTOR_WARNING, "WARN")
 
     try:
         if kind == "thread":

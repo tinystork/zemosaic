@@ -209,3 +209,61 @@ def test_dispatch_fits_predicate_counts_shared_once():
     assert zpar.dispatch_fits(0, 3, 1, 4) is True
     assert zpar.dispatch_fits(1, 3, 1, 4) is False
     assert zpar.dispatch_fits(10 ** 12, 10 ** 12, 0, None) is True
+
+
+# ---------------------------------------------------------------------------
+# Rework-1 (M1): an IN-MEMORY plan can never enter the per-cell queue
+# ---------------------------------------------------------------------------
+
+def test_inmem_plan_is_structurally_excluded_from_the_dispatch_queue():
+    reservations = {"cell-0": 8 * GIB}
+    # M1: dispatching an in-memory plan against stream-sized reservations could
+    # oversubscribe RAM. The gate must be False regardless of cap/task count.
+    assert zpar.dispatch_is_applicable("inmem", reservations, 8, 40) is False
+    assert zpar.dispatch_is_applicable("inmem", reservations, 2, 2) is False
+    # …and the reservation itself uses the IN-MEMORY bound for that mode.
+    assert zpar.dispatch_reservation_bound(8 * GIB, 2 * GIB, "inmem") == 8 * GIB
+    assert zpar.dispatch_reservation_bound(8 * GIB, 2 * GIB, "stream") == 2 * GIB
+    # the streaming plan keeps the queue
+    assert zpar.dispatch_is_applicable("stream", reservations, 8, 40) is True
+    # no reservations / a single cell / a cap of 1 keep the historical path
+    assert zpar.dispatch_is_applicable("stream", {}, 8, 40) is False
+    assert zpar.dispatch_is_applicable("stream", reservations, 8, 1) is False
+    assert zpar.dispatch_is_applicable("stream", reservations, 1, 40) is False
+
+
+# ---------------------------------------------------------------------------
+# Rework-1: a streaming-mode plan still dispatches per cell
+# ---------------------------------------------------------------------------
+
+def test_streaming_plan_still_dispatches_per_cell():
+    assert zpar.dispatch_is_applicable("stream", {"c": 1 * GIB}, 4, 4)
+    out, meta, logs = _run([1 * GIB] * 4, budget=6 * GIB, cap=4, sleep=0.5)
+    assert [r["index"] for r in out] == [0, 1, 2, 3]
+    assert meta["max_concurrent"] > 1
+    assert meta["scheduler"] == "per_cell_reservation"
+
+
+# ---------------------------------------------------------------------------
+# Rework-1 (L2): a THREAD fallback warns ONCE and still completes
+# ---------------------------------------------------------------------------
+
+def test_thread_executor_fallback_warns_once_and_completes(monkeypatch):
+    monkeypatch.setattr(zpar, "_parent_is_daemonic", lambda: True)
+    tasks = _tasks(3, sleep=0.05)
+    logs = []
+    meta = {}
+    out = zpar.pmap_reserved(
+        _sleep_worker, tasks, [1 * GIB] * 3,
+        shared_bytes=0, decision_budget_bytes=6 * GIB, workers=3,
+        cell_ids=[t["cell"] for t in tasks],
+        emit=lambda msg, lvl="INFO": logs.append((lvl, msg)),
+        meta=meta,
+    )
+    assert [r["index"] for r in out] == [0, 1, 2]
+    assert meta["executor"] == "thread"
+    warnings = [
+        msg for lvl, msg in logs
+        if lvl == "WARN" and "thread executor" in msg
+    ]
+    assert warnings == [zpar.THREAD_EXECUTOR_WARNING]
