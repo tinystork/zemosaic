@@ -16601,7 +16601,28 @@ def _run_single(
             }
             if extra:
                 ctx.update(extra)
-            telemetry.maybe_emit_stats(ctx)
+            # ZM-ZEGRID-DISK-TELEMETRY: a phase/substep boundary is a FORCED
+            # sample, so the (rate-limited) cache walk and the process-tree I/O
+            # deltas are recorded there. A mid-phase update keeps the historical
+            # rate-limited behaviour.
+            _is_boundary = phase_name is not None or phase_index is not None
+            try:
+                _payload = telemetry.emit_stats(ctx, force=_is_boundary)
+            except Exception:
+                _payload = None
+            try:
+                _disk_line = telemetry.format_disk_line(_payload)
+                _phase_token = (
+                    int(ctx["phase_index"]), str(ctx["phase_name"])
+                )
+                if (
+                    _disk_line
+                    and _telemetry_state.get("disk_line_phase") != _phase_token
+                ):
+                    _telemetry_state["disk_line_phase"] = _phase_token
+                    _emit(_disk_line, callback=progress_callback)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -16950,6 +16971,13 @@ def _run_single(
     cache_root = _prepare_run_cache_root(
         Path(_temp_root) / CACHE_DIR_NAME, emit=_emit_live
     )
+    # ZM-ZEGRID-DISK-TELEMETRY: attach the root ONCE it is known. Pure observer;
+    # a failure can never affect the run.
+    try:
+        if telemetry is not None:
+            telemetry.set_cache_root(cache_root)
+    except Exception:
+        pass
     if str(Path(_temp_root)) != str(Path(output_dir)):
         _emit(
             f"ZeGrid: temporary work root = {_temp_root} (outputs stay in {output_dir})",

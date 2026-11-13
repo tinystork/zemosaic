@@ -541,6 +541,29 @@ def _sample_runtime_resources_for_telemetry() -> dict:
     return info
 
 
+def _fmt_bytes(value) -> str:
+    try:
+        amount = float(value)
+    except Exception:
+        return "n/a"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(amount) < 1024.0 or unit == "PiB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    return f"{amount:.1f} PiB"
+
+
+def _fmt_delta(value) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        amount = float(value)
+    except Exception:
+        return "n/a"
+    sign = "+" if amount >= 0 else "-"
+    return sign + _fmt_bytes(abs(amount))
+
+
 class ResourceTelemetryController:
     _DEFAULT_FIELDS = [
         "timestamp_iso",
@@ -570,6 +593,18 @@ class ResourceTelemetryController:
         "gpu_max_chunk_bytes",
         "use_gpu",
         "use_gpu_phase5",
+        # ZM-ZEGRID-DISK-TELEMETRY: APPEND-ONLY columns. Existing readers keep
+        # working (same names, same order, new columns at the end).
+        "cache_bytes",
+        "cache_files",
+        "cache_delta_bytes",
+        "io_read_bytes",
+        "io_write_bytes",
+        "io_read_delta_bytes",
+        "io_write_delta_bytes",
+        "phase_elapsed_s",
+        "disk_unavailable_reason",
+        "io_unavailable_reason",
     ]
 
     def __init__(
@@ -580,6 +615,8 @@ class ResourceTelemetryController:
         csv_path: str | None = None,
         *,
         log_and_callback: Callable | None = None,
+        cache_root: str | None = None,
+        disk_min_interval_sec: float = 5.0,
     ) -> None:
         self.enabled = bool(enabled)
         self.interval_sec = float(interval_sec) if interval_sec and interval_sec > 0 else 1.5
@@ -597,6 +634,173 @@ class ResourceTelemetryController:
         # resource probe + CSV write so two emitters cannot interleave a row or
         # race the interval gate. RLock: a callback may re-enter harmlessly.
         self._emit_lock = threading.RLock()
+        # ZM-ZEGRID-DISK-TELEMETRY: additive, non-intrusive measurement state.
+        # The cache walk is EXPENSIVE on a million-file tree, so it runs ONLY on
+        # a forced (phase-boundary) sample and at most once per
+        # ``disk_min_interval_sec``. IO counters are cheap and read per sample.
+        self._cache_root = None if cache_root is None else str(cache_root)
+        self._disk_min_interval_sec = max(0.0, float(disk_min_interval_sec))
+        self._last_disk_walk = 0.0
+        self._last_cache_bytes = None
+        self._last_cache_files = None
+        self._last_io = None
+        self._phase_started = None
+        self._phase_key = None
+        self._disk_walk_calls = 0
+        self._last_disk_payload: dict = {}
+
+    def set_cache_root(self, path) -> None:
+        """Attach the run's cache root (called once it is known). Never raises."""
+        try:
+            self._cache_root = None if path is None else str(path)
+        except Exception:
+            pass
+
+    def _walk_cache(self) -> tuple[int, int]:
+        """Recursive (bytes, files) of the cache root. Counts one walk."""
+        self._disk_walk_calls += 1
+        total = 0
+        files = 0
+        root = self._cache_root
+        if not root:
+            raise FileNotFoundError("no cache root configured")
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += int(entry.stat(follow_symlinks=False).st_size)
+                            files += 1
+                    except OSError:
+                        continue
+        return total, files
+
+    def _io_totals(self):
+        """(read_bytes, write_bytes) of this process tree, or (None, reason)."""
+        try:
+            import psutil  # local import: absent psutil is a reason, not a crash
+        except Exception:
+            return None, "psutil_unavailable"
+        try:
+            process = psutil.Process(os.getpid())
+            counters = process.io_counters()
+            read_total = int(counters.read_bytes)
+            write_total = int(counters.write_bytes)
+            try:
+                children = process.children(recursive=True)
+            except Exception:
+                children = []
+            for child in children:
+                try:
+                    child_counters = child.io_counters()
+                    read_total += int(child_counters.read_bytes)
+                    write_total += int(child_counters.write_bytes)
+                except Exception:
+                    continue
+            return (read_total, write_total), None
+        except Exception as exc:  # permission, missing counters, race
+            return None, f"{type(exc).__name__}: {exc}"
+
+    def _disk_payload(self, context: dict, *, force: bool, now: float) -> dict:
+        """Additive disk/IO sample. Never raises; reasons instead of zeros."""
+        payload: dict = {}
+        phase_name = str(context.get("phase_name") or "")
+        phase_key = (context.get("phase_index"), phase_name)
+        if self._phase_key != phase_key:
+            self._phase_key = phase_key
+            self._phase_started = now
+        if self._phase_started is not None:
+            payload["phase_elapsed_s"] = round(max(0.0, now - self._phase_started), 3)
+        else:
+            payload["phase_elapsed_s"] = None
+
+        # ---- cache volume: forced samples only, rate-limited ----
+        if not self._cache_root:
+            payload["disk_unavailable_reason"] = "no_cache_root"
+        elif not force:
+            payload["disk_unavailable_reason"] = (
+                "cache_sampled_on_phase_boundaries_only"
+            )
+        elif self._last_disk_walk and (
+            (now - self._last_disk_walk) < self._disk_min_interval_sec
+        ):
+            payload["cache_bytes"] = self._last_cache_bytes
+            payload["cache_files"] = self._last_cache_files
+            payload["cache_delta_bytes"] = 0
+            payload["disk_unavailable_reason"] = "rate_limited"
+        else:
+            previous = self._last_cache_bytes
+            try:
+                cache_bytes, cache_files = self._walk_cache()
+                self._last_disk_walk = now
+                self._last_cache_bytes = int(cache_bytes)
+                self._last_cache_files = int(cache_files)
+                payload["cache_bytes"] = int(cache_bytes)
+                payload["cache_files"] = int(cache_files)
+                payload["cache_delta_bytes"] = (
+                    None if previous is None else int(cache_bytes) - int(previous)
+                )
+            except Exception as exc:
+                payload["disk_unavailable_reason"] = (
+                    f"cache_walk_failed: {type(exc).__name__}: {exc}"
+                )
+                # Explicitly EMPTY (never a fabricated zero).
+                payload["cache_bytes"] = None
+                payload["cache_files"] = None
+                payload["cache_delta_bytes"] = None
+
+        # ---- process-tree I/O: cheap, every sample ----
+        current, reason = self._io_totals()
+        if current is None:
+            payload["io_unavailable_reason"] = str(reason)
+            # Explicitly EMPTY (the CSV writes empty, never 0).
+            payload["io_read_bytes"] = None
+            payload["io_write_bytes"] = None
+            payload["io_read_delta_bytes"] = None
+            payload["io_write_delta_bytes"] = None
+        else:
+            previous_io = self._last_io
+            payload["io_read_bytes"] = int(current[0])
+            payload["io_write_bytes"] = int(current[1])
+            if previous_io is None:
+                payload["io_read_delta_bytes"] = None
+                payload["io_write_delta_bytes"] = None
+            else:
+                payload["io_read_delta_bytes"] = int(current[0]) - int(previous_io[0])
+                payload["io_write_delta_bytes"] = int(current[1]) - int(previous_io[1])
+            self._last_io = (int(current[0]), int(current[1]))
+        return payload
+
+    def format_disk_line(self, payload: dict | None = None) -> str | None:
+        """One human-readable disk line, or None when nothing was measured."""
+        data = self._last_disk_payload if payload is None else payload
+        if not data:
+            return None
+        parts = []
+        if data.get("cache_bytes") is not None:
+            parts.append(
+                f"cache={_fmt_bytes(data['cache_bytes'])} "
+                f"({int(data.get('cache_files') or 0)} files), "
+                f"phase delta={_fmt_delta(data.get('cache_delta_bytes'))}"
+            )
+        elif data.get("disk_unavailable_reason"):
+            parts.append(f"cache=unavailable ({data['disk_unavailable_reason']})")
+        if data.get("io_read_bytes") is not None:
+            parts.append(
+                f"io read={_fmt_delta(data.get('io_read_delta_bytes'))} "
+                f"write={_fmt_delta(data.get('io_write_delta_bytes'))}"
+            )
+        elif data.get("io_unavailable_reason"):
+            parts.append(f"io=unavailable ({data['io_unavailable_reason']})")
+        if data.get("phase_elapsed_s") is not None:
+            parts.append(f"elapsed={data['phase_elapsed_s']:.1f} s")
+        if not parts:
+            return None
+        return "ZeGrid: disk — " + ", ".join(parts)
 
     def _open_csv_if_needed(self, fieldnames: list[str]) -> None:
         if not self._csv_path or self._csv_writer is not None:
@@ -617,18 +821,18 @@ class ResourceTelemetryController:
             self._csv_file = None
             self._csv_writer = None
 
-    def emit_stats(self, context: dict | None = None, *, force: bool = False) -> None:
+    def emit_stats(self, context: dict | None = None, *, force: bool = False) -> dict | None:
         if not self.enabled or self._callback is None:
-            return
+            return None
         import time as _time
 
         with self._emit_lock:
-            self._emit_stats_locked(context, force=force, _time=_time)
+            return self._emit_stats_locked(context, force=force, _time=_time)
 
-    def _emit_stats_locked(self, context: dict | None, *, force: bool, _time) -> None:
+    def _emit_stats_locked(self, context: dict | None, *, force: bool, _time) -> dict | None:
         now = _time.monotonic()
         if (not force) and self._last_sample and (now - self._last_sample) < self.interval_sec:
-            return
+            return None
         self._last_sample = now
 
         base_context = context.copy() if isinstance(context, dict) else {}
@@ -640,6 +844,15 @@ class ResourceTelemetryController:
         payload.update(base_context)
         payload.update(resources)
         payload["timestamp_iso"] = datetime.utcnow().isoformat() + "Z"
+        # ZM-ZEGRID-DISK-TELEMETRY: additive disk/IO sample. Guarded twice: the
+        # helper itself never raises, and any escape here cannot fail the run.
+        try:
+            payload.update(self._disk_payload(base_context, force=force, now=now))
+        except Exception as exc:
+            payload["disk_unavailable_reason"] = (
+                f"disk_sample_failed: {type(exc).__name__}: {exc}"
+            )
+        self._last_disk_payload = dict(payload)
 
         try:
             self._log_and_callback(
@@ -665,9 +878,10 @@ class ResourceTelemetryController:
                         self._csv_file.flush()
             except Exception:
                 self._csv_path = None
+        return payload
 
-    def maybe_emit_stats(self, context: dict | None = None) -> None:
-        self.emit_stats(context, force=False)
+    def maybe_emit_stats(self, context: dict | None = None) -> dict | None:
+        return self.emit_stats(context, force=False)
 
     def close(self) -> None:
         try:
