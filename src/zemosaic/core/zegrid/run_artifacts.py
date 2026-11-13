@@ -857,6 +857,281 @@ def restore_global_gauge(
 
 
 # ---------------------------------------------------------------------------
+# Gauge IMPORT (ZM-ZEGRID-GAUGE-IMPORT)
+# ---------------------------------------------------------------------------
+
+
+def _gauge_import_refusal(section: str, detail: str, **facts):
+    """One structured refusal for a gauge import, naming the failing section."""
+    from .run_resume import ResumeIncompatible
+
+    reason = {"section": str(section), "detail": str(detail)}
+    reason.update(facts)
+    return ResumeIncompatible(
+        f"gauge import refused ({section}): {detail}",
+        reasons=[reason],
+    )
+
+
+def import_gauge_artifact(
+    gauge_path: str | os.PathLike[str],
+    *,
+    origin_identity: Mapping[str, Any],
+    origin_run_json_path: str | None,
+    expected_frame_rows: Sequence[Mapping[str, Any]],
+    expected_frame_ids: Sequence[str],
+    expected_canvas: Mapping[str, Any],
+    expected_science_params: Mapping[str, Any],
+    expected_mode: str,
+) -> tuple[Any, tuple[str, ...], str | None, dict]:
+    """Verify and import a global gauge artifact produced by ANOTHER run.
+
+    Opt-in only: the caller passes an explicit artifact path and the origin
+    ``run.json`` identity. Every check below is the SAME validator the resume
+    path already trusts:
+
+    * strict JSON + ``artifact_sha256`` self-digest -> :func:`_read_json`,
+      :func:`_self_digest` (identical to :func:`read_gauge_artifact`);
+    * schema/version/coefficient encoding/vectors/exclusions ->
+      :func:`_validate_gauge_document` (identical to the restore path);
+    * origin identity shape/schema -> :func:`run_store.validate_run_identity`;
+    * artifact binding (``run_id`` + ``identity_sha256``) -> the same two checks
+      as :func:`read_gauge_artifact`;
+    * frame set: same ids, order, content digests and sizes -> the origin
+      identity's ``science_contract.inputs`` section;
+    * canvas -> the origin identity's ``science_contract.canvas`` section;
+    * photometric parameters (normalization/weighting/gauge mode/reference) ->
+      the origin identity's ``science_contract.science.params`` (the execution
+      ``backend`` field is EXCLUDED: it is not a photometric parameter and is
+      normalised to the run's effective backend, which a fresh import cannot
+      know here);
+    * gauge coherence: reference frame id/index, mode and the EXACT
+      :func:`gauge_fingerprint` of the decoded gauge must equal BOTH the origin
+      identity's ``gauge.sha256`` and the artifact's own ``gauge_sha256``
+      (identical to :func:`restore_global_gauge`).
+
+    The artifact is only READ (no write, no repair, no normalisation). Returns
+    ``(gauge, frame_ids, reference_frame_id, provenance)``.
+    """
+    from .run_store import StoreFormatError, validate_run_identity
+    from .run_store import identity_sha256 as _identity_sha256
+
+    path = Path(gauge_path)
+    try:
+        raw = _read_json(path, "imported gauge artifact")
+    except Exception as exc:  # unreadable / non-strict JSON / duplicate keys
+        raise _gauge_import_refusal(
+            "artifact",
+            f"the artifact at {str(path)!r} is not a readable strict-JSON "
+            f"gauge document ({type(exc).__name__}: {exc})",
+            gauge_path=str(path),
+        ) from exc
+    artifact_sha = raw.pop("artifact_sha256", None)
+    if not artifact_sha or artifact_sha != _self_digest(raw):
+        raise _gauge_import_refusal(
+            "artifact",
+            "the artifact self-digest does not verify; refusing a corrupt "
+            "gauge (never a best-effort import)",
+            gauge_path=str(path),
+        )
+    try:
+        parsed = _validate_gauge_document(raw)
+    except Exception as exc:
+        raise _gauge_import_refusal(
+            "artifact",
+            f"the artifact does not satisfy {GAUGE_SCHEMA}: "
+            f"{type(exc).__name__}: {exc}",
+            gauge_path=str(path),
+        ) from exc
+
+    try:
+        origin = validate_run_identity(origin_identity)
+    except StoreFormatError as exc:
+        raise _gauge_import_refusal(
+            "identity",
+            f"the origin run.json is not a valid run identity: {exc}",
+        ) from exc
+    origin_sha = _identity_sha256(origin)
+    if str(raw.get("run_id")) != str(origin["run_id"]):
+        raise _gauge_import_refusal(
+            "identity",
+            "the artifact belongs to another run_id "
+            f"({raw.get('run_id')!r} != {origin['run_id']!r})",
+        )
+    if str(raw.get("identity_sha256")) != origin_sha:
+        raise _gauge_import_refusal(
+            "identity",
+            "the artifact belongs to another identity "
+            f"({raw.get('identity_sha256')!r} != {origin_sha!r})",
+        )
+
+    # ---- frame set: ids, order, content digests, sizes -------------------
+    origin_inputs = origin["science_contract"]["inputs"]
+    origin_rows = origin_inputs.get("frames")
+    if not isinstance(origin_rows, list):
+        raise _gauge_import_refusal(
+            "inputs", "the origin identity carries no frames inputs section"
+        )
+    expected = [dict(row) for row in expected_frame_rows]
+    if len(origin_rows) != len(expected):
+        raise _gauge_import_refusal(
+            "inputs",
+            "the frame count differs "
+            f"(origin {len(origin_rows)} != current {len(expected)})",
+            origin_frames=len(origin_rows),
+            current_frames=len(expected),
+        )
+    for index, (stored, current) in enumerate(zip(origin_rows, expected)):
+        for field in ("frame_id", "content_sha256", "nbytes", "order", "role"):
+            if stored.get(field) != current.get(field):
+                raise _gauge_import_refusal(
+                    "inputs",
+                    f"frame {index} ({current.get('frame_id')!r}) differs on "
+                    f"{field!r}: origin {stored.get(field)!r} != current "
+                    f"{current.get(field)!r}",
+                    frame_index=int(index),
+                    frame_id=str(current.get("frame_id")),
+                    field=str(field),
+                )
+    current_ids = [str(v) for v in expected_frame_ids]
+    origin_ids = [str(row.get("frame_id")) for row in origin_rows]
+    if origin_ids != current_ids:
+        # Never inline thousands of ids in a refusal: name the first difference.
+        first = next(
+            index for index, (a, b) in enumerate(zip(origin_ids, current_ids))
+            if a != b
+        ) if len(origin_ids) == len(current_ids) else 0
+        raise _gauge_import_refusal(
+            "inputs",
+            "the frame ORDER differs from the current descriptor order at "
+            f"index {first} (origin {origin_ids[first:first + 1]!r} != current "
+            f"{current_ids[first:first + 1]!r})",
+            frame_index=int(first),
+        )
+
+    # ---- canvas ----------------------------------------------------------
+    if dict(origin["science_contract"]["canvas"]) != dict(expected_canvas):
+        stored_canvas = dict(origin["science_contract"]["canvas"])
+        detail = ", ".join(
+            f"{key}: origin {stored_canvas.get(key)!r} != current "
+            f"{dict(expected_canvas).get(key)!r}"
+            for key in sorted(set(stored_canvas) | set(expected_canvas))
+            if stored_canvas.get(key) != dict(expected_canvas).get(key)
+        )
+        raise _gauge_import_refusal(
+            "canvas", f"the canvas differs ({detail})"
+        )
+
+    # ---- photometric parameters (backend excluded: execution field) ------
+    origin_params = dict(origin["science_contract"]["science"].get("params") or {})
+    current_params = dict(expected_science_params)
+    origin_params.pop("backend", None)
+    current_params.pop("backend", None)
+    if origin_params != current_params:
+        differing = sorted(
+            key for key in set(origin_params) | set(current_params)
+            if origin_params.get(key) != current_params.get(key)
+        )
+        raise _gauge_import_refusal(
+            "science",
+            "the photometric parameters differ on "
+            + ", ".join(repr(key) for key in differing),
+            fields=differing,
+        )
+
+    # ---- gauge coherence (same check as restore_global_gauge) ------------
+    origin_gauge = dict(origin["science_contract"]["gauge"])
+    frame_ids = tuple(str(v) for v in parsed["frame_ids"])
+    if frame_ids != tuple(current_ids):
+        raise _gauge_import_refusal(
+            "gauge",
+            "the artifact frame order differs from the origin identity's",
+        )
+    if str(parsed["mode"]) != str(expected_mode):
+        raise _gauge_import_refusal(
+            "gauge",
+            f"the artifact gauge mode {parsed['mode']!r} != this run's "
+            f"{expected_mode!r}",
+        )
+    if str(origin_gauge.get("mode")) != str(parsed["mode"]):
+        raise _gauge_import_refusal(
+            "gauge",
+            "the origin identity's gauge mode "
+            f"{origin_gauge.get('mode')!r} != the artifact's "
+            f"{parsed['mode']!r}",
+        )
+    reference_frame_id = parsed["reference_frame_id"]
+    reference_index = int(parsed["reference_index"])
+    if reference_frame_id is not None and str(reference_frame_id) != frame_ids[
+        reference_index
+    ]:
+        raise _gauge_import_refusal(
+            "gauge",
+            "the artifact's reference_frame_id does not match its own "
+            "frame_ids[reference_index]",
+        )
+    if reference_frame_id != origin_gauge.get("reference_frame_id"):
+        raise _gauge_import_refusal(
+            "gauge",
+            "the artifact's reference frame "
+            f"{reference_frame_id!r} != the origin identity's "
+            f"{origin_gauge.get('reference_frame_id')!r}",
+        )
+
+    from zemosaic.core.canonical_streaming import FixedNormalization
+
+    gauge = FixedNormalization(
+        reference_index=reference_index,
+        coefficients=parsed["coefficients"],
+        norm_active=parsed["norm_active"],
+        weights=parsed["weights"],
+        weight_active=parsed["weight_active"],
+        exclusions=parsed["exclusions"],
+    )
+    actual_sha = gauge_fingerprint(
+        gauge=gauge,
+        mode=str(parsed["mode"]),
+        frame_ids=frame_ids,
+        reference_frame_id=reference_frame_id,
+    )
+    stored_sha = str(origin_gauge.get("sha256"))
+    artifact_sha_value = str(raw.get("gauge_sha256"))
+    if actual_sha != stored_sha:
+        raise _gauge_import_refusal(
+            "gauge",
+            "the imported gauge does not reproduce the origin identity's "
+            f"gauge hash ({actual_sha} != {stored_sha}); never re-derive or "
+            "repair a global gauge",
+            restored_sha256=actual_sha,
+            stored_sha256=stored_sha,
+        )
+    if actual_sha != artifact_sha_value:
+        raise _gauge_import_refusal(
+            "gauge",
+            "the artifact's own gauge_sha256 does not match its decoded gauge "
+            f"({actual_sha} != {artifact_sha_value})",
+            restored_sha256=actual_sha,
+            artifact_sha256=artifact_sha_value,
+        )
+
+    provenance = {
+        "source": "imported_artifact",
+        "gauge_path": str(path),
+        "origin_run_json_path": (
+            None if origin_run_json_path is None else str(origin_run_json_path)
+        ),
+        "artifact_sha256": str(artifact_sha),
+        "gauge_sha256": actual_sha,
+        "origin_run_id": str(origin["run_id"]),
+        "origin_identity_sha256": origin_sha,
+        "frame_count": int(len(frame_ids)),
+        "reference_frame_id": reference_frame_id,
+        "mode": str(parsed["mode"]),
+    }
+    return gauge, frame_ids, reference_frame_id, provenance
+
+
+# ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
 

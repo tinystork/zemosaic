@@ -15477,35 +15477,13 @@ def _r55_run_store_working_set(bundle, execution_contract) -> dict:
     }
 
 
-def _r55_build_run_store_identity(
-    *,
-    run_id: str,
-    descs,
-    canvas,
-    bundle,
-    halo_px: int,
-    halo_provenance,
-    global_gauge,
-    global_frame_ids,
-    gauge_mode: str,
-    science_config,
-    workers: int | None,
-    prefetch_units: int | None,
-    effective_backend: str | None = None,
-) -> dict:
-    """Build the frozen scientific identity of THIS run (plan §6.1).
+def _r55_frame_input_rows(descs) -> list[dict]:
+    """Content-only input rows of the frozen identity.
 
-    ``effective_backend`` (ZM-ZEGRID-BACKEND-IDENTITY) is the run's EFFECTIVE
-    backend as decided by :func:`_effective_run_backend` (the frozen admission
-    on a resume, the selected backend on a fresh run). It is used ONLY to
-    normalise the ``backend`` field of the science parameters, so a CPU-frozen
-    run resumed on a GPU-enabled host freezes ``backend='cpu'`` exactly like the
-    process that created it. The execution contract itself (``backend`` block /
-    tile) still comes from the run-scope bundle and is never re-derived here.
-    ``None`` keeps the historical behaviour for direct/unit callers.
+    ZM-ZEGRID-GAUGE-IMPORT: extracted VERBATIM from the identity builder so the
+    import verifier hashes the frames with EXACTLY the same function (and the
+    same refusal messages) instead of a second, drifting implementation.
     """
-    import socket as _socket
-
     frames = []
     for order, desc in enumerate(descs or ()):
         # The logical identifier is a PORTABLE scientific id (relative to the
@@ -15536,6 +15514,55 @@ def _r55_build_run_store_identity(
                 "role": "light",
             }
         )
+    return frames
+
+
+def _r55_canvas_identity_block(canvas) -> dict:
+    """Content-only canvas section of the frozen identity (shared with import)."""
+    canvas_shape = [int(canvas.height), int(canvas.width)]
+    return {
+        "shape": canvas_shape,
+        "wcs_sha256": hashlib.sha256(str(canvas.wcs_header).encode("utf-8")).hexdigest(),
+        "geometry_sha256": _r55_sha256_json(
+            {
+                "canvas_id": str(getattr(canvas, "canvas_id", "")),
+                "shape": canvas_shape,
+                "resolution_deg": float(getattr(canvas, "resolution_deg", 0.0)),
+            }
+        ),
+    }
+
+
+def _r55_build_run_store_identity(
+    *,
+    run_id: str,
+    descs,
+    canvas,
+    bundle,
+    halo_px: int,
+    halo_provenance,
+    global_gauge,
+    global_frame_ids,
+    gauge_mode: str,
+    science_config,
+    workers: int | None,
+    prefetch_units: int | None,
+    effective_backend: str | None = None,
+) -> dict:
+    """Build the frozen scientific identity of THIS run (plan §6.1).
+
+    ``effective_backend`` (ZM-ZEGRID-BACKEND-IDENTITY) is the run's EFFECTIVE
+    backend as decided by :func:`_effective_run_backend` (the frozen admission
+    on a resume, the selected backend on a fresh run). It is used ONLY to
+    normalise the ``backend`` field of the science parameters, so a CPU-frozen
+    run resumed on a GPU-enabled host freezes ``backend='cpu'`` exactly like the
+    process that created it. The execution contract itself (``backend`` block /
+    tile) still comes from the run-scope bundle and is never re-derived here.
+    ``None`` keeps the historical behaviour for direct/unit callers.
+    """
+    import socket as _socket
+
+    frames = _r55_frame_input_rows(descs)
     # The aggregate is derived from CONTENT rows by the store (relocation-safe);
     # no absolute source path ever enters the scientific identity.
     inputs = {"frames": frames}
@@ -15561,18 +15588,7 @@ def _r55_build_run_store_identity(
                 [str(v) for v in mem.patch_ids],
             ]
         )
-    canvas_shape = [int(canvas.height), int(canvas.width)]
-    canvas_block = {
-        "shape": canvas_shape,
-        "wcs_sha256": hashlib.sha256(str(canvas.wcs_header).encode("utf-8")).hexdigest(),
-        "geometry_sha256": _r55_sha256_json(
-            {
-                "canvas_id": str(getattr(canvas, "canvas_id", "")),
-                "shape": canvas_shape,
-                "resolution_deg": float(getattr(canvas, "resolution_deg", 0.0)),
-            }
-        ),
-    }
+    canvas_block = _r55_canvas_identity_block(canvas)
     # The execution contract is resolved ONCE and is the SAME value used by the
     # backend block below: grid.tile_px can never disagree with backend.tile_px.
     _execution_contract = _r55_execution_contract_from_bundle(bundle)
@@ -16113,8 +16129,12 @@ def _run_single(
     telemetry=None,
     resume_mode=zres.RESUME_MODE_NEVER,
     resume_run_id=None,
+    # ZM-ZEGRID-GAUGE-IMPORT: already normalised+validated by the product entry
+    # (``_normalize_gauge_import_option``); ``None`` keeps today's behaviour.
+    gauge_import=None,
     stop_channel=None,
 ):
+    _gauge_import_option = gauge_import
     # M4: external working-set lifecycle accounting (strict JSON, additive).
     _ext_lifecycle = {
         "schema": "zemosaic-zegrid-external-lifecycle-v1",
@@ -17643,10 +17663,76 @@ def _run_single(
     # so every Cell shares a single photometric anchor. Frame-major full-canvas
     # reprojection (parallelised); the disk cache is DELETED after use (bounded
     # disk — only the in-memory gauge coefficients are needed downstream).
-    _emit(
-        f"ZeGrid: computing global photometric gauge (full-canvas, frame-major, workers={workers})",
-        callback=progress_callback,
-    )
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-GAUGE-IMPORT — opt-in, strictly verified gauge import
+    # ------------------------------------------------------------------
+    # A fresh run may IMPORT the complete global gauge from another run of the
+    # SAME frames (ids AND content digests), canvas and photometry. The gauge
+    # does not depend on the tiling, so this is sound across layouts; the
+    # verification reuses the resume path's validators (artifact self-digest,
+    # document schema, frame/canvas/science sections, gauge fingerprint) and
+    # the imported object then follows EXACTLY the restored-gauge code path
+    # below (``_resume_gauge``), so the compute phase never runs.
+    _gauge_import_provenance = None
+    if _gauge_import_option is not None:
+        if _resume_gauge is not None:
+            raise RuntimeError(
+                "ZeGrid: an explicit gauge import cannot be combined with a "
+                "resume — the frozen store owns its own gauge artifact, so the "
+                "provenance would be ambiguous. Nothing was written."
+            )
+        try:
+            _import_gauge_obj, _import_ids, _import_ref, _import_prov = (
+                zart.import_gauge_artifact(
+                    _gauge_import_option["gauge_path"],
+                    origin_identity=_gauge_import_option["origin_run_json"],
+                    origin_run_json_path=_gauge_import_option[
+                        "origin_run_json_path"
+                    ],
+                    expected_frame_rows=_r55_frame_input_rows(descs),
+                    expected_frame_ids=[
+                        str(d.frame_id.logical_path) for d in descs
+                    ],
+                    expected_canvas=_r55_canvas_identity_block(canvas),
+                    expected_science_params=_r55_digest_tree(
+                        vars(science_config)
+                    ),
+                    expected_mode=str(
+                        getattr(science_config, "cell_gauge_mode", "global")
+                        or "global"
+                    ),
+                )
+            )
+        except Exception as _import_exc:
+            _emit(
+                f"ZeGrid: gauge import REFUSED — {_import_exc}. No gauge work "
+                "was started and nothing was written.",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise
+        _gauge_import_provenance = _import_prov
+        # The SAME restored-gauge path the resume uses: one code path, not two.
+        _resume_gauge = (_import_gauge_obj, _import_ids, _import_ref)
+        _resume_gauge_restored = True
+        _resume_gauge_resident_bytes = int(
+            _restored_gauge_resident_bytes(_import_gauge_obj)
+        )
+        _emit(
+            "ZeGrid: global photometric gauge IMPORTED from a verified artifact "
+            f"{_import_prov['gauge_path']!r} (origin run "
+            f"{_import_prov['origin_run_id']!r}, gauge_sha256="
+            f"{_import_prov['gauge_sha256']}, artifact_sha256="
+            f"{_import_prov['artifact_sha256']}); the gauge phase will NOT "
+            "execute",
+            callback=progress_callback,
+        )
+
+    if _gauge_import_provenance is None:
+        _emit(
+            f"ZeGrid: computing global photometric gauge (full-canvas, frame-major, workers={workers})",
+            callback=progress_callback,
+        )
     gauge_cache_dir = cache_root / "__gauge__"
     _gauge_rep = _reporter()
     # rework-1 (M1): the gauge phase spans TWO sub-passes (counts N + pairs N-1),
@@ -17674,22 +17760,39 @@ def _run_single(
             else global_frame_ids[int(global_gauge.reference_index)]
         )
         gauge_diagnostics = {
-            "source": "restored_gauge_artifact",
+            "source": (
+                "imported_gauge_artifact"
+                if _gauge_import_provenance is not None
+                else "restored_gauge_artifact"
+            ),
             "compute_global_gauge_executed": False,
             "frame_count": int(len(global_frame_ids)),
             "reference_index": int(global_gauge.reference_index),
             "reference_frame_id": str(global_reference_frame_id),
             "exclusions": int(len(global_gauge.exclusions)),
         }
+        if _gauge_import_provenance is not None:
+            gauge_diagnostics["import"] = dict(_gauge_import_provenance)
         _gauge_rep.end(throughput=0.0)
-        _emit(
-            "ZeGrid: global photometric gauge RESTORED from the durable artifact "
-            f"— reference {global_reference_frame_id!r} (index "
-            f"{global_gauge.reference_index} of {len(global_frame_ids)} frames), "
-            f"exclusions={len(global_gauge.exclusions)}; the gauge phase did NOT "
-            "execute",
-            callback=progress_callback,
-        )
+        if _gauge_import_provenance is not None:
+            _emit(
+                "ZeGrid: global photometric gauge IMPORTED from the verified "
+                f"artifact (origin run {_gauge_import_provenance['origin_run_id']!r}) "
+                f"— reference {global_reference_frame_id!r} (index "
+                f"{global_gauge.reference_index} of {len(global_frame_ids)} frames), "
+                f"exclusions={len(global_gauge.exclusions)}; the gauge phase did "
+                "NOT execute (imported, never computed)",
+                callback=progress_callback,
+            )
+        else:
+            _emit(
+                "ZeGrid: global photometric gauge RESTORED from the durable artifact "
+                f"— reference {global_reference_frame_id!r} (index "
+                f"{global_gauge.reference_index} of {len(global_frame_ids)} frames), "
+                f"exclusions={len(global_gauge.exclusions)}; the gauge phase did NOT "
+                "execute",
+                callback=progress_callback,
+            )
     else:
         with timings.timed("gauge"):
             try:
@@ -24018,6 +24121,7 @@ def _run_single(
             r55_scheduler=_r55_scheduler_block,
             r55_run_telemetry=_r55_run_telemetry,
             publication=_publication,
+            gauge_import_provenance=_gauge_import_provenance,
         )
 
         _write_run_log(
@@ -24867,6 +24971,9 @@ def _write_outputs(
     r55_scheduler=None,
     r55_run_telemetry=None,
     publication=None,
+    # ZM-ZEGRID-GAUGE-IMPORT: additive provenance, ``None`` unless this run
+    # IMPORTED its gauge (a computed/restored run keeps the historical shape).
+    gauge_import_provenance=None,
 ):
     output_dir = Path(output_dir)
 
@@ -25138,6 +25245,16 @@ def _write_outputs(
                 auto_gauge_info if auto_gauge_info is not None else {"enabled": False}
             ),
             "global_reference_frame_id": global_reference_frame_id,
+            # ZM-ZEGRID-GAUGE-IMPORT: additive, present ONLY when the gauge was
+            # imported from a verified artifact (computed/restored runs keep
+            # this exact historical shape).
+            **(
+                {
+                    "source": "imported_artifact",
+                    "import": dict(gauge_import_provenance),
+                }
+                if gauge_import_provenance is not None else {}
+            ),
             "note": (
                 "one reference frame + per-frame sky_mean coefficients computed once "
                 "over the full canvas footprint; every Cell reuses the same gauge "
@@ -25417,6 +25534,73 @@ def _write_outputs(
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _normalize_gauge_import_option(raw):
+    """Normalise the opt-in ``zegrid_gauge_import`` input (``None`` -> ``None``).
+
+    Explicit, never implicit: a mapping naming BOTH an existing artifact file
+    and the origin ``run.json`` (path or already-parsed object). Unknown keys,
+    a missing file, a directory instead of a file, or unreadable JSON are
+    refused BEFORE anything is created or written. The artifact is only ever
+    READ from here on.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            "zegrid_gauge_import must be a mapping with 'gauge_path' and "
+            f"'origin_run_json' (got {type(raw).__name__})"
+        )
+    unknown = sorted(set(raw) - {"gauge_path", "origin_run_json"})
+    if unknown:
+        raise ValueError(
+            "zegrid_gauge_import carries unknown key(s) "
+            f"{unknown}; only 'gauge_path' and 'origin_run_json' are accepted"
+        )
+    gauge_path = raw.get("gauge_path")
+    if not gauge_path:
+        raise ValueError("zegrid_gauge_import.gauge_path is required")
+    path = Path(str(gauge_path))
+    if not path.is_file():
+        raise ValueError(
+            f"zegrid_gauge_import.gauge_path {str(path)!r} is not an existing "
+            "gauge.json file (a directory is never guessed)"
+        )
+    origin = raw.get("origin_run_json")
+    origin_path = None
+    if isinstance(origin, Mapping):
+        origin_doc = dict(origin)
+    elif isinstance(origin, (str, Path)):
+        origin_path = Path(str(origin))
+        if not origin_path.is_file():
+            raise ValueError(
+                "zegrid_gauge_import.origin_run_json "
+                f"{str(origin_path)!r} is not an existing run.json file"
+            )
+        try:
+            origin_doc = json.loads(origin_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(
+                "zegrid_gauge_import.origin_run_json is not readable strict "
+                f"JSON ({type(exc).__name__}: {exc})"
+            ) from exc
+        if not isinstance(origin_doc, dict):
+            raise ValueError(
+                "zegrid_gauge_import.origin_run_json must be a JSON object"
+            )
+    else:
+        raise ValueError(
+            "zegrid_gauge_import.origin_run_json is required (a path to the "
+            "origin run.json or the parsed identity object)"
+        )
+    return {
+        "gauge_path": str(path),
+        "origin_run_json": origin_doc,
+        "origin_run_json_path": (
+            None if origin_path is None else str(origin_path)
+        ),
+    }
+
+
 def run_zegrid_mode(
     input_folder: str,
     output_folder: str,
@@ -25446,6 +25630,10 @@ def run_zegrid_mode(
     # ``None`` = legacy/direct caller (explicit keyword semantics).
     zegrid_halo_px_user_selected: bool | None = None,
     zegrid_scheduler_mode: str | None = None,
+    # ZM-ZEGRID-GAUGE-IMPORT: explicit opt-in import of a VERIFIED global gauge
+    # artifact from another run of the same frames/canvas/photometry. ``None``
+    # (default) keeps the historical behaviour byte for byte.
+    zegrid_gauge_import: Mapping | None = None,
     frames_info: Sequence | None = None,
     selection_paths: Sequence[str] | None = None,
     global_wcs_output_path: str | None = None,
@@ -25458,6 +25646,9 @@ def run_zegrid_mode(
     telemetry: object | None = None,
     stop_channel: object | None = None,
 ) -> None:
+    # Validated (never guessed) BEFORE any directory, lock, state or output is
+    # created: a malformed import option can never leave a partial run behind.
+    _gauge_import_option = _normalize_gauge_import_option(zegrid_gauge_import)
     """Run the NEW ZeGrid engine over the input folder's FITS inventory.
 
     ZM-ZEGRID-R35A: ZeGrid is an EXPLICIT mode and is fed by the eligible FITS
@@ -25960,6 +26151,18 @@ def run_zegrid_mode(
             raise RuntimeError(_refusal)
         eq_frames = [f for f in frames_info if f.mount == "EQ"]
         altz_frames = [f for f in frames_info if f.mount == "ALTZ"]
+        # ZM-ZEGRID-GAUGE-IMPORT: a mount-segregated run builds TWO independent
+        # frame sets/identities, so ONE import option cannot describe both.
+        # Refuse explicitly instead of guessing which pass it belongs to.
+        if _gauge_import_option is not None:
+            _mref = (
+                "ZeGrid: gauge import REFUSED — a MOUNT-SEGREGATED run (EQ+ALTZ) "
+                "builds two independent frame sets/identities, so one imported "
+                "gauge cannot describe both passes. Run each mount separately "
+                "with its own gauge artifact. Nothing was written."
+            )
+            _emit(_mref, lvl="ERROR", callback=progress_callback)
+            raise RuntimeError(_mref)
         _emit(
             f"ZeGrid: mount segregation detected — EQ={len(eq_frames)}, ALTZ={len(altz_frames)}",
             callback=progress_callback,
@@ -25983,6 +26186,7 @@ def run_zegrid_mode(
                         telemetry=telemetry,
                         resume_mode=_resume_mode,
                         resume_run_id=_resume_run_id,
+                        gauge_import=_gauge_import_option,
                         stop_channel=stop_channel)
         if altz_frames:
             _run_single_guarded(altz_frames, input_folder, base_out / "grid_ALTZ",
@@ -26003,6 +26207,7 @@ def run_zegrid_mode(
                         telemetry=telemetry,
                         resume_mode=_resume_mode,
                         resume_run_id=_resume_run_id,
+                        gauge_import=_gauge_import_option,
                         stop_channel=stop_channel)
     else:
         _emit("ZeGrid: mount info missing or homogeneous — single pass",
@@ -26025,4 +26230,5 @@ def run_zegrid_mode(
                     telemetry=telemetry,
                     resume_mode=_resume_mode,
                     resume_run_id=_resume_run_id,
+                    gauge_import=_gauge_import_option,
                     stop_channel=stop_channel)
