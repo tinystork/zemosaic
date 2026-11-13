@@ -388,3 +388,159 @@ def test_invalid_option_is_refused_before_any_write(tmp_path, corpus, bad):
             zegrid_halo_px=8, use_gpu=False, zegrid_gauge_import=bad,
         )
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 — M1: the corpus is read ONCE on an import run
+# ---------------------------------------------------------------------------
+
+def test_rework1_import_hashes_each_frame_exactly_once(
+    tmp_path, corpus, computed, monkeypatch
+):
+    """M1: no second full-corpus read (import verification + identity build).
+
+    A normal run hashes each frame once (the identity build). An import run must
+    ALSO hash each frame once: the rows computed for the verification are reused
+    verbatim by ``_r55_build_run_store_identity``.
+    """
+    calls = []
+    real = zrs.content_sha256_file
+
+    def spy(path):
+        calls.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(zrs, "content_sha256_file", spy)
+    n_frames = len(list(corpus.glob("*.fits")))
+
+    _run(corpus, tmp_path / "out-normal", tmp_path / "store-normal", "2x2")
+    assert len(calls) == n_frames, "a normal run must hash each frame once"
+    assert len(set(calls)) == n_frames
+
+    calls.clear()
+    _run(
+        corpus, tmp_path / "out-import", tmp_path / "store-import", "2x2",
+        gauge_import={
+            "gauge_path": str(computed["store"] / "gauge.json"),
+            "origin_run_json": str(computed["store"] / "run.json"),
+        },
+    )
+    assert len(calls) == n_frames, (
+        "an import run hashed the corpus more than once "
+        f"({len(calls)} reads for {n_frames} frames)"
+    )
+    assert len(set(calls)) == n_frames
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 — L1: the backend exclusion is locked by a test
+# ---------------------------------------------------------------------------
+
+def _forge_origin_backend(computed, target, backend):
+    """Re-sign the computed artifact for an origin identity declaring ``backend``."""
+    identity = json.loads((computed["store"] / "run.json").read_text())
+    identity["science_contract"]["science"]["params"]["backend"] = backend
+    identity["science_contract"]["backend"]["backend"] = backend
+    zrs.validate_run_identity(identity)  # the forged origin is a VALID identity
+    raw = json.loads((computed["store"] / "gauge.json").read_text())
+    raw["identity_sha256"] = zrs.identity_sha256(identity)
+    body = {key: value for key, value in raw.items() if key != "artifact_sha256"}
+    raw["artifact_sha256"] = zart._self_digest(body)
+    gauge_path = Path(target) / f"{backend}_gauge.json"
+    run_path = Path(target) / f"{backend}_run.json"
+    gauge_path.write_text(json.dumps(raw), encoding="utf-8")
+    run_path.write_text(json.dumps(identity), encoding="utf-8")
+    return gauge_path, run_path, identity
+
+
+def test_l1_gpu_origin_artifact_is_accepted_by_a_cpu_run(tmp_path, corpus, computed):
+    """L1: an artifact whose ORIGIN identity says ``backend=gpu`` imports into a
+    CPU-effective run, and the identity's gauge sha256 is unchanged.
+
+    What this proves: the photometric comparison deliberately ignores ``backend``
+    and the import does not reject a backend difference; the gauge fingerprint
+    is preserved verbatim.
+
+    What it CANNOT prove: that a gauge actually computed on a GPU is numerically
+    identical to the CPU one. There is no GPU here and the gauge path
+    (``photometric.py``) has no GPU implementation at all, so the artifact's
+    numbers are the CPU-computed ones by construction. CPU↔GPU parity remains a
+    separate contract; if the gauge ever gains a GPU path, this exclusion must be
+    re-examined.
+    """
+    gauge_path, run_path, forged = _forge_origin_backend(computed, tmp_path, "gpu")
+    result = _run(
+        corpus, tmp_path / "out", tmp_path / "store", "1x2",
+        gauge_import={
+            "gauge_path": str(gauge_path),
+            "origin_run_json": str(run_path),
+        },
+    )
+    computed_sha = computed["identity"]["science_contract"]["gauge"]["sha256"]
+    assert result["identity"]["science_contract"]["gauge"]["sha256"] == computed_sha
+    provenance = result["manifest"]["photometric_gauge"]["import"]
+    assert provenance["origin_identity_sha256"] == zrs.identity_sha256(forged)
+    assert provenance["gauge_sha256"] == computed_sha
+    assert "computing global photometric gauge" not in "\n".join(result["logs"])
+
+
+def test_l1_reverse_direction_is_accepted_too(computed):
+    """L1 (reverse): origin ``backend=cpu`` imported by a run expecting ``gpu``."""
+    kwargs = _origin(computed)
+    params = dict(kwargs["expected_science_params"])
+    params["backend"] = "gpu"
+    kwargs["expected_science_params"] = params
+    _gauge, frame_ids, reference, provenance = zart.import_gauge_artifact(
+        str(computed["store"] / "gauge.json"), **kwargs
+    )
+    assert provenance["gauge_sha256"] == computed["identity"][
+        "science_contract"]["gauge"]["sha256"]
+    assert frame_ids == tuple(
+        row["frame_id"] for row in computed["identity"]["science_contract"][
+            "inputs"]["frames"])
+    assert reference
+
+
+# ---------------------------------------------------------------------------
+# REWORK-1 — L2: a refused import leaves nothing behind
+# ---------------------------------------------------------------------------
+
+def test_l2_refused_import_leaves_nothing_on_disk(tmp_path, corpus, computed):
+    tampered = tmp_path / "tampered"
+    _tamper_one_frame(corpus, tampered)
+    out = tmp_path / "out"
+    assert not out.exists()
+    with pytest.raises(zres.ResumeIncompatible):
+        _run(
+            tampered, out, tmp_path / "store", "2x2",
+            gauge_import={
+                "gauge_path": str(computed["store"] / "gauge.json"),
+                "origin_run_json": str(computed["store"] / "run.json"),
+            },
+        )
+    # Verification now runs before the cache root and the layout, and this
+    # attempt created the output folder: it is gone, with its run log.
+    assert not out.exists()
+
+
+def test_l2_refusal_never_deletes_a_preexisting_output_folder(
+    tmp_path, corpus, computed
+):
+    tampered = tmp_path / "tampered"
+    _tamper_one_frame(corpus, tampered)
+    out = tmp_path / "out"
+    out.mkdir()
+    marker = out / "user-file.txt"
+    marker.write_text("keep me", encoding="utf-8")
+    with pytest.raises(zres.ResumeIncompatible):
+        _run(
+            tampered, out, tmp_path / "store", "2x2",
+            gauge_import={
+                "gauge_path": str(computed["store"] / "gauge.json"),
+                "origin_run_json": str(computed["store"] / "run.json"),
+            },
+        )
+    assert marker.read_text(encoding="utf-8") == "keep me"
+    # No layout/cache artifact was created before the refusal.
+    assert not (out / "zegrid-cache").exists()
+    assert not (out / MANIFEST).exists()

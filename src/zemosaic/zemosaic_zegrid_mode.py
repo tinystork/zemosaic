@@ -15548,6 +15548,11 @@ def _r55_build_run_store_identity(
     workers: int | None,
     prefetch_units: int | None,
     effective_backend: str | None = None,
+    # ZM-ZEGRID-GAUGE-IMPORT (REWORK-1 M1): precomputed content rows. When the
+    # caller already hashed the corpus (gauge-import verification), reuse the
+    # EXACT rows instead of reading every frame a second time. ``None`` keeps
+    # the historical behaviour (hash here, once).
+    frame_rows=None,
 ) -> dict:
     """Build the frozen scientific identity of THIS run (plan §6.1).
 
@@ -15562,7 +15567,11 @@ def _r55_build_run_store_identity(
     """
     import socket as _socket
 
-    frames = _r55_frame_input_rows(descs)
+    frames = (
+        [dict(row) for row in frame_rows]
+        if frame_rows is not None
+        else _r55_frame_input_rows(descs)
+    )
     # The aggregate is derived from CONTENT rows by the store (relocation-safe);
     # no absolute source path ever enters the scientific identity.
     inputs = {"frames": frames}
@@ -16103,6 +16112,29 @@ def _run_scope_bundle(active_bundle, final_bundle):
     return active_bundle if active_bundle is not None else final_bundle
 
 
+def _discard_attempt_output_dir(output_dir) -> None:
+    """Best-effort removal of an output folder THIS attempt created and a
+    pre-import refusal left behind (REWORK-1 L2).
+
+    Only called when the folder did not exist before the attempt, so it can
+    never delete user data. Failures are swallowed: cleanup must never mask the
+    refusal that is already propagating.
+    """
+    path = Path(output_dir)
+    try:
+        entries = sorted(
+            path.rglob("*"), key=lambda p: len(p.parts), reverse=True
+        )
+        for entry in entries:
+            if entry.is_file() or entry.is_symlink():
+                entry.unlink()
+            elif entry.is_dir():
+                entry.rmdir()
+        path.rmdir()
+    except OSError:
+        pass
+
+
 def _run_single(
     frames_info,
     input_folder,
@@ -16149,6 +16181,10 @@ def _run_single(
         "cleanup_failures": [],
     }
     output_dir = Path(output_dir).expanduser()
+    # ZM-ZEGRID-GAUGE-IMPORT (REWORK-1 L2): remember whether THIS attempt
+    # created the output folder, so a refused import can restore the exact
+    # pre-run state (and can never delete a folder the user already had).
+    _output_dir_existed = output_dir.exists()
     output_dir.mkdir(parents=True, exist_ok=True)
     # ZM-ZEGRID-R53: ONE validated effective halo width for this run. The product
     # entry (``run_zegrid_mode``) resolves and validates it BEFORE any expensive
@@ -16656,6 +16692,77 @@ def _run_single(
         )
     except Exception:
         pass
+    # ------------------------------------------------------------------
+    # ZM-ZEGRID-GAUGE-IMPORT — opt-in, strictly verified gauge import
+    # ------------------------------------------------------------------
+    # REWORK-1 (L2): verification runs HERE — after the descriptors/canvas are
+    # known, but BEFORE the cache root, the layout and any planning work — so a
+    # refused import leaves no cache/layout artifact behind. REWORK-1 (M1): the
+    # content rows hashed for the verification are kept and REUSED by the
+    # identity builder, so an import run reads each frame exactly ONCE.
+    _gauge_import_provenance = None
+    _frame_input_rows_for_run = None
+    if _gauge_import_option is not None:
+        if _resume_gauge is not None:
+            raise RuntimeError(
+                "ZeGrid: an explicit gauge import cannot be combined with a "
+                "resume — the frozen store owns its own gauge artifact, so the "
+                "provenance would be ambiguous. Nothing was written."
+            )
+        _frame_input_rows_for_run = _r55_frame_input_rows(descs)
+        try:
+            _import_gauge_obj, _import_ids, _import_ref, _import_prov = (
+                zart.import_gauge_artifact(
+                    _gauge_import_option["gauge_path"],
+                    origin_identity=_gauge_import_option["origin_run_json"],
+                    origin_run_json_path=_gauge_import_option[
+                        "origin_run_json_path"
+                    ],
+                    expected_frame_rows=_frame_input_rows_for_run,
+                    expected_frame_ids=[
+                        str(d.frame_id.logical_path) for d in descs
+                    ],
+                    expected_canvas=_r55_canvas_identity_block(canvas),
+                    expected_science_params=_r55_digest_tree(
+                        vars(science_config)
+                    ),
+                    expected_mode=str(
+                        getattr(science_config, "cell_gauge_mode", "global")
+                        or "global"
+                    ),
+                )
+            )
+        except Exception as _import_exc:
+            _emit(
+                f"ZeGrid: gauge import REFUSED — {_import_exc}. No gauge work "
+                "was started and nothing was written.",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            # REWORK-1 (L2): verification now runs before the cache root and the
+            # layout, so the only thing this attempt may have created is its own
+            # output folder (and the run log inside it). Remove it when we
+            # created it; never touch a folder the user already had.
+            if not _output_dir_existed:
+                _discard_attempt_output_dir(output_dir)
+            raise
+        _gauge_import_provenance = _import_prov
+        # The SAME restored-gauge path the resume uses: one code path, not two.
+        _resume_gauge = (_import_gauge_obj, _import_ids, _import_ref)
+        _resume_gauge_restored = True
+        _resume_gauge_resident_bytes = int(
+            _restored_gauge_resident_bytes(_import_gauge_obj)
+        )
+        _emit(
+            "ZeGrid: global photometric gauge IMPORTED from a verified artifact "
+            f"{_import_prov['gauge_path']!r} (origin run "
+            f"{_import_prov['origin_run_id']!r}, gauge_sha256="
+            f"{_import_prov['gauge_sha256']}, artifact_sha256="
+            f"{_import_prov['artifact_sha256']}); the gauge phase will NOT "
+            "execute (verified before layout/cache)",
+            callback=progress_callback,
+        )
+
     # M4 (plan §6.6): validate the frozen inventory by CONTENT before layout or
     # gauge. A moved dataset is not a change; a changed byte is a refusal.
     if _resume_boot is not None:
@@ -17663,71 +17770,10 @@ def _run_single(
     # so every Cell shares a single photometric anchor. Frame-major full-canvas
     # reprojection (parallelised); the disk cache is DELETED after use (bounded
     # disk — only the in-memory gauge coefficients are needed downstream).
-    # ------------------------------------------------------------------
-    # ZM-ZEGRID-GAUGE-IMPORT — opt-in, strictly verified gauge import
-    # ------------------------------------------------------------------
-    # A fresh run may IMPORT the complete global gauge from another run of the
-    # SAME frames (ids AND content digests), canvas and photometry. The gauge
-    # does not depend on the tiling, so this is sound across layouts; the
-    # verification reuses the resume path's validators (artifact self-digest,
-    # document schema, frame/canvas/science sections, gauge fingerprint) and
-    # the imported object then follows EXACTLY the restored-gauge code path
-    # below (``_resume_gauge``), so the compute phase never runs.
-    _gauge_import_provenance = None
-    if _gauge_import_option is not None:
-        if _resume_gauge is not None:
-            raise RuntimeError(
-                "ZeGrid: an explicit gauge import cannot be combined with a "
-                "resume — the frozen store owns its own gauge artifact, so the "
-                "provenance would be ambiguous. Nothing was written."
-            )
-        try:
-            _import_gauge_obj, _import_ids, _import_ref, _import_prov = (
-                zart.import_gauge_artifact(
-                    _gauge_import_option["gauge_path"],
-                    origin_identity=_gauge_import_option["origin_run_json"],
-                    origin_run_json_path=_gauge_import_option[
-                        "origin_run_json_path"
-                    ],
-                    expected_frame_rows=_r55_frame_input_rows(descs),
-                    expected_frame_ids=[
-                        str(d.frame_id.logical_path) for d in descs
-                    ],
-                    expected_canvas=_r55_canvas_identity_block(canvas),
-                    expected_science_params=_r55_digest_tree(
-                        vars(science_config)
-                    ),
-                    expected_mode=str(
-                        getattr(science_config, "cell_gauge_mode", "global")
-                        or "global"
-                    ),
-                )
-            )
-        except Exception as _import_exc:
-            _emit(
-                f"ZeGrid: gauge import REFUSED — {_import_exc}. No gauge work "
-                "was started and nothing was written.",
-                lvl="ERROR",
-                callback=progress_callback,
-            )
-            raise
-        _gauge_import_provenance = _import_prov
-        # The SAME restored-gauge path the resume uses: one code path, not two.
-        _resume_gauge = (_import_gauge_obj, _import_ids, _import_ref)
-        _resume_gauge_restored = True
-        _resume_gauge_resident_bytes = int(
-            _restored_gauge_resident_bytes(_import_gauge_obj)
-        )
-        _emit(
-            "ZeGrid: global photometric gauge IMPORTED from a verified artifact "
-            f"{_import_prov['gauge_path']!r} (origin run "
-            f"{_import_prov['origin_run_id']!r}, gauge_sha256="
-            f"{_import_prov['gauge_sha256']}, artifact_sha256="
-            f"{_import_prov['artifact_sha256']}); the gauge phase will NOT "
-            "execute",
-            callback=progress_callback,
-        )
-
+    # ZM-ZEGRID-GAUGE-IMPORT (REWORK-1 L2): the artifact was already verified
+    # BEFORE the cache root and the layout (see the early verification above);
+    # this block only keeps the historical compute log line for non-imported
+    # gauges.
     if _gauge_import_provenance is None:
         _emit(
             f"ZeGrid: computing global photometric gauge (full-canvas, frame-major, workers={workers})",
@@ -21477,6 +21523,7 @@ def _run_single(
                 # EFFECTIVE backend (frozen admission on a resume), never the
                 # backend this host requested.
                 effective_backend=_effective_backend,
+                frame_rows=_frame_input_rows_for_run,
             )
             _resume_boot.verify_identity(_store_identity)
         except zres.ResumeIncompatible as _resume_exc:
@@ -21976,6 +22023,7 @@ def _run_single(
                 # requested backend (unchanged identity); the parameter makes
                 # the one decision explicit at every identity build.
                 effective_backend=_effective_backend,
+                frame_rows=_frame_input_rows_for_run,
             )
             _store_stage = "store_open"
             _store_budget_bytes = int(
