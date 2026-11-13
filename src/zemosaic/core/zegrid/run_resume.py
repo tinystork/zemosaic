@@ -587,6 +587,33 @@ def validate_working_set_transition(raw: Any) -> dict:
         raise ResumeStateError(
             "working_set_transitions[].ram_observation must be an object"
         )
+    # ZM-ZEGRID-HARDENING-PASS (H4): a WORKING-SET UPGRADE carries the plan
+    # aggregate it was admitted with and the budget that admitted it. A record
+    # whose own numbers say the aggregate exceeded the budget describes an
+    # admission that cannot have happened (a hand-edited state, or a future
+    # caller that forgot the guard), so it is REFUSED here — this validator is
+    # called by BOTH the recorder (before any write) and validate_state (on
+    # load), so a contradictory pair can never enter or leave the store.
+    _obs_aggregate = observation.get("plan_aggregate_bytes")
+    _obs_budget = observation.get("plan_budget_bytes")
+    if _obs_aggregate is not None and _obs_budget is not None:
+        _aggregate = _as_int(
+            _obs_aggregate,
+            "working_set_transitions[].ram_observation.plan_aggregate_bytes",
+            minimum=0,
+        )
+        _budget = _as_int(
+            _obs_budget,
+            "working_set_transitions[].ram_observation.plan_budget_bytes",
+            minimum=0,
+        )
+        if int(_aggregate) > int(_budget):
+            raise ResumeStateError(
+                "working_set_transitions[].ram_observation is incoherent: "
+                f"plan_aggregate_bytes {_aggregate} > plan_budget_bytes "
+                f"{_budget}; an upgrade cannot have been admitted with an "
+                "aggregate above its own budget"
+            )
     identity_sha = str(raw["identity_sha256"])
     if not identity_sha:
         raise ResumeStateError(

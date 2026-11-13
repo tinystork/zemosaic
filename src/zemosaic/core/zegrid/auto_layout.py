@@ -589,18 +589,20 @@ def _cell_contributor_count(footprints, canvas, bounds: zg.GlobalBounds) -> int:
 # the run's SINGLE footprint projection (R28).
 
 #: The load pass is only engaged when the historical (first-admissible) grid is
-#: MATERIALLY imbalanced: ``max_slots / mean_slots`` above this ratio. A corpus
-#: where every Cell sees every frame (ratio 1.0) and every legacy/degenerate
-#: case stay on the historical grid byte for byte.
+#: MATERIALLY imbalanced: ``max_slots / mean(NON-EMPTY Cells)`` above this ratio.
+#: Empty Cells carry no work, so averaging over them would deflate the mean and
+#: arm the pass on a corpus whose tail is structural and cannot be improved. A
+#: corpus where every Cell sees every frame (ratio 1.0) and every
+#: legacy/degenerate case stay on the historical grid byte for byte.
 LOAD_IMBALANCE_TRIGGER = 2.0
 
-#: Weight of the tail (``max_slots``) in the scalar score. DERIVED from the
-#: makespan proxy ``max(total/P, max)`` for a nominal parallelism P=4: the
-#: aggregate term is ``total/4`` and the tail term ``max``, so comparing
-#: ``total + 4*max`` is the same ordering in integer-friendly units. P=4 is the
-#: smallest worker class the resource contract admits; a larger P only raises the
-#: tail weight, so 4 is the CONSERVATIVE (least tail-biased) choice.
-LOAD_TAIL_WEIGHT = 4
+#: Nominal parallelism used by the makespan proxy. A Cell is an INDIVISIBLE
+#: serial unit, so the wall-clock of a grid is bounded below by BOTH the heaviest
+#: Cell (``max_slots``) and the aggregate work spread over ``P`` workers
+#: (``ceil(total_slots / P)``). ``P = 4`` is the smallest worker class the
+#: resource contract admits; a larger P only makes the aggregate term smaller,
+#: i.e. 4 is the CONSERVATIVE (least optimistic) choice.
+LOAD_WORKERS = 4
 
 #: Bounded size of the extra candidate family evaluated by the load pass.
 LOAD_MAX_EXTRA_CANDIDATES = 6
@@ -611,9 +613,16 @@ class MembershipLoad:
     """Exact per-Cell membership load of one ``nx x ny`` grid.
 
     ``total_slots`` is the sum of the per-Cell membership counts (aggregate I/O),
-    ``max_slots`` the heaviest Cell (the serial tail that sets the makespan) and
-    ``mean_slots`` the arithmetic mean over ALL Cells (empty Cells included: they
-    are real Cells of the partition even though they carry no work).
+    ``max_slots`` the heaviest Cell (the serial tail). Two means are carried on
+    purpose:
+
+    * ``mean_slots`` — over ALL Cells (empty Cells are real Cells of the
+      partition);
+    * ``mean_nonempty_slots`` — over the Cells that actually carry memberships.
+
+    The IMBALANCE trigger uses the NON-EMPTY mean (an empty Cell is not a data
+    point about load), while both denominators are published so the decision is
+    auditable.
     """
 
     nx: int
@@ -622,32 +631,81 @@ class MembershipLoad:
     total_slots: int
     max_slots: int
     mean_slots: float
+    nonempty_cells: int = 0
+    mean_nonempty_slots: float = 0.0
+
+    def _mean_nonempty(self) -> float:
+        """Non-empty mean, tolerating a legacy construction without the field."""
+        if self.mean_nonempty_slots > 0.0:
+            return float(self.mean_nonempty_slots)
+        if self.nonempty_cells > 0:
+            return float(self.total_slots) / float(self.nonempty_cells)
+        return float(self.mean_slots)
 
     @property
     def imbalance(self) -> float:
-        """``max / mean`` (0.0 for a load-free grid; 1.0 when perfectly flat)."""
+        """``max / mean(non-empty Cells)`` — the TRIGGER quantity.
+
+        0.0 for a load-free grid; 1.0 when the occupied Cells are perfectly flat.
+        """
+        mean = self._mean_nonempty()
+        if mean <= 0.0:
+            return 0.0
+        return float(self.max_slots) / mean
+
+    @property
+    def imbalance_all_cells(self) -> float:
+        """``max / mean(all Cells)`` — published for audit, NEVER used to trigger."""
         if self.mean_slots <= 0.0:
             return 0.0
         return float(self.max_slots) / float(self.mean_slots)
 
-    def score(self, tail_weight: int = LOAD_TAIL_WEIGHT) -> int:
-        """Deterministic integer score: lower is better.
+    def makespan_proxy_slots(self, workers: int = LOAD_WORKERS) -> int:
+        """The ACTUAL makespan proxy: ``max(ceil(total/workers), max_slots)``.
 
-        ``total_slots + tail_weight * max_slots`` — rewards a lower aggregate load
-        AND a lower tail, and is exact integer arithmetic (no float rounding).
+        Cells are indivisible serial units, so the makespan is at least the
+        heaviest Cell and at least the aggregate spread over ``workers``. This is
+        the quantity the rank uses — NOT a weighted sum (a weighted sum is not a
+        proxy: ``total=100, max=10`` gives ``140`` under ``total+4*max`` but a
+        proxy of ``25``).
         """
-        return int(self.total_slots) + int(tail_weight) * int(self.max_slots)
+        w = max(1, int(workers))
+        aggregate = -(-int(self.total_slots) // w)  # ceil, non-negative
+        return int(max(aggregate, int(self.max_slots)))
+
+    def score(self, workers: int = LOAD_WORKERS) -> int:
+        """The ranked quantity (legacy field name): the makespan proxy in slots."""
+        return self.makespan_proxy_slots(workers)
+
+    def rank_key(self, workers: int = LOAD_WORKERS) -> tuple:
+        """Deterministic TOTAL order: proxy, total, max, cells, ``(nx, ny)``."""
+        return (
+            self.makespan_proxy_slots(workers),
+            int(self.total_slots),
+            int(self.max_slots),
+            int(self.cells),
+            int(self.nx),
+            int(self.ny),
+        )
 
     def to_dict(self) -> dict:
         return {
             "nx": int(self.nx),
             "ny": int(self.ny),
             "cells": int(self.cells),
+            "nonempty_cells": int(self.nonempty_cells),
             "total_slots": int(self.total_slots),
             "max_slots": int(self.max_slots),
             "mean_slots": round(float(self.mean_slots), 6),
-            "max_over_mean": round(float(self.imbalance), 6),
+            "mean_nonempty_slots": round(float(self._mean_nonempty()), 6),
+            # The trigger denominator, then the all-Cells view for audit.
+            "max_over_mean_nonempty": round(float(self.imbalance), 6),
+            "max_over_mean_all_cells": round(float(self.imbalance_all_cells), 6),
+            # The number actually ranked (and its components).
             "score": self.score(),
+            "makespan_proxy_slots": self.makespan_proxy_slots(),
+            "workers": int(LOAD_WORKERS),
+            "rank_key": list(self.rank_key()),
         }
 
 
@@ -662,10 +720,13 @@ def membership_load(nx: int, ny: int, counts: Sequence[int]) -> MembershipLoad:
     cells = len(vals)
     total = int(sum(vals))
     mx = int(max(vals)) if vals else 0
+    nonempty = sum(1 for c in vals if c > 0)
     mean = (float(total) / float(cells)) if cells else 0.0
+    mean_nonempty = (float(total) / float(nonempty)) if nonempty else 0.0
     return MembershipLoad(
         nx=int(nx), ny=int(ny), cells=int(cells),
         total_slots=total, max_slots=mx, mean_slots=mean,
+        nonempty_cells=int(nonempty), mean_nonempty_slots=mean_nonempty,
     )
 
 
@@ -674,11 +735,15 @@ def load_signal_is_material(
 ) -> bool:
     """True when the load signal is material enough to justify the load pass.
 
-    Neutral cases (a corpus where every Cell sees every frame, a grid with no
-    memberships, a single Cell) are NOT material, so the historical grid is kept
-    and no extra candidate is ever scanned.
+    The denominator is the count of NON-EMPTY Cells (H2): including empty Cells
+    inflates ``max/mean`` and can arm the pass on a structural tail where no
+    candidate can improve. Neutral cases (a corpus where every Cell sees every
+    frame, a grid with no memberships, a single Cell) are NOT material, so the
+    historical grid is kept and no extra candidate is ever scanned.
     """
     if load.cells <= 1 or load.total_slots <= 0:
+        return False
+    if load.nonempty_cells <= 1:
         return False
     return float(load.imbalance) > float(trigger)
 
@@ -686,48 +751,39 @@ def load_signal_is_material(
 def load_candidate_is_acceptable(
     candidate: MembershipLoad,
     baseline: MembershipLoad,
-    tail_weight: int = LOAD_TAIL_WEIGHT,
+    workers: int = LOAD_WORKERS,
 ) -> bool:
     """Hard guards a load-aware choice must satisfy against the historical grid.
 
     * the tail may NEVER grow (``max_slots <= baseline.max_slots``);
-    * the aggregate may grow at most by ``tail_weight`` slots per slot removed
-      from the tail, i.e. ``total <= baseline_total + tail_weight * (baseline_max
-      - candidate_max)`` — EXACTLY the score-improvement inequality, so the
-      published exchange rate is the only tunable and no second cap can disagree
-      with it.
+    * the MAKESPAN PROXY may never worsen:
+      ``max(ceil(total/P), max) <= max(ceil(baseline_total/P), baseline_max)``.
 
-    On a dense field the two objectives trade inversely (a Cell covering fewer
-    frames implies more Cells touched per frame), so this is the honest
-    formulation: the rule may buy a shorter tail, but never at a price above the
-    published ``tail_weight`` exchange rate, and never by lengthening the tail.
+    The proxy is the quantity actually ranked, so "no worse makespan" is stated
+    on the proxy itself. The explicit tail guard is kept on top: the proxy can be
+    aggregate-dominated, and a candidate must still never lengthen the tail.
     """
     if int(candidate.max_slots) > int(baseline.max_slots):
         return False
-    saved_tail = int(baseline.max_slots) - int(candidate.max_slots)
-    allowed_total = int(baseline.total_slots) + int(tail_weight) * saved_tail
-    return int(candidate.total_slots) <= int(allowed_total)
+    return int(candidate.makespan_proxy_slots(workers)) <= int(
+        baseline.makespan_proxy_slots(workers)
+    )
 
 
 def better_load(
     candidate: MembershipLoad,
     incumbent: MembershipLoad,
-    tail_weight: int = LOAD_TAIL_WEIGHT,
+    workers: int = LOAD_WORKERS,
 ) -> bool:
     """True when ``candidate`` should REPLACE ``incumbent`` under the rule.
 
-    Deterministic total order: acceptance guards first, then the integer score
-    (STRICTLY lower), then (tie-breaks) fewer total slots, lower tail, fewer
-    Cells, and finally the lexicographic ``(nx, ny)``. Two runs on the same
-    inputs always return the same grid.
+    Deterministic TOTAL order: acceptance guards first, then
+    ``rank_key = (proxy, total_slots, max_slots, cells, nx, ny)``. Two runs on the
+    same inputs always return the same grid.
     """
-    if not load_candidate_is_acceptable(candidate, incumbent, tail_weight):
+    if not load_candidate_is_acceptable(candidate, incumbent, workers):
         return False
-    a = (candidate.score(), candidate.total_slots, candidate.max_slots,
-         candidate.cells, candidate.nx, candidate.ny)
-    b = (incumbent.score(), incumbent.total_slots, incumbent.max_slots,
-         incumbent.cells, incumbent.nx, incumbent.ny)
-    return a < b
+    return candidate.rank_key(workers) < incumbent.rank_key(workers)
 
 
 # ---------------------------------------------------------------------------

@@ -1983,6 +1983,7 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
     load_total = 0
     load_max = 0
     load_cells = 0
+    load_nonempty = 0
     for c in _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
         cheaper = min(c["inmem_bound_bytes"], c["stream_bound_bytes"])
         if worst is None or cheaper > worst["cheaper_bound_bytes"]:
@@ -1994,6 +1995,8 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
         n = c["n"]
         load_total += int(n)
         load_cells += 1
+        if int(n) > 0:
+            load_nonempty += 1
         if int(n) > load_max:
             load_max = int(n)
         for t in CPU_STREAMING_TILE_LADDER:
@@ -2008,6 +2011,10 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
         nx=int(nx), ny=int(ny), cells=int(load_cells),
         total_slots=int(load_total), max_slots=int(load_max),
         mean_slots=(float(load_total) / float(load_cells)) if load_cells else 0.0,
+        nonempty_cells=int(load_nonempty),
+        mean_nonempty_slots=(
+            float(load_total) / float(load_nonempty) if load_nonempty else 0.0
+        ),
     )
     return worst
 
@@ -2360,11 +2367,17 @@ def _load_aware_select(
         take = acceptable and zal.better_load(load, best_load)
         records.append({
             "nx": int(cx), "ny": int(cy), "cells": int(load.cells),
+            "nonempty_cells": int(load.nonempty_cells),
             "total_slots": int(load.total_slots),
             "max_slots": int(load.max_slots),
             "mean_slots": round(float(load.mean_slots), 6),
-            "max_over_mean": round(float(load.imbalance), 6),
+            "mean_nonempty_slots": round(float(load.mean_nonempty_slots), 6),
+            "max_over_mean_nonempty": round(float(load.imbalance), 6),
+            "max_over_mean_all_cells": round(float(load.imbalance_all_cells), 6),
+            # The number actually ranked: max(ceil(total/workers), max).
             "score": int(load.score()),
+            "makespan_proxy_slots": int(load.makespan_proxy_slots()),
+            "rank_key": list(load.rank_key()),
             "admissible": bool(state["admissible"]),
             "floors_ok": bool(state.get("floors_ok", True)),
             "acceptable": bool(acceptable),
@@ -2401,11 +2414,15 @@ def _load_aware_select(
         "applied": bool(applied),
         "reason": reason,
         "imbalance_trigger": float(zal.LOAD_IMBALANCE_TRIGGER),
-        "tail_weight": int(zal.LOAD_TAIL_WEIGHT),
-        "score_rule": "total_slots + tail_weight * max_slots (lower is better)",
-        "total_growth_bound_rule": (
-            "total_slots <= baseline_total_slots + tail_weight * "
-            "(baseline_max_slots - candidate_max_slots)"
+        "trigger_denominator": "non_empty_cells",
+        "workers": int(zal.LOAD_WORKERS),
+        "score_rule": (
+            "rank by makespan proxy max(ceil(total_slots / workers), max_slots), "
+            "then total_slots, then max_slots, then cells, then (nx, ny)"
+        ),
+        "acceptance_rule": (
+            "max_slots <= baseline.max_slots AND "
+            "proxy(candidate) <= proxy(baseline)"
         ),
         "tail_never_grows": True,
         "n_frames": int(n_frames),
@@ -3443,20 +3460,26 @@ def _choose_layout_mode_aware(
             _base = load_selection["baseline"]
             _pick = load_selection["chosen"]
             _log(
-                "layout load: baseline {bx}x{by} ({bc} cells) total_slots={bt} "
-                "max_slots={bmax} mean_slots={bmean:.1f} max/mean={bratio:.2f} "
+                "layout load: baseline {bx}x{by} ({bc} cells, {bne} non-empty) "
+                "total_slots={bt} max_slots={bmax} mean/nonempty={bmne:.1f} "
+                "max/mean={bratio:.2f} proxy={bproxy} "
                 "-> {decision} {px}x{py} total_slots={pt} max_slots={pmax} "
-                "mean_slots={pmean:.1f} max/mean={pratio:.2f} "
+                "mean/nonempty={pmne:.1f} max/mean={pratio:.2f} proxy={pproxy} "
                 "(rule: {rule}; reason: {reason}; tail_pinned_at_all_frames={pinned})"
                 .format(
                     bx=_base["nx"], by=_base["ny"], bc=_base["cells"],
+                    bne=_base["nonempty_cells"],
                     bt=_base["total_slots"], bmax=_base["max_slots"],
-                    bmean=_base["mean_slots"], bratio=_base["max_over_mean"],
+                    bmne=_base["mean_nonempty_slots"],
+                    bratio=_base["max_over_mean_nonempty"],
+                    bproxy=_base["makespan_proxy_slots"],
                     decision=("CHOSEN" if load_selection["applied"] else "KEPT"),
                     px=_pick["nx"], py=_pick["ny"], pt=_pick["total_slots"],
-                    pmax=_pick["max_slots"], pmean=_pick["mean_slots"],
-                    pratio=_pick["max_over_mean"],
-                    rule=load_selection["score_rule"],
+                    pmax=_pick["max_slots"],
+                    pmne=_pick["mean_nonempty_slots"],
+                    pratio=_pick["max_over_mean_nonempty"],
+                    pproxy=_pick["makespan_proxy_slots"],
+                    rule="proxy=max(ceil(total/workers), max)",
                     reason=load_selection["reason"],
                     pinned=load_selection["tail_pinned_at_all_frames"],
                 )
@@ -3464,9 +3487,11 @@ def _choose_layout_mode_aware(
             for _rec in load_selection["candidates"]:
                 _log(
                     "layout load: candidate {nx}x{ny} cells={cells} "
-                    "total_slots={total_slots} max_slots={max_slots} "
-                    "mean_slots={mean_slots:.1f} max/mean={max_over_mean:.2f} "
-                    "score={score} admissible={admissible} "
+                    "nonempty={nonempty_cells} total_slots={total_slots} "
+                    "max_slots={max_slots} "
+                    "mean/nonempty={mean_nonempty_slots:.1f} "
+                    "max/mean={max_over_mean_nonempty:.2f} "
+                    "proxy={makespan_proxy_slots} admissible={admissible} "
                     "acceptable={acceptable} selected={selected}".format(**_rec)
                 )
             if load_selection["applied"]:
@@ -15624,9 +15649,21 @@ def _r55_build_run_store_identity(
                 f"contract {_contract_backend!r}; refusing to freeze a "
                 "self-contradicting identity"
             )
-        if isinstance(science_params, dict) and "backend" in science_params:
-            science_params = dict(science_params)
-            science_params["backend"] = _eff_backend
+        # ZM-ZEGRID-HARDENING-PASS (H5): the override is the ONLY thing that
+        # keeps a CPU-frozen run from freezing a GPU-requested backend (and vice
+        # versa). A science-params object WITHOUT a ``backend`` field would make
+        # the override a silent no-op and reintroduce the CPU-frozen/GPU-host
+        # mismatch, so it is refused explicitly instead of skipped.
+        if not isinstance(science_params, dict) or "backend" not in science_params:
+            raise _R55RunStoreIdentityError(
+                "durable identity: the science parameters carry no 'backend' "
+                f"field (got {type(science_params).__name__}); the effective "
+                f"backend {_eff_backend!r} cannot be frozen without it. "
+                "Refusing rather than silently skipping the backend override "
+                "(a CPU-frozen run must never freeze a GPU-requested backend)."
+            )
+        science_params = dict(science_params)
+        science_params["backend"] = _eff_backend
     science_block = {
         "sha256": _r55_sha256_json(science_params),
         "contract_version": str(
@@ -16524,6 +16561,11 @@ def _run_single(
     # forced off here (one helper, same mapping as the planner), so the ACTIVE
     # GPU decision is never armed and the identity matches by construction.
     _gpu_selected_by_host = bool(gpu_used)
+    # ZM-ZEGRID-HARDENING-PASS (H6): THIS is the ONE resolution of the run's
+    # effective backend. Every downstream consumer (plan admission, ignore
+    # diagnostics, the durable science identity assigned below) reuses this
+    # ``gpu_used`` value; no consumer re-derives it, so they cannot diverge if
+    # the ordering of the admission block changes.
     gpu_used = _frozen_planning_gpu(
         _frozen_admission, gpu_used=gpu_used
     )
@@ -18096,6 +18138,25 @@ def _run_single(
     # gated the plan and drives the ignore/refusal diagnostics (fresh run:
     # selected backend; resume: frozen admission), so identity and that logic can
     # never disagree again.
+    # ZM-ZEGRID-HARDENING-PASS (H6): this is the SECOND and LAST resolution of
+    # the effective backend, and it is REQUIRED to be a second call — not a
+    # duplicated one:
+    #
+    #  * the first call (before the admission block) resolves the HOST-SELECTED
+    #    backend into ``gpu_used`` so the plan/ignore diagnostics never offer a
+    #    GPU to a CPU-frozen run;
+    #  * between the two calls the admission block may legitimately CHANGE the
+    #    executed backend: a validated pre-execution GPU fallback
+    #    (``_final.gpu_used`` False, branch above) rewrites ``science_config`` to
+    #    cpu. The identity must freeze what ACTUALLY executed, so it has to
+    #    consume the POST-admission value, and it must still fail closed with the
+    #    typed refusal when a GPU-frozen admission reaches here without a GPU.
+    #
+    # The two values are therefore equal on every resume path WITHOUT a
+    # fallback (the frozen admission wins in both calls); they may differ only
+    # when the product explicitly fell back, which is exactly the case that must
+    # not reuse the pre-admission value. See
+    # ``test_h6_two_resolutions_agree_on_the_resume_path``.
     _effective_backend = (
         "gpu"
         if _frozen_planning_gpu(

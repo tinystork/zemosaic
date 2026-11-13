@@ -814,3 +814,79 @@ def test_plan_bundle_auto_threads_the_resume_upgrade_flag(monkeypatch):
     assert seen["frozen_admission"]["working_set"]["class"] == (
         "external_spool"
     )
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-HARDENING-PASS (H4) — the upgrade's own numbers must agree
+# ---------------------------------------------------------------------------
+
+def _incoherent_upgrade(*, aggregate_mib, budget_mib=320):
+    proposal = {
+        "from_class": _UPGRADE_PROPOSAL["from_class"],
+        "to_class": _UPGRADE_PROPOSAL["to_class"],
+        "tile_px": _UPGRADE_PROPOSAL["tile_px"],
+        "column_batch": _UPGRADE_PROPOSAL["column_batch"],
+        "reason": _UPGRADE_PROPOSAL["reason"],
+        "ram_observation": dict(_UPGRADE_PROPOSAL["ram_observation"]),
+    }
+    proposal["ram_observation"]["plan_budget_bytes"] = int(budget_mib * MIB)
+    proposal["ram_observation"]["plan_aggregate_bytes"] = int(aggregate_mib * MIB)
+    return proposal
+
+
+def test_h4_recorder_refuses_aggregate_above_budget(tmp_path):
+    root = tmp_path / "run"
+    _, identity_sha = _partial_external_store(root)
+    state_file = zres.state_path(root)
+    state_before = state_file.read_bytes()
+
+    bad = _incoherent_upgrade(aggregate_mib=321)
+    assert (bad["ram_observation"]["plan_aggregate_bytes"]
+            > bad["ram_observation"]["plan_budget_bytes"])
+    with pytest.raises(zres.ResumeStateError) as exc:
+        zres.record_working_set_upgrade(
+            root, transition=bad, identity_sha256=identity_sha
+        )
+    message = str(exc.value)
+    assert "plan_aggregate_bytes" in message
+    assert "plan_budget_bytes" in message
+    # Nothing was written and no transition was recorded.
+    assert state_file.read_bytes() == state_before
+    assert zres.read_state(root).get("working_set_transitions") in (None, [])
+
+    # Control: the coherent proposal (aggregate < budget) is still accepted.
+    record = zres.record_working_set_upgrade(
+        root, transition=_UPGRADE_PROPOSAL, identity_sha256=identity_sha
+    )
+    assert (record["ram_observation"]["plan_aggregate_bytes"]
+            <= record["ram_observation"]["plan_budget_bytes"])
+
+
+def test_h4_validate_state_refuses_a_crafted_incoherent_upgrade(tmp_path):
+    root, _record, _sha = _root_with_one_upgrade(tmp_path)
+    raw = json.loads(zres.state_path(root).read_text(encoding="utf-8"))
+    observation = raw["working_set_transitions"][0]["ram_observation"]
+    observation["plan_budget_bytes"] = 10 * MIB
+    observation["plan_aggregate_bytes"] = 10 * MIB + 1
+
+    with pytest.raises(zres.ResumeStateError) as exc:
+        zres.validate_state(raw)
+    assert "incoherent" in str(exc.value)
+    assert "plan_aggregate_bytes" in str(exc.value)
+
+    # An equal pair (aggregate == budget) is coherent and still accepted.
+    observation["plan_aggregate_bytes"] = 10 * MIB
+    assert zres.validate_state(raw)["working_set_transitions"]
+
+
+def test_h4_on_disk_incoherent_upgrade_is_refused_on_load(tmp_path):
+    root, _record, _sha = _root_with_one_upgrade(tmp_path)
+    path = zres.state_path(root)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["working_set_transitions"][0]["ram_observation"][
+        "plan_aggregate_bytes"] = 400 * MIB
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(zres.ResumeStateError) as exc:
+        zres.read_state(root)
+    assert "plan_aggregate_bytes" in str(exc.value)

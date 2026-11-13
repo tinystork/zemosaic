@@ -434,7 +434,81 @@ def test_run_single_builds_both_identities_with_the_effective_backend():
         REPO_ROOT / "src" / "zemosaic" / "zemosaic_zegrid_mode.py"
     ).read_text(encoding="utf-8")
     assert source.count("effective_backend=_effective_backend") == 2
-    # The effective token consumes the SAME decision the plan/ignore logic uses.
+    # ZM-ZEGRID-HARDENING-PASS (H6): TWO documented resolutions, both required:
+    # the pre-admission one (host-selected -> plan gate) and the post-admission
+    # one (final executed value -> identity). They are equal on every resume
+    # path without a pre-execution fallback (proven at runtime below).
+    assert '_effective_backend = "gpu" if bool(gpu_used) else "cpu"' not in source
     assert "_frozen_planning_gpu(\n            _frozen_admission, gpu_used=bool(gpu_used)\n        )" in source
+    start = source.index("def _run_single(")
+    body = source[start:source.index("\ndef ", start + 1)]
+    assert body.count("_frozen_planning_gpu(") == 2
+    assert "REQUIRED to be a second call" in body
     assert 'if _requested_backend != _effective_backend:' in source
     assert 'science_config = replace(science_config, backend=_effective_backend)' in source
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-HARDENING-PASS (H5) — science params must carry `backend`
+# ---------------------------------------------------------------------------
+
+def test_identity_builder_refuses_science_params_without_backend(tmp_path):
+    science = _science()
+    del science.backend
+    assert "backend" not in vars(science)
+    with pytest.raises(zz._R55RunStoreIdentityError) as exc:
+        _identity(
+            tmp_path,
+            bundle=_scope_bundle(cpu_tile=96),
+            science=science,
+            effective_backend="cpu",
+        )
+    message = str(exc.value)
+    assert "backend" in message
+    assert "science parameters" in message
+
+    # The same refusal applies to a GPU-frozen resume.
+    with pytest.raises(zz._R55RunStoreIdentityError):
+        _identity(
+            tmp_path,
+            bundle=_scope_bundle(cpu_tile=96, gpu_tile=128, parity=True),
+            science=science,
+            effective_backend="gpu",
+        )
+
+
+# ---------------------------------------------------------------------------
+# ZM-ZEGRID-HARDENING-PASS (H6) — ONE resolution, reused by the identity
+# ---------------------------------------------------------------------------
+
+def test_h6_two_resolutions_agree_on_the_resume_path(tmp_path):
+    """H6: both documented resolutions return the SAME token on a resume.
+
+    Without a pre-execution fallback the post-admission ``gpu_used`` is the
+    pre-admission value coerced by the first call, so the identity freezes
+    exactly the backend the plan and the ignore diagnostics used.
+    """
+    cpu_frozen = _admission(tile_px=64, backend="cpu")
+    gpu_frozen = _admission(tile_px=64, backend="gpu")
+    # Pre-admission (host requests GPU) == post-admission (final value) on resume.
+    for admission, host in ((cpu_frozen, True), (cpu_frozen, False),
+                            (gpu_frozen, True)):
+        first = zz._frozen_planning_gpu(admission, gpu_used=bool(host))
+        second = zz._frozen_planning_gpu(
+            admission, gpu_used=bool(first))
+        assert first == second
+    # A GPU-frozen resume without a GPU is still the typed refusal (the guard
+    # the identity relies on is never relaxed).
+    with pytest.raises(zres.ResumeFrozenAdmissionUnavailable):
+        zz._frozen_planning_gpu(gpu_frozen, gpu_used=False)
+
+    # The identity freezes the value the resolution returns, on both backends.
+    cpu_identity = _identity(
+        tmp_path, bundle=_scope_bundle(cpu_tile=96),
+        science=_science(backend="gpu"), effective_backend="cpu")
+    assert cpu_identity["science_contract"]["science"]["params"]["backend"] == "cpu"
+    gpu_identity = _identity(
+        tmp_path, bundle=_scope_bundle(cpu_tile=96, gpu_tile=128, parity=True),
+        science=_science(backend="cpu"), effective_backend="gpu")
+    assert gpu_identity["science_contract"]["science"]["params"]["backend"] == "gpu"
+    assert gpu_identity["science_contract"]["backend"]["backend"] == "gpu"
