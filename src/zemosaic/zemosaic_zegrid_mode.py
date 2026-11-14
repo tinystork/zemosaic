@@ -18949,6 +18949,21 @@ def _run_single(
                         "DONE", _r.get("cell_id"),
                         stack_s=_stack_s, status=_r.get("status"),
                     ))
+                    # ZM-ZEGRID-EXTERNAL-REDUCE-HANG: surface the measured phase
+                    # elapsed_s BEFORE the durable commit, so a reader sees where
+                    # the time went even if the commit never happens.
+                    _phases = (
+                        (_rec.get("memory_peak") or {}).get("phases") or {}
+                    ) if isinstance(_rec, dict) else {}
+                    if isinstance(_phases, dict):
+                        for _label in ("write", "reduce", "finalize"):
+                            _ph = _phases.get(_label)
+                            if isinstance(_ph, dict) and _ph.get("elapsed_s") is not None:
+                                _life(
+                                    f"ZeGrid: cell {_r.get('cell_id')} "
+                                    f"phase={_label} END "
+                                    f"({float(_ph['elapsed_s']):.3f}s)"
+                                )
                 except Exception:  # noqa: BLE001 - telemetry is never fatal
                     pass
         return _res, _meta

@@ -139,6 +139,9 @@ SPOOL_MANIFEST_NAME = "manifest.json"
 SPOOL_OWNER_NAME = "ATTEMPT"
 IMAGES_NAME = "images.npy"
 WEIGHTS_NAME = "weights.npy"
+# ZM-ZEGRID-EXTERNAL-REDUCE-HANG: per-cell phase breadcrumb inside the SAME
+# spool attempt dir, so a HUNG cell still shows its last completed phase on disk.
+PHASE_LOG_NAME = "phases.log"
 
 #: Transactional attempt states (M4). The spool is never reusable as a
 #: completed Cell until the durable store commit exists; the caller marks it.
@@ -2099,6 +2102,31 @@ def run_cell_streaming_external(
     spool = ExternalSpool(spec)
     gpu_fallback_tiles = []
 
+    # ZM-ZEGRID-EXTERNAL-REDUCE-HANG: write/ reduce/ finalize breadcrumbs to the
+    # cell's OWN spool attempt directory. Every write is swallowed (telemetry can
+    # never fail a cell) and this file SURVIVES a hang, which the run log cannot
+    # do from inside a child process.
+    _phase_log_path = Path(spool.attempt_dir) / PHASE_LOG_NAME
+    _phase_acc = {"write": 0.0, "reduce": 0.0, "finalize": 0.0}
+    _phase_started = set()
+
+    def _phase_line(kind: str, label: str, seconds=None) -> None:
+        try:
+            suffix = "" if seconds is None else f" ({float(seconds):.3f}s)"
+            with open(_phase_log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"ZeGrid: cell {spool.cell_id} phase={label} "
+                    f"{kind.upper()}{suffix}\n"
+                )
+                f.flush()
+        except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+            pass
+
+    def _phase_start(label: str) -> None:
+        if label not in _phase_started:
+            _phase_started.add(label)
+            _phase_line("start", label)
+
     def _probe(label: str) -> None:
         # Additive diagnostics only: the hook may never affect the cell.
         if memory_probe is None:
@@ -2109,8 +2137,10 @@ def run_cell_streaming_external(
             pass
 
     try:
+        _phase_start("write")
         for (y0, y1, x0, x1) in _iter_tiles(h, w, tile_size):
             _probe("write")
+            _tw = time.perf_counter()
             handle = spool.write_tile(
                 provider, p1, y0, y1, x0, x1,
                 taper_kind=taper_kind,
@@ -2118,10 +2148,13 @@ def run_cell_streaming_external(
                 taper_floor=taper_floor,
                 halo_px=halo,
             )
+            _phase_acc["write"] += time.perf_counter() - _tw
             sink_cp = (
                 rejection_sink.checkpoint() if rejection_sink is not None else None
             )
             _probe("reduce")
+            _phase_start("reduce")
+            _tr = time.perf_counter()
             try:
                 if gpu_active:
                     try:
@@ -2166,6 +2199,7 @@ def run_cell_streaming_external(
                     )
             finally:
                 spool.discard_tile(handle)
+            _phase_acc["reduce"] += time.perf_counter() - _tr
             if rejection_sink is not None:
                 rejection_sink.flush_batch()
 
@@ -2258,6 +2292,9 @@ def run_cell_streaming_external(
                     }),
                 },
             })
+        _phase_line("end", "write", _phase_acc["write"])
+        if "reduce" in _phase_started:
+            _phase_line("end", "reduce", _phase_acc["reduce"])
     except BaseException:
         if not retain_on_failure:
             try:
@@ -2270,6 +2307,8 @@ def run_cell_streaming_external(
         spool.cleanup()
 
     _probe("finalize")
+    _phase_start("finalize")
+    _tf = time.perf_counter()
     (science, weight_sum, valid_mask, surviving, support_w1, support_w2, n_eff, agg) = (
         _finalize_phase2_outputs(
             p1,
@@ -2288,7 +2327,7 @@ def run_cell_streaming_external(
             prefetch_report=None,
         )
     )
-    return finalize_streaming_result(
+    _result = finalize_streaming_result(
         provider, request, p1,
         science=science, weight_sum=weight_sum, valid_mask=valid_mask,
         surviving=surviving, support_w1=support_w1, support_w2=support_w2,
@@ -2296,3 +2335,6 @@ def run_cell_streaming_external(
         backend_requested_token=token,
         tile_prefetch_plan={"requested": "off"},
     )
+    _phase_acc["finalize"] = time.perf_counter() - _tf
+    _phase_line("end", "finalize", _phase_acc["finalize"])
+    return _result
