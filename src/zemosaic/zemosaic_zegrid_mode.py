@@ -18826,10 +18826,13 @@ def _run_single(
             _r40_bounds, nx, ny, block_px=int(_r40bm.BLOCK_PX)
         )
 
+    _lifecycle_log = _log_line
+
     def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt,
                         tasks=None, workers=None, cache_workers=None,
                         progress_callback=None, heartbeat=None,
-                        heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S):
+                        heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
+                        lifecycle_log=None):
         """Run the WHOLE per-cell batch once; returns (results, meta).
 
         ``gpu_attempt=True`` disables pmap's SAME-config serial retry (serial_fallback
@@ -18892,6 +18895,19 @@ def _run_single(
                 # A cell with no reservation keeps the historical executor: no
                 # guess, no invented bound.
                 _res_list = None
+        # ZM-ZEGRID-REDUCE-VISIBILITY: a per-cell START line goes to the RUN LOG
+        # FILE (not only the console), so a running stack is watchable. Every
+        # write is swallowed: telemetry can never fail a cell.
+        _life = _lifecycle_log if lifecycle_log is None else lifecycle_log
+        if _life is not None:
+            for _t in _tasks:
+                try:
+                    _life(zpar.cell_lifecycle_line(
+                        "START", _t[0].cell_id,
+                        frames=len(_t[2].patch_ids), mode=_t[4],
+                    ))
+                except Exception:  # noqa: BLE001 - telemetry is never fatal
+                    pass
         try:
             if _res_list is not None:
                 _res = zpar.pmap_reserved(
@@ -18922,6 +18938,19 @@ def _run_single(
                 _batch_exc, input_folder, progress_callback, phase="cell cache"
             )
             raise
+        if _life is not None:
+            for _r in _res or ():
+                try:
+                    if not isinstance(_r, dict):
+                        continue
+                    _rec = _r.get("record") if isinstance(_r.get("record"), dict) else {}
+                    _stack_s = _r.get("stack_seconds", _rec.get("stack_seconds", 0.0))
+                    _life(zpar.cell_lifecycle_line(
+                        "DONE", _r.get("cell_id"),
+                        stack_s=_stack_s, status=_r.get("status"),
+                    ))
+                except Exception:  # noqa: BLE001 - telemetry is never fatal
+                    pass
         return _res, _meta
 
     def _run_r55_active_cpu_waves(*, science_cfg, start_bundle,
@@ -18966,6 +18995,7 @@ def _run_single(
         deterministic_checkpoints = []
         shrink_count = 0
         run_t0 = time.perf_counter()
+        _lifecycle_hb = {"t": 0.0}
         # ZM-ZEGRID-COMMIT-INTEGRITY: ONE explicit line with the durable commit
         # counter at stacking start, so a silent divergence is visible.
         if _store_state["store"] is not None and _store_state["publishing"]:
@@ -19583,6 +19613,19 @@ def _run_single(
             )
             wave_tasks = pending_tasks[start:end]
             wave_units = int(len(wave_tasks))
+            # ZM-ZEGRID-REDUCE-VISIBILITY: a low-frequency heartbeat in the RUN
+            # LOG FILE (rate-limited to >= 60 s, never per-cell spam), so a
+            # multi-hour stack shows committed/in-flight progress to a reader.
+            try:
+                _hb_now = time.monotonic()
+                if zpar.heartbeat_due(_lifecycle_hb["t"], _hb_now):
+                    _lifecycle_hb["t"] = _hb_now
+                    _hb_committed = int(_store_state.get("commits", 0) or 0)
+                    _lifecycle_log(zpar.cells_heartbeat_line(
+                        _hb_committed, int(total_tasks), wave_units
+                    ))
+            except Exception:  # noqa: BLE001 - telemetry is never fatal
+                pass
             # M1 REWORK-2: capture the authorised generation BEFORE the wave is
             # dispatched. A transition that happens while the wave is in flight
             # must not stamp old results with the new generation.

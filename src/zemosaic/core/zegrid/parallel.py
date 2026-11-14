@@ -1090,6 +1090,40 @@ def dispatch_is_applicable(chosen_mode, reservations, cap, n_tasks) -> bool:
     )
 
 
+def cell_lifecycle_line(kind, cell_id, *, frames=None, mode=None,
+                        stack_s=None, status=None) -> str:
+    """ONE per-cell lifecycle line for the RUN LOG FILE (never the console only).
+
+    ``kind`` is ``"START"`` (frames + mode) or ``"DONE"`` (stack_s + status).
+    Kept as a pure formatter so the exact text is testable.
+    """
+    token = str(kind).upper()
+    if token == "START":
+        return (
+            f"ZeGrid: cell START id={cell_id} frames={int(frames or 0)} "
+            f"mode={mode}"
+        )
+    if token == "DONE":
+        return (
+            f"ZeGrid: cell DONE id={cell_id} stack_s={float(stack_s or 0.0):.1f} "
+            f"status={status}"
+        )
+    raise ValueError(f"unknown lifecycle kind {kind!r}")
+
+
+def heartbeat_due(last_ts, now_ts, interval_s: float = 60.0) -> bool:
+    """True when a rate-limited progress line may be written again."""
+    return float(now_ts) - float(last_ts) >= float(interval_s)
+
+
+def cells_heartbeat_line(committed, total, in_flight) -> str:
+    """Rate-limited progress line: how many cells are durable, how many run."""
+    return (
+        f"ZeGrid: cells committed={int(committed)}/{int(total)} "
+        f"in_flight={int(in_flight)}"
+    )
+
+
 def dispatch_wave_bound(chosen_mode, dispatch_cap, units_in_flight) -> int:
     """How many cells ONE wave may contain (ZM-ZEGRID-PER-CELL-SCHEDULER).
 
