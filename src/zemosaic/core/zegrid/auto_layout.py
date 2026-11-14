@@ -815,12 +815,20 @@ def memory_observations_from_commit_records(records) -> list[dict]:
         row = meta.get("record")
         if not isinstance(row, dict):
             continue
-        peak_kib = None
-        mem = meta.get("memory_peak")
-        if isinstance(mem, dict):
-            peak_kib = mem.get("owned_peak_kib")
-            if peak_kib is None:
-                peak_kib = mem.get("peak_rss_kib")
+        # ZM-ZEGRID-CELL-PROFILE rework-5 (FIELD PATH): the commit writer stores
+        # the peak under ``payload_meta.record.memory_peak`` (mode.py ~:6549),
+        # NOT at ``payload_meta.memory_peak``. Reading the wrong level made every
+        # row unreadable, so a resume always stayed on ``source="model"`` and the
+        # measured envelope was silently ignored (the 21.8 GiB / 88.7 % defect).
+        mem = row.get("memory_peak")
+        if not isinstance(mem, dict):
+            mem = {}
+        peak_kib = mem.get("owned_peak_kib")
+        if peak_kib is None:
+            peak_kib = mem.get("peak_rss_kib")
+        if peak_kib is None:
+            # legacy/top-level fallback (older records, or a flat manifest)
+            peak_kib = meta.get("peak_rss_kib")
         if peak_kib is None:
             continue
         hw = row.get("patch_shape_hw")

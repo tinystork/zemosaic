@@ -19,12 +19,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from zemosaic.core.zegrid import auto_layout as zal  # noqa: E402
 from zemosaic.core.zegrid import parallel as zpar  # noqa: E402
 from zemosaic.core.zegrid import runtime_control as zrt  # noqa: E402
 
@@ -475,3 +477,101 @@ def test_multi_wave_run_is_byte_identical_to_the_sequential_run():
     assert [r["index"] for r in out] == list(range(12))
     assert [r["digest"] for r in out] == [r["digest"] for r in seq]
     assert all(m["max_concurrent"] > 1 for m in meta_all)
+
+
+# ---------------------------------------------------------------------------
+# Rework-5: the durable commit peak lives at payload_meta.record.memory_peak
+# ---------------------------------------------------------------------------
+
+def _commit_record(payload_meta):
+    return SimpleNamespace(manifest={"payload_meta": payload_meta})
+
+
+_MANIFEST_ROW = {
+    "n_contributors": 40,
+    "n_patch_contributors": 40,
+    "patch_shape_hw": [901, 1006],
+}
+
+
+def test_observations_read_the_real_commit_field_path():
+    # The writer (mode.py ~:6549) puts the peak INSIDE record["memory_peak"].
+    obs = zal.memory_observations_from_commit_records([
+        _commit_record({
+            "record": {
+                **_MANIFEST_ROW,
+                "memory_peak": {
+                    "owned_peak_kib": 2_232_320,     # 2 180 MiB owned
+                    "peak_rss_kib": 3_000_000,
+                },
+            }
+        })
+    ])
+    assert len(obs) == 1
+    assert obs[0]["n_contributors"] == 40
+    assert obs[0]["patch_area_px"] == 901 * 1006
+    assert obs[0]["owned_peak_bytes"] == 2_232_320 * 1024
+
+
+def test_observations_fall_back_to_peak_rss_when_owned_is_absent():
+    # (a) record.memory_peak.peak_rss_kib (no owned decomposition)
+    obs = zal.memory_observations_from_commit_records([
+        _commit_record({
+            "record": {**_MANIFEST_ROW, "memory_peak": {"peak_rss_kib": 1_500_000}},
+        })
+    ])
+    assert obs and obs[0]["owned_peak_bytes"] == 1_500_000 * 1024
+
+    # (b) legacy top-level payload_meta.peak_rss_kib
+    obs2 = zal.memory_observations_from_commit_records([
+        _commit_record({
+            "record": dict(_MANIFEST_ROW),
+            "peak_rss_kib": 900_000,
+        })
+    ])
+    assert obs2 and obs2[0]["owned_peak_bytes"] == 900_000 * 1024
+
+    # a record with no peak at all is skipped (never guessed)
+    assert zal.memory_observations_from_commit_records([
+        _commit_record({"record": dict(_MANIFEST_ROW)})
+    ]) == []
+
+
+def test_measured_observation_tightens_the_admitted_concurrency():
+    # The fixed path turns the real 2 180 MiB owned peak into the 2 507 MiB
+    # envelope; the deep shape gets 3 760 MiB. That is what the plan missed.
+    obs = zal.memory_observations_from_commit_records([
+        _commit_record({
+            "record": {
+                **_MANIFEST_ROW,
+                "memory_peak": {"owned_peak_kib": 2_232_320},
+            }
+        })
+    ])
+    stream_bound = int(780.6 * MIB)
+    reservation = zal.reservation_bytes(
+        40, 906_406, stream_bound, observations=obs
+    )
+    assert abs(reservation - 2_507 * MIB) <= 1 * MIB
+    deep = zal.reservation_bytes(21_807, 906_406, stream_bound, observations=obs)
+    assert abs(deep - 3_760 * MIB) <= 1 * MIB
+
+    decision = int(16_667 * MIB * 0.9)
+    # CPU cap with 16 logical CPUs is 14 (the pool size)…
+    block = zpar.external_dispatch_reservation(
+        reservations_by_cell={f"c{i}": reservation for i in range(20)},
+        budget_bytes=16_667 * MIB, shared_bytes=0, cpu_count=16, n_cells=20,
+    )
+    assert block["dispatch_cap"] == 14
+    # …but the BUDGET admits only 5 cells at 2 507 MiB (6 would exceed it),
+    # NOT the 14 the buggy 750 MiB model allowed.
+    _out, meta, _logs = _run(
+        [reservation] * 20, budget=decision, cap=block["dispatch_cap"], sleep=0.35
+    )
+    assert meta["max_concurrent"] == 5
+    assert meta["max_concurrent"] <= 6
+
+    _out2, meta_old, _logs2 = _run(
+        [750 * MIB] * 20, budget=decision, cap=block["dispatch_cap"], sleep=0.35
+    )
+    assert meta_old["max_concurrent"] == 14   # the defect, for contrast
