@@ -960,6 +960,30 @@ class StoreLock:
         return self._fd is not None
 
 
+def _after_fork_in_child() -> None:
+    """Drop inherited lock handles; only the parent owns the store lock.
+
+    Closing a forked descriptor does not unlock the parent's POSIX flock.
+    Never call release(): it would write OWNER.json and issue LOCK_UN on the
+    shared open-file description.
+    """
+    global _LIVE_LOCKS_GUARD
+    for lock in tuple(_LIVE_LOCKS.values()):
+        fd = lock._fd
+        lock._fd = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    _LIVE_LOCKS.clear()
+    _LIVE_LOCKS_GUARD = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
 # ---------------------------------------------------------------------------
 # Disk budget
 # ---------------------------------------------------------------------------

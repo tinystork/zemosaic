@@ -49,6 +49,7 @@ recorded in ``zegrid_manifest.json``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -113,6 +114,7 @@ from .core.zegrid import banded_fits as zbf
 from .core.zegrid import bounded_assembly as zbas
 from .core.zegrid import cell_feather as zcf
 from .core.zegrid import cell_offset as zco
+from .core.zegrid import cell_status as zcs
 from .core.zegrid import execution as zxe
 from .core.zegrid import fd_limits as zfdl
 from .core.zegrid import file_provider as zfp
@@ -3907,6 +3909,17 @@ def _run_cell_external(
         )
         spool_info = {}
         gpu_fallback = {}
+
+        # ZM-CELL-LIVE-OBS: bounded tile/block live progress for THIS cell. The
+        # fields are plain scalars; the writer owns the rate limit and swallows
+        # every failure, so this can never change the reduction.
+        def _live_probe(fields, _cid=str(cell_id)):
+            try:
+                payload = dict(fields)
+                payload["cell_id"] = _cid
+                _live_progress(payload)
+            except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+                pass
         # ZM-ZEGRID-PEAK-ATTRIBUTION: additive component telemetry. A passive
         # sampler records the OWNED (anonymous/private) and FILE-BACKED mapped
         # peaks, per phase, so a working-set peak can never again be compared
@@ -3934,6 +3947,12 @@ def _run_cell_external(
                 owner_record=owner_record,
                 owner_liveness=owner_liveness,
                 gpu_fallback_out=gpu_fallback,
+                # ZM-CELL-LIVE-OBS: the probe is armed ONLY when the wave driver
+                # wired telemetry, so an OFF run keeps the historical call shape
+                # (and allocates nothing per tile/block).
+                progress_probe=(
+                    _live_probe if _STACK_LIVE_TELEMETRY is not None else None
+                ),
                 memory_probe=(
                     _mem_tracker.mark if _mem_tracker is not None else None
                 ),
@@ -4936,8 +4955,69 @@ def _storage_plan_refusal(exc):
 # worker result, no measurable behaviour change.
 _STACK_R40_WORKER_COORDS = None
 
+# ZM-CELL-LIVE-OBS (lot 2): the worker-local live telemetry contract.
+# ``None`` (the default and every legacy/GPU path) means "telemetry absent":
+# no file, no write, no behaviour change. When the wave driver wires it, this is
+# a SMALL picklable dict of plain values (path/run_id/generation/interval) sent
+# through the SAME initializer as the other worker inputs, so it is spawn-safe
+# and Qt-safe (nothing but str/int crosses the process boundary).
+_STACK_LIVE_TELEMETRY = None
+#: Per-cell writers are cached for the lifetime of ONE worker process so the
+#: coalescing/rate-limit state survives the cache -> write -> reduce -> finalize
+#: phases of the same cell. Bounded by the wave's own cell count.
+_STACK_LIVE_WRITERS: dict = {}
 
-def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id, tile_size=STREAM_TILE_SIZE, cache_workers=1, r40_worker_coords=None, phase_profiling=False):
+
+def _live_writer_for(cell_id):
+    """The worker-side writer for ONE cell, or ``None`` when telemetry is off."""
+    cfg = _STACK_LIVE_TELEMETRY
+    if not cfg:
+        return None
+    cid = str(cell_id)
+    writer = _STACK_LIVE_WRITERS.get(cid)
+    if writer is None:
+        try:
+            writer = zcs.LiveTelemetryWriter(
+                zcs.live_cell_path(cfg["dir"], cid),
+                run_id=cfg.get("run_id", "run"),
+                generation=int(cfg.get("generation", 0) or 0),
+                cell_id=cid,
+                min_interval_s=float(
+                    cfg.get("interval_s", zcs.MIN_WRITE_INTERVAL_S)
+                    or zcs.MIN_WRITE_INTERVAL_S
+                ),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+            return None
+        _STACK_LIVE_WRITERS[cid] = writer
+    return writer
+
+
+def _live_progress(fields) -> None:
+    """Worker-side adapter: plain fields -> the per-cell rate-limited writer."""
+    if _STACK_LIVE_TELEMETRY is None or not isinstance(fields, dict):
+        return
+    cid = fields.get("cell_id")
+    if cid is None:
+        return
+    writer = _live_writer_for(cid)
+    if writer is None:
+        return
+    try:
+        writer.progress(
+            fields.get("phase") or "phase",
+            tile_current=fields.get("tile_current"),
+            tile_total=fields.get("tile_total"),
+            block_current=fields.get("block_current"),
+            block_total=fields.get("block_total"),
+            elapsed_s=fields.get("elapsed_s"),
+            force=bool(fields.get("force")),
+        )
+    except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+        pass
+
+
+def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame_ids, global_reference_frame_id, tile_size=STREAM_TILE_SIZE, cache_workers=1, r40_worker_coords=None, phase_profiling=False, live_telemetry=None):
     """Child/parent initializer: publish the read-only per-cell stack inputs.
 
     ``r40_worker_coords`` (ZM-ZEGRID-R40-B2-C) is the OPTIONAL parent-computed
@@ -4945,10 +5025,15 @@ def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame
     appended to ``initargs`` by the caller ONLY when the capture is ON; with the
     capture OFF the initargs tuple is byte-identical to the pre-R40 transport and
     this parameter stays ``None`` (transport fully absent).
+
+    ``live_telemetry`` (ZM-CELL-LIVE-OBS, optional) is the SMALL run/generation
+    identity + live directory described on ``_STACK_LIVE_TELEMETRY``. It defaults
+    to ``None``: every existing caller keeps a byte-identical transport.
     """
     global _STACK_DESCS, _STACK_CANVAS, _STACK_CONFIG, _STACK_GAUGE
     global _STACK_GLOBAL_FRAME_IDS, _STACK_GLOBAL_REF, _STACK_TILE_SIZE
     global _STACK_CACHE_WORKERS, _STACK_R40_WORKER_COORDS, _STACK_PHASE_PROFILING
+    global _STACK_LIVE_TELEMETRY, _STACK_LIVE_WRITERS
     _STACK_DESCS = descs
     _STACK_CANVAS = canvas
     _STACK_CONFIG = science_config
@@ -4959,6 +5044,10 @@ def _init_stack_worker(descs, canvas, science_config, global_gauge, global_frame
     _STACK_CACHE_WORKERS = cache_workers
     _STACK_R40_WORKER_COORDS = r40_worker_coords
     _STACK_PHASE_PROFILING = bool(phase_profiling)
+    _STACK_LIVE_TELEMETRY = dict(live_telemetry) if live_telemetry else None
+    # A NEW dispatch generation always starts with fresh per-cell writers: the
+    # previous generation's coalescing state must never leak into this one.
+    _STACK_LIVE_WRITERS.clear()
 
 
 def _resolve_cell_normalization(mode, global_gauge, global_frame_ids, provider, science_config):
@@ -6120,6 +6209,19 @@ def _prepare_stack_cell(task):
     # (idempotent; child processes inherit an already-raised limit on fork).
     zfdl.ensure_nofile_headroom()
     cid = cell.cell_id
+    _live_progress(
+        {
+            "cell_id": cid,
+            "phase": "cache",
+            "tile_current": 0,
+            "tile_total": max(1, len(mem.patch_ids)),
+            "force": True,
+        }
+    )
+    _live_w = _live_writer_for(cid)
+    if _live_w is not None:
+        # A real worker START, not a submission: this IS the RUNNING transition.
+        _live_w.state("RUNNING")
     _patch_bounds = [int(patch.patch.x0), int(patch.patch.y0),
                      int(patch.patch.x1), int(patch.patch.y1)]
     _patch_shape_hw = [int(patch.patch.height), int(patch.patch.width)]
@@ -6163,6 +6265,16 @@ def _prepare_stack_cell(task):
             workers=int(_STACK_CACHE_WORKERS),
         )
     cache_build_s = time.perf_counter() - t0
+    _live_progress(
+        {
+            "cell_id": cid,
+            "phase": "cache",
+            "tile_current": max(1, len(mem.patch_ids)),
+            "tile_total": max(1, len(mem.patch_ids)),
+            "elapsed_s": cache_build_s,
+            "force": True,
+        }
+    )
     reproject = zxe.get_reproject_path_stats().to_dict()
 
     # Per-Cell photometric normalization (ZM-CELL-PHOTOMETRY-R34B).
@@ -6355,7 +6467,13 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             "storage_profile='bounded' received an in-memory cell task; the "
             "admitted storage model requires the file-backed streaming path"
         )
+    if mode != "external":
+        # A real worker START of the RAM/stream stacking phase (the external
+        # executor below emits its own write/reduce/finalize phases instead).
+        _live_progress({"cell_id": cid, "phase": "stack", "force": True})
     if mode == "external":
+        # The external executor reports its OWN write/reduce/finalize phases
+        # (including tile and block counters); do not duplicate them here.
         _ext = dict(external_info or {})
         if not _ext:
             raise RuntimeError(
@@ -6450,6 +6568,16 @@ def _consume_stack_cell(prepared, *, tile_size=None):
                 prepared["_tile_prefetch_producer_alive_after_join"] = True
             raise
     stack_s = time.perf_counter() - t0
+    if mode != "external":
+        # The RAM/stream path has no tile spool: ONE honest phase pair.
+        _live_progress(
+            {
+                "cell_id": cid,
+                "phase": "finalize",
+                "elapsed_s": stack_s,
+                "force": True,
+            }
+        )
     if source_context is not None:
         storage_info.update({
             "input_strategy": _CELL_INPUT_WINDOWED,
@@ -14843,6 +14971,132 @@ def _gpu_durable_commit(store_state, registry, cell_id, receipt, *,
     return True
 
 
+def _cpu_durable_commit(store_state, registry, cell_id, receipt, *,
+                        plan_generation, backend="cpu"):
+    """Durably commit + verify + release ONE accepted CPU cell, or fail loudly.
+
+    ZM-CELL-LIVE-COMMIT (lot 1): this is THE single durable step of the CPU cell
+    transaction. It was extracted verbatim from the CPU wave commit loop so the
+    LIVE (result-reception) path and the end-of-wave fallback can never diverge.
+    The existing transaction store/fence stays authoritative; nothing here
+    replaces it.
+    Order is mandatory and observable:
+
+    1. ``commit_and_release`` publishes the payload and only then releases the
+       registry's large arrays;
+    2. ``require_commit`` proves the record is DURABLE (cheap local lookup)
+       BEFORE any counter/progress treats the cell as processed;
+    3. the run counters advance ONLY after that verification.
+
+    Any store failure is TERMINAL for a durable run (``StoreCommitNotDurable``):
+    no silent degrade, no in-memory substitute, and the payload is retained.
+
+    Returns the hand-off mapping (``{"commit": ..., "release": ...}``) or
+    ``None`` when no durable store is configured/publishing for this run.
+    """
+    store = store_state.get("store")
+    if store is None:
+        # No durable store configured for this run: no durable claim exists.
+        return None
+    if not store_state.get("publishing"):
+        return None
+    try:
+        handoff = store.commit_and_release(
+            registry,
+            str(cell_id),
+            attempt_id=getattr(receipt, "attempt_id", None),
+            backend=str(backend),
+            plan_generation=int(plan_generation),
+        )
+    except zrs.RunStoreError as exc:
+        store_state["publishing"] = False
+        store_state["degraded_reason"] = f"{type(exc).__name__}: {exc}"
+        store_state["commit_errors"].append(
+            {
+                "cell_id": str(cell_id),
+                "attempt_id": getattr(receipt, "attempt_id", None),
+                "error": store_state["degraded_reason"],
+            }
+        )
+        raise zrs.StoreCommitNotDurable(
+            "durable commit FAILED for cell "
+            f"{cell_id!r} attempt {getattr(receipt, 'attempt_id', None)!r} "
+            f"run_id={store.run_id!r} "
+            f"store_root={store.root}: "
+            f"{store_state['degraded_reason']}",
+            run_id=store.run_id,
+            cell_id=str(cell_id),
+            store_root=store.root,
+            attempt_id=getattr(receipt, "attempt_id", None),
+        ) from exc
+    # Verify the commit is DURABLE before anything (progress, release counters)
+    # treats the cell as processed. Cheap local index lookup.
+    # ZM-CELL-LIVE-COMMIT R2: a store that cannot VERIFY the record it just
+    # accepted is not trustworthy. It is marked unhealthy here (not only on a
+    # commit_and_release error) so no later cell of the same run can ever claim
+    # progress that has no durable record.
+    try:
+        store.require_commit(str(cell_id), getattr(receipt, "attempt_id", None))
+    except zrs.StoreCommitNotDurable as exc:
+        store_state["publishing"] = False
+        store_state["degraded_reason"] = (
+            f"verification: {type(exc).__name__}: {exc}"
+        )
+        store_state["commit_errors"].append(
+            {
+                "cell_id": str(cell_id),
+                "attempt_id": getattr(receipt, "attempt_id", None),
+                "error": store_state["degraded_reason"],
+            }
+        )
+        raise
+    store_state["commits"] = int(store_state.get("commits", 0)) + 1
+    released = handoff.get("release") or {}
+    if released.get("released"):
+        store_state["released_cells"] = (
+            int(store_state.get("released_cells", 0)) + 1
+        )
+        store_state["released_bytes"] = (
+            int(store_state.get("released_bytes", 0))
+            + int(released.get("released_bytes", 0))
+        )
+    return handoff
+
+
+def _cpu_cell_intake_refusal(durable_intent, store_state, cell_id):
+    """Fail-closed intake decision for ONE computed CPU cell (ZM-CELL-LIVE-COMMIT R2).
+
+    ``durable_intent`` is the wave's DURABLE INTENT frozen BEFORE dispatch; it is
+    never re-derived from the mutable store health. Returns ``None`` when the cell
+    may be transacted, or the typed terminal refusal when a run that STARTED
+    durable lost its store (commit error, verification error, degraded store).
+
+    This is deliberately a pure decision helper: it touches no payload, keeps the
+    already durable commits untouched, and makes "a durable run can never turn
+    into memory-only progression" directly testable.
+    """
+    if not bool(durable_intent):
+        # No durable intent for this run: the M1 in-memory claim stays possible
+        # (unchanged historical behaviour for store-less runs).
+        return None
+    store = store_state.get("store")
+    healthy = bool(
+        store is not None
+        and store_state.get("publishing")
+        and store_state.get("degraded_reason") is None
+    )
+    if healthy:
+        return None
+    return _R55DurableStoreUnavailable(
+        "durable store is not healthy any more "
+        f"(cell={str(cell_id)!r}, "
+        f"store={'set' if store is not None else 'none'}, "
+        f"publishing={store_state.get('publishing')!r}, "
+        f"degraded_reason={store_state.get('degraded_reason')!r}); a durable run "
+        "never continues as memory-only"
+    )
+
+
 class _R55DurableStoreUnavailable(RuntimeError):
     """A degraded store must not back assembly from missing commits.
 
@@ -18828,11 +19082,387 @@ def _run_single(
 
     _lifecycle_log = _log_line
 
+    # ------------------------------------------------------------------
+    # ZM-CELL-LIVE-COMMIT (lot 1) — ONE parent-side cell transaction.
+    #
+    # Before this lot a completed cell stayed in RAM until its WHOLE wave
+    # returned: ``pmap_reserved`` collected into ``out[idx]`` and ``pmap``
+    # returned only after every task. These helpers are the single, shared
+    # route the parent now uses AT RESULT RECEPTION (consumer) and, when no
+    # consumer is wired, at the end-of-wave pass — never both for the same cell.
+    # ------------------------------------------------------------------
+    def _cpu_cell_progress_state():
+        """Per-RUN state of the live commit route (unique cells, not a prefix)."""
+        return {"processed": set(), "committed": set()}
+
+    # ZM-CELL-LIVE-OBS (lot 2): the wave driver arms the live reader/state
+    # registry here so the SINGLE commit transaction can publish COMMITTING /
+    # COMMITTED truth and remove the cell's telemetry file commit-then-delete,
+    # without threading another parameter through every helper.
+    _live_scope = {"reader": None, "states": None}
+
+    def _cpu_lifecycle_line(kind, cell_id, **fields):
+        try:
+            if _lifecycle_log is None:
+                return
+            _lifecycle_log(zpar.cell_lifecycle_line(kind, cell_id, **fields))
+        except Exception:  # noqa: BLE001 - telemetry is never fatal
+            pass
+
+    def _cpu_lifecycle_phases(cell_id, result):
+        """Surface the measured phase elapsed BEFORE the durable commit."""
+        if _lifecycle_log is None:
+            return
+        try:
+            rec = (
+                result.get("record")
+                if isinstance(result.get("record"), dict) else {}
+            )
+            phases = (rec.get("memory_peak") or {}).get("phases") or {}
+            if not isinstance(phases, dict):
+                return
+            for label in ("write", "reduce", "finalize"):
+                ph = phases.get(label)
+                if isinstance(ph, dict) and ph.get("elapsed_s") is not None:
+                    _lifecycle_log(
+                        f"ZeGrid: cell {cell_id} phase={label} END "
+                        f"({float(ph['elapsed_s']):.3f}s)"
+                    )
+        except Exception:  # noqa: BLE001 - telemetry is never fatal
+            pass
+
+    def _cpu_cell_spool_cleanup(cell_id):
+        """Safe post-commit removal of ONE cell's external spool attempt.
+
+        COMMIT-THEN-DELETE: the caller only reaches this after a VERIFIED
+        durable commit. A cleanup failure is accounted, never fatal.
+        """
+        try:
+            _ws_b = (
+                _run_scope_bundle(_r55_active_bundle, _final)
+                .working_set_block or {}
+            )
+        except Exception:
+            _ws_b = {}
+        if _ws_b.get("class") != WORKING_SET_EXTERNAL:
+            return
+        try:
+            _root_b = (_ws_b.get("disk") or {}).get("spool_root")
+            _rep_b = zext.cleanup_after_commit(
+                _root_b,
+                cell_id,
+                owner_token=_ws_b.get("owner_token"),
+            )
+            _ext_lifecycle["attempts_created"] += 1
+            _ext_lifecycle["cells_executed_external"] += 1
+            _ext_lifecycle["attempts_discarded_stale"] += int(
+                _rep_b.get("discarded_same_owner", 0)
+            ) + int(_rep_b.get("discarded_stale", 0))
+            _ext_lifecycle["cleaned_committed"] += int(
+                _rep_b.get("cleaned_committed", 0)
+            )
+            _ext_lifecycle["spool_bytes_written"] += int(
+                _ws_b["disk"]["cumulative_writes_bytes"]
+            )
+            _ext_lifecycle["spool_bytes_read"] += int(
+                _ws_b["disk"]["cumulative_reads_bytes"]
+            )
+            _ext_lifecycle["cleanup_failures"].extend(
+                _rep_b.get("failures", [])
+            )
+        except Exception as _ext_clean_exc:  # noqa: BLE001 - accounted only
+            _ext_lifecycle["cleanup_failures"].append({
+                "cell_id": cell_id,
+                "error": f"{type(_ext_clean_exc).__name__}: {_ext_clean_exc}",
+            })
+
+    def _cpu_cell_receipt(*, result, wave_generation, wave_index, progress,
+                          durable_intent):
+        """THE single parent transaction for ONE computed CPU cell.
+
+        accept (registry / generation fence) -> durable commit -> verification
+        -> progress -> safe cleanup -> LIGHT receipt.
+
+        Runs in the PARENT, in the collecting thread, the moment the result is
+        received — never inside a worker and never from a future done-callback.
+        ``wave_generation`` was captured BEFORE dispatch, so a generation
+        transition during the wave can never stamp a late result with a newer
+        generation.
+
+        ``durable_intent`` is the DURABLE INTENT of the wave, frozen BEFORE
+        dispatch (store configured, publishing and healthy at that moment). It is
+        deliberately NOT recomputed from the mutable store health: a run that
+        STARTED durable must never silently continue as an in-memory M1 run after
+        a store failure, because that would report progress (and possibly
+        ``COMMITTED``) without any durable record. Once the intent is durable and
+        the store is not healthy any more, the intake FAILS CLOSED with
+        :class:`_R55DurableStoreUnavailable` (explicit fatal, no progress).
+
+        Failures are FATAL and propagate UNCHANGED (accept refusal,
+        ``StoreCommitNotDurable``): nothing is swallowed as telemetry, no cell is
+        re-accepted, no progress is fabricated. The returned mapping is light
+        (no array reference) so the caller can drop the payload immediately.
+        """
+        cid = str(result.get("cell_id", ""))
+        backend = str(result.get("backend_used") or "cpu")
+        try:
+            stack_s = float(
+                result.get("stack_seconds")
+                or (result.get("record") or {}).get("stack_seconds", 0.0)
+                or 0.0
+            )
+        except Exception:  # noqa: BLE001 - display only
+            stack_s = 0.0
+        # COMPUTED != COMMITTED: this line only says the cell RETURNED.
+        _cpu_lifecycle_line(
+            "COMPUTED", cid, stack_s=stack_s, status=result.get("status")
+        )
+        _cpu_lifecycle_phases(cid, result)
+        _refusal = _cpu_cell_intake_refusal(
+            bool(durable_intent), _store_state, cid
+        )
+        if _refusal is not None:
+            # R2: a durable run NEVER degrades into memory-only progression.
+            # The cell is neither accepted nor counted nor reported COMMITTED;
+            # already durable successes stay untouched on disk.
+            _emit(
+                "ZeGrid: durable store became UNUSABLE while handling "
+                f"cell {cid} (publishing={_store_state['publishing']!r}, "
+                f"degraded_reason={_store_state.get('degraded_reason')!r}); "
+                "refusing the cell instead of reporting progress without a "
+                "durable commit",
+                lvl="ERROR", callback=progress_callback,
+            )
+            raise _refusal
+        if cid in progress["processed"]:
+            # A duplicate receipt can never double-commit (and the registry
+            # would refuse a conflicting payload outright).
+            _emit(
+                f"ZeGrid: duplicate receipt for cell {cid} ignored — it was "
+                "already transacted in this run",
+                lvl="WARN", callback=progress_callback,
+            )
+            return None
+        progress["processed"].add(cid)
+        attempt = f"cpu-wave:{int(wave_generation)}:{int(wave_index)}:{cid}"
+        try:
+            if _m3_fence is not None:
+                _env = zrec.TaskGeneration(
+                    run_id=str(result_registry.run_id),
+                    cell_id=cid,
+                    attempt_id=attempt,
+                    plan_generation=int(wave_generation),
+                )
+                _out = _m3_fence.accept(
+                    _env,
+                    result,
+                    backend=backend,
+                )
+                if not _out.accepted:
+                    # A late/duplicate result that is no longer required never
+                    # poisons accepted state. But a cell the run still NEEDS
+                    # (pending) rejected by the generation fence — e.g. a
+                    # generation transition in the middle of a CPU wave — leaves
+                    # a permanent hole. Fail closed with the typed M1
+                    # conservation refusal instead of leaking a lower-level
+                    # RunRegistryError during assembly.
+                    if cid in set(result_registry.pending_cell_ids()):
+                        _stale = _R55RunRefused(
+                            "R55_RUN_RESULT_ACCEPTANCE",
+                            (
+                                f"cell {cid} result rejected "
+                                "by the M3 generation fence "
+                                f"({_out.reason}: "
+                                f"{_out.detail or ''}); the "
+                                "required cell cannot be "
+                                "accepted for the current "
+                                "generation"
+                            ),
+                            record={
+                                "schema": zrt.RUN_CONTROL_SCHEMA,
+                                "status": "refused",
+                                "reason_code": (
+                                    "R55_RUN_RESULT_ACCEPTANCE"
+                                ),
+                                "detail": (
+                                    f"{_out.reason}: "
+                                    f"{_out.detail or ''}"
+                                ),
+                                "wave_index": int(wave_index),
+                                "cell_id": cid,
+                                "generation": int(wave_generation),
+                                "result_registry": (
+                                    result_registry.snapshot()
+                                ),
+                                "publication": {
+                                    "fits": False,
+                                    "manifest": False,
+                                    "assembly": False,
+                                },
+                                "note": (
+                                    "A required cell's result "
+                                    "was rejected by the "
+                                    "generation fence; "
+                                    "previously accepted "
+                                    "payloads remain owned "
+                                    "and nothing is published"
+                                ),
+                            },
+                        )
+                        _stale.result_registry = result_registry
+                        raise _stale
+                    # A late result from a replaced plan for a cell that is no
+                    # longer required is never published; the run stays healthy.
+                    _emit(
+                        "ZeGrid: CPU result for "
+                        f"{cid} rejected by the M3 "
+                        f"generation fence ({_out.reason}) — "
+                        "not published",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+                    return None
+                receipt = _out.receipt
+            else:
+                receipt = result_registry.accept(
+                    result,
+                    backend=backend,
+                    plan_generation=int(wave_generation),
+                    attempt_id=attempt,
+                )
+        except zrr.RunRegistryError as _reg_exc:
+            _emit(
+                "ZeGrid: CPU result acceptance failed for "
+                f"{cid}: {_reg_exc}",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            _acceptance = _R55RunRefused(
+                "R55_RUN_RESULT_ACCEPTANCE",
+                f"cell {cid} acceptance failed: {_reg_exc}",
+                record={
+                    "schema": zrt.RUN_CONTROL_SCHEMA,
+                    "status": "refused",
+                    "reason_code": "R55_RUN_RESULT_ACCEPTANCE",
+                    "detail": str(_reg_exc),
+                    "wave_index": int(wave_index),
+                    "cell_id": cid,
+                    "generation": int(wave_generation),
+                    "result_registry": (
+                        result_registry.snapshot()
+                    ),
+                    "publication": {
+                        "fits": False,
+                        "manifest": False,
+                        "assembly": False,
+                    },
+                    "note": (
+                        "Internal acceptance/schema failure, "
+                        "not a resource shortage; accepted "
+                        "payloads remain owned"
+                    ),
+                },
+            )
+            _acceptance.result_registry = result_registry
+            raise _acceptance from _reg_exc
+        # Frozen intent (never re-derived from mutable health here: the guard
+        # above already failed closed on a degraded durable store).
+        durable_store = bool(durable_intent)
+        committed = False
+        released_bytes = 0
+        _live_states = _live_scope.get("states")
+        _live_reader = _live_scope.get("reader")
+        if durable_store and not receipt.idempotent:
+            try:
+                if _live_states is not None:
+                    _live_states.update(cid, zcs.COMMITTING)
+                _cpu_lifecycle_line(
+                    "COMMITTING", cid, generation=int(wave_generation)
+                )
+                handoff = _cpu_durable_commit(
+                    _store_state,
+                    result_registry,
+                    cid,
+                    receipt,
+                    plan_generation=int(wave_generation),
+                    backend=backend,
+                )
+            except zrs.StoreCommitNotDurable:
+                _emit(
+                    "ZeGrid: durable commit FAILED for "
+                    f"{cid} ({_store_state['degraded_reason']}"
+                    "). Refusing to continue: a cell whose "
+                    "commit is not durable is never reported as "
+                    "processed (fail fast, no silent degrade).",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
+                raise
+            committed = True
+            _rel = (handoff or {}).get("release") or {}
+            if _rel.get("released"):
+                released_bytes = int(_rel.get("released_bytes", 0))
+            # M4: COMMIT-THEN-DELETE. The Cell is durable; only now may its
+            # external spool be removed.
+            _cpu_cell_spool_cleanup(cid)
+            _cpu_lifecycle_line(
+                "COMMITTED", cid,
+                attempt=receipt.attempt_id,
+                generation=int(wave_generation),
+                payload_sha=receipt.payload_sha256,
+            )
+            if _live_states is not None:
+                _live_states.update(cid, zcs.COMMITTED)
+            if _live_reader is not None:
+                # COMMIT-THEN-DELETE, exactly like the spool: the cell's live
+                # file is only removed after a VERIFIED durable commit.
+                _live_reader.discard([cid])
+        # Durable progress advances ONLY on a verified commit. With no durable
+        # store the M1 in-memory acceptance is the honest claim (same in-memory
+        # truth as before, reported at reception instead of at wave end).
+        # Counting is by UNIQUE cell_id: out-of-order commits and a resumed
+        # sparse set can never fabricate a contiguous-prefix count.
+        if committed or (not durable_store and not receipt.idempotent):
+            if cid not in progress["committed"]:
+                progress["committed"].add(cid)
+                _stack_report(len(progress["committed"]), cid)
+        return {
+            "receipt": True,
+            "cell_id": cid,
+            "status": receipt.status,
+            "backend_used": backend,
+            "stack_seconds": float(stack_s),
+            "peak_rss_kib": result.get("peak_rss_kib"),
+            "attempt_id": receipt.attempt_id,
+            "payload_sha256": receipt.payload_sha256,
+            "payload_bytes": int(receipt.payload_bytes or 0),
+            "plan_generation": int(wave_generation),
+            "committed": bool(committed),
+            "released_bytes": int(released_bytes),
+        }
+
+    def _cpu_result_consumer(*, wave_generation, wave_index, progress,
+                             durable_intent):
+        """Bind the DISPATCH-TIME generation and durable intent to a consumer."""
+
+        def _consume(index, result):
+            return _cpu_cell_receipt(
+                result=result,
+                wave_generation=int(wave_generation),
+                wave_index=int(wave_index),
+                progress=progress,
+                durable_intent=bool(durable_intent),
+            )
+
+        return _consume
+
     def _run_cell_batch(science_cfg, tile_size, *, gpu_attempt,
                         tasks=None, workers=None, cache_workers=None,
                         progress_callback=None, heartbeat=None,
                         heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
-                        lifecycle_log=None):
+                        lifecycle_log=None, consume=None, emit_done=True,
+                        live_telemetry=None, state_registry=None, live_tick=None,
+                        on_fatal=None, wave_generation=None):
         """Run the WHOLE per-cell batch once; returns (results, meta).
 
         ``gpu_attempt=True`` disables pmap's SAME-config serial retry (serial_fallback
@@ -18843,6 +19473,25 @@ def _run_single(
         ``tasks``/``workers``/``cache_workers`` (ZM-ZEGRID-R36 F-M2) let the CPU
         fallback rerun HONOR an independently-computed CPU plan instead of the
         primary GPU plan (exact mode/tasks/bounds + safe concurrency/cache workers).
+
+        ``consume`` (ZM-CELL-LIVE-COMMIT, optional) is handed to the executor as
+        its parent-side RESULT CONSUMER: every cell is accepted/committed the
+        moment its result is received, before any slower peer of the SAME batch
+        returns, and the returned list then holds light receipts instead of
+        payloads. ``emit_done=False`` disables the end-of-batch per-cell DONE
+        lines, because the consumer already emitted COMPUTED/COMMITTED at
+        reception (no duplicate telemetry).
+
+        ZM-CELL-LIVE-OBS (lot 2, all optional and OFF by default):
+
+        * ``live_telemetry`` — the small identity/dir dict handed to the worker
+          initializer (spawn-safe);
+        * ``state_registry`` — the run-wide :class:`zcs.LiveCellStates`;
+        * ``live_tick`` — parent heartbeat hook called with a ``gui`` boolean:
+          it always writes the journal line and samples the worker files, and
+          delivers the GUI callback only when ``gui`` is true (thread affinity);
+        * ``on_fatal`` — parent hook that reports a fatal failure BEFORE the
+          executor drain (Nono LOW-1).
         """
         _tasks = cell_tasks if tasks is None else tasks
         _workers = cells_in_flight if workers is None else int(workers)
@@ -18874,7 +19523,16 @@ def _run_single(
             descs, canvas, science_cfg, global_gauge, global_frame_ids,
             global_reference_frame_id, tile_size, _cache_workers,
             _r40_coords_by_cell, _STACK_PHASE_PROFILING,
+            live_telemetry=live_telemetry,
         )
+        _initializer = _init_stack_worker
+        if live_telemetry:
+            # Spawn-safe: a partial of a MODULE-LEVEL function carrying only
+            # plain str/int values is picklable, and the initializer signature
+            # (and therefore the historical initargs tuple) is unchanged.
+            _initializer = functools.partial(
+                _init_stack_worker, live_telemetry=dict(live_telemetry)
+            )
         # ZM-ZEGRID-PER-CELL-SCHEDULER: admit each CELL against the remaining
         # budget instead of sizing the pool by the WORST cell. The dispatcher
         # uses the SAME worker, the SAME tasks and the SAME order, so results
@@ -18895,19 +19553,104 @@ def _run_single(
                 # A cell with no reservation keeps the historical executor: no
                 # guess, no invented bound.
                 _res_list = None
-        # ZM-ZEGRID-REDUCE-VISIBILITY: a per-cell START line goes to the RUN LOG
-        # FILE (not only the console), so a running stack is watchable. Every
-        # write is swallowed: telemetry can never fail a cell.
+        # ZM-CELL-LIVE-OBS (lot 2): the batch is QUEUED, not started. A cell is
+        # only SUBMITTED at its real dispatch point (pmap state event) and only
+        # RUNNING when its worker says so (worker telemetry) — the pre-L2 code
+        # announced START for every cell of the batch before admission, which is
+        # exactly the lie this lot removes.
         _life = _lifecycle_log if lifecycle_log is None else lifecycle_log
         if _life is not None:
-            for _t in _tasks:
-                try:
+            try:
+                _life(
+                    f"ZeGrid: cells QUEUED n={len(_tasks)} "
+                    f"gen={int(wave_generation or 0)} "
+                    "(SUBMITTED per real dispatch, RUNNING on real worker start)"
+                )
+            except Exception:  # noqa: BLE001 - telemetry is never fatal
+                pass
+
+        def _state_cb(event):
+            """Parent state event -> run-wide registry + run log (best effort)."""
+            kind = str(event.get("event", ""))
+            cid = event.get("cell_id")
+            try:
+                if state_registry is not None:
+                    if kind == "submitted":
+                        state_registry.update(cid, zcs.SUBMITTED)
+                    elif kind == "computed":
+                        state_registry.update(cid, zcs.COMPUTED)
+                    elif kind == "failed":
+                        state_registry.update(cid, zcs.FAILED)
+                    elif kind == "cancelled":
+                        # Only a future the parent REALLY cancelled (never
+                        # started) reaches this event.
+                        state_registry.update(cid, zcs.CANCELLED)
+                if _life is None or cid is None:
+                    return
+                if kind == "submitted":
                     _life(zpar.cell_lifecycle_line(
-                        "START", _t[0].cell_id,
-                        frames=len(_t[2].patch_ids), mode=_t[4],
+                        "SUBMITTED", cid,
+                        k=event.get("k"),
+                        reservation_bytes=(
+                            _res_list[event["index"]]
+                            if _res_list is not None
+                            and event.get("index") is not None
+                            and 0 <= int(event["index"]) < len(_res_list)
+                            else 0
+                        ),
                     ))
+                elif kind == "failed":
+                    _life(zpar.cell_lifecycle_line(
+                        "FAILED", cid, stage=event.get("stage"), error="cell",
+                    ))
+                elif kind == "cancelled":
+                    _life(zpar.cell_lifecycle_line("CANCELLED", cid))
+            except Exception:  # noqa: BLE001 - telemetry is never fatal
+                pass
+
+        def _on_fatal(event):
+            """Report the fatal state BEFORE the executor drain (Nono LOW-1)."""
+            try:
+                exc = event.get("error")
+                line = zpar.fatal_lifecycle_line(
+                    exc,
+                    cell_id=event.get("cell_id"),
+                    index=event.get("index"),
+                    stage=event.get("stage"),
+                )
+                if _life is not None:
+                    _life(line)
+                _emit_live(line, lvl="ERROR")
+            except Exception:  # noqa: BLE001 - reporting is never fatal
+                pass
+
+        def _heartbeat_composed():
+            """Pressure sample FIRST (unchanged), then the live status tick.
+
+            ZM-CELL-LIVE-OBS rework-1 (R2): the tick is called from WHATEVER
+            thread samples the heartbeat. It always writes the JOURNAL line and
+            samples the worker files; the GUI progress callback is delivered
+            ONLY when the calling thread is the one that started the batch
+            (thread affinity). The serial-path monitor thread therefore gets a
+            real periodic journal heartbeat for a long cell instead of nothing.
+            """
+            failure = None
+            if heartbeat is not None:
+                try:
+                    heartbeat()
+                except BaseException as _hb_exc:  # noqa: BLE001
+                    failure = _hb_exc
+            if live_tick is not None:
+                try:
+                    live_tick(threading.current_thread() is _owner_thread)
                 except Exception:  # noqa: BLE001 - telemetry is never fatal
                     pass
+            if failure is not None:
+                raise failure
+
+        _owner_thread = threading.current_thread()
+
+        _hb = _heartbeat_composed if (heartbeat is not None or live_tick is not None) else None
         try:
             if _res_list is not None:
                 _res = zpar.pmap_reserved(
@@ -18917,28 +19660,34 @@ def _run_single(
                     workers=_dispatch_cap,
                     cell_ids=[str(t[0].cell_id) for t in _tasks],
                     progress_callback=_progress, emit=_emit_live, meta=_meta,
-                    initializer=_init_stack_worker,
+                    initializer=_initializer,
                     initargs=_initargs,
                     serial_fallback=not gpu_attempt,
-                    heartbeat=heartbeat,
+                    heartbeat=_hb,
                     heartbeat_interval_s=heartbeat_interval_s,
+                    consume=consume,
+                    state_cb=_state_cb if (state_registry is not None or _life is not None) else None,
+                    on_fatal=on_fatal or _on_fatal,
                 )
             else:
                 _res = zpar.pmap(
                     _stack_cell, _tasks, workers=_workers,
                     progress_callback=_progress, emit=_emit_live, meta=_meta,
-                    initializer=_init_stack_worker,
+                    initializer=_initializer,
                     initargs=_initargs,
                     serial_fallback=not gpu_attempt,
-                    heartbeat=heartbeat,
+                    heartbeat=_hb,
                     heartbeat_interval_s=heartbeat_interval_s,
+                    consume=consume,
+                    state_cb=_state_cb if (state_registry is not None or _life is not None) else None,
+                    on_fatal=on_fatal or _on_fatal,
                 )
         except Exception as _batch_exc:
             _quarantine_payload_failure(
                 _batch_exc, input_folder, progress_callback, phase="cell cache"
             )
             raise
-        if _life is not None:
+        if _life is not None and emit_done:
             for _r in _res or ():
                 try:
                     if not isinstance(_r, dict):
@@ -19009,8 +19758,103 @@ def _run_single(
         checkpoints = []
         deterministic_checkpoints = []
         shrink_count = 0
+        # ZM-CELL-LIVE-COMMIT (lot 1): UNIQUE-cell counters for the live commit
+        # route. ``processed`` guards against any double transaction of the same
+        # cell_id; ``committed`` counts DISTINCT committed cells, so out-of-order
+        # commits and a sparse resumed set never fabricate a prefix count.
+        _cpu_progress = _cpu_cell_progress_state()
         run_t0 = time.perf_counter()
         _lifecycle_hb = {"t": 0.0}
+
+        # ------------------------------------------------------------------
+        # ZM-CELL-LIVE-OBS (lot 2) — RUN-wide truthful live status.
+        #
+        # Every cell of the frozen plan appears EXACTLY once (QUEUED, or
+        # COMMITTED when it was already durable at run start), so the published
+        # counts always add up: resumed commits and NEW commits are separate and
+        # never double counted. The worker telemetry (tiny, rate-limited files)
+        # is read HERE, on the parent heartbeat, and published to the run log and
+        # the existing progress callback; nothing is read per frame and no new
+        # thread is created before a fork.
+        # ------------------------------------------------------------------
+        _live_run_id = None
+        if result_registry is not None:
+            _live_run_id = getattr(result_registry, "run_id", None)
+        if not _live_run_id:
+            _live_store = (
+                _store_state.get("store")
+                if isinstance(_store_state, dict) else None
+            )
+            _live_run_id = getattr(_live_store, "run_id", None)
+        _live_run_id = str(_live_run_id or f"pid{os.getpid()}")
+        _live_dir = Path(disk_root) / zcs.LIVE_DIR_NAME
+        _live_states = zcs.LiveCellStates()
+        try:
+            _live_interval_s = float(
+                getattr(zconfig, "zegrid_live_status_interval_s", None)
+                or zcs.MIN_WRITE_INTERVAL_S
+            )
+        except (TypeError, ValueError):
+            _live_interval_s = zcs.MIN_WRITE_INTERVAL_S
+        if not (0.0 < _live_interval_s <= 60.0):
+            _live_interval_s = zcs.MIN_WRITE_INTERVAL_S
+        _live_reader = None
+        _live_enabled = True
+        try:
+            _live_dir.mkdir(parents=True, exist_ok=True)
+            _live_reader = zcs.LiveTelemetryReader(
+                _live_dir, run_id=_live_run_id, generation=0
+            )
+        except Exception:  # noqa: BLE001 - telemetry is never fatal
+            _live_reader = None
+            _live_enabled = False
+        _live_scope["reader"] = _live_reader
+        _live_scope["states"] = _live_states
+        try:
+            _live_heartbeat_s = zcs.heartbeat_interval(
+                getattr(zconfig, "zegrid_live_heartbeat_interval_s", None)
+            )
+        except Exception:  # noqa: BLE001 - config is never fatal
+            _live_heartbeat_s = zcs.LIVE_HEARTBEAT_INTERVAL_S
+        _live_reporter = (
+            zcs.LiveReporter(
+                _live_states,
+                _live_reader,
+                emit_line=_lifecycle_log,
+                gui_emit=_emit_live,
+                interval_s=_live_heartbeat_s,
+            )
+            if _live_enabled
+            else None
+        )
+
+        def _live_beat(*, force=False, deliver_gui=True):
+            """Sample the worker files and publish the bounded live lines."""
+            if _live_reporter is None:
+                return
+            _live_reporter.sample()
+            _live_reporter.publish(force=force, deliver_gui=deliver_gui)
+
+        def _live_tick(gui=True):
+            """Parent heartbeat hook: NEVER raises, never science-bearing.
+
+            ``gui=False`` is the SAFE JOURNAL path used by the serial monitor
+            thread: it writes the periodic heartbeat line to the run log but
+            never touches the GUI progress callback (thread affinity).
+            """
+            _live_beat(force=False, deliver_gui=bool(gui))
+
+        # The frozen plan is the ONLY source of the live roster: every cell is
+        # QUEUED unless it was already durable when this attempt started (a
+        # resumed cell is COMMITTED, never "pending progress").
+        _live_resumed = set()
+        if pending_cell_ids is not None:
+            _live_pending = {str(c) for c in pending_cell_ids}
+            _live_resumed = {
+                str(c) for c in canonical_cids if str(c) not in _live_pending
+            }
+        _live_states.reset(canonical_cids, committed=_live_resumed)
+
         # ZM-ZEGRID-COMMIT-INTEGRITY: ONE explicit line with the durable commit
         # counter at stacking start, so a silent divergence is visible.
         if _store_state["store"] is not None and _store_state["publishing"]:
@@ -19628,17 +20472,16 @@ def _run_single(
             )
             wave_tasks = pending_tasks[start:end]
             wave_units = int(len(wave_tasks))
-            # ZM-ZEGRID-REDUCE-VISIBILITY: a low-frequency heartbeat in the RUN
-            # LOG FILE (rate-limited to >= 60 s, never per-cell spam), so a
-            # multi-hour stack shows committed/in-flight progress to a reader.
+            # ZM-ZEGRID-REDUCE-VISIBILITY / ZM-CELL-LIVE-OBS: the RUN-WIDE
+            # unique status (resumed vs new commits, queued/running/error counts
+            # that always add up to the frozen plan) is published by the live
+            # reporter. Its PERIODIC heartbeat is independent of changes; this
+            # safe-boundary call only refreshes the roster before dispatch.
             try:
                 _hb_now = time.monotonic()
                 if zpar.heartbeat_due(_lifecycle_hb["t"], _hb_now):
                     _lifecycle_hb["t"] = _hb_now
-                    _hb_committed = int(_store_state.get("commits", 0) or 0)
-                    _lifecycle_log(zpar.cells_heartbeat_line(
-                        _hb_committed, int(total_tasks), wave_units
-                    ))
+                    _live_beat(force=False)
             except Exception:  # noqa: BLE001 - telemetry is never fatal
                 pass
             # M1 REWORK-2: capture the authorised generation BEFORE the wave is
@@ -19650,14 +20493,54 @@ def _run_single(
                 else 0
             )
             wave_t0 = time.perf_counter()
-            # ZM-ZEGRID-COMMIT-INTEGRITY: a DURABLE run advances its visible
-            # progress ONLY on a durable commit. The pmap callback fires when a
-            # WORKER returns, i.e. before the parent commit, so it must not move
-            # the counter here; the commit loop below reports instead.
-            _durable_wave = bool(
+            # ZM-CELL-LIVE-OBS (lot 2): arm the per-wave live transport. The
+            # files of THIS wave's cells are truncated by the PARENT before any
+            # worker exists (so a previous wave/run can never leak in), the
+            # reader is retargeted to the dispatch-time generation, and the
+            # worker gets the same identity through its initializer (spawn-safe).
+            _live_wave_cids = [str(t[0].cell_id) for t in wave_tasks]
+            if _live_enabled and _live_reader is not None:
+                try:
+                    _live_reader.retarget(generation=int(wave_generation))
+                    if _live_reporter is not None:
+                        _live_reporter.retarget(generation=int(wave_generation))
+                    _live_reader.truncate(_live_wave_cids)
+                except Exception:  # noqa: BLE001 - telemetry is never fatal
+                    pass
+            _wave_live = (
+                {
+                    "dir": str(_live_dir),
+                    "run_id": _live_run_id,
+                    "generation": int(wave_generation),
+                    "interval_s": float(_live_interval_s),
+                }
+                if _live_enabled else None
+            )
+            # ZM-CELL-LIVE-COMMIT (lot 1): with a result registry, the parent
+            # CONSUMES each cell at reception and commits it there. The pmap
+            # progress callback therefore must not move any counter (it fires on
+            # a WORKER return, before the parent transaction): the single route
+            # reports progress on the committed cell. The generation above was
+            # captured BEFORE dispatch and is bound into the consumer.
+            _consumed_online = result_registry is not None
+            # ZM-CELL-LIVE-COMMIT R2: the DURABLE INTENT of this wave is frozen
+            # BEFORE dispatch, from the store state at that instant. The route
+            # must never recompute it from mutable health: once durable, a store
+            # failure is terminal, never a silent switch to memory-only progress.
+            _durable_intent = bool(
                 _store_state["store"] is not None
                 and _store_state["publishing"]
                 and _store_state.get("degraded_reason") is None
+            )
+            _wave_consumer = (
+                _cpu_result_consumer(
+                    wave_generation=int(wave_generation),
+                    wave_index=int(wave_index),
+                    progress=_cpu_progress,
+                    durable_intent=_durable_intent,
+                )
+                if _consumed_online
+                else None
             )
             try:
                 wave_results, wave_meta = _run_cell_batch(
@@ -19669,13 +20552,25 @@ def _run_single(
                     cache_workers=int(bundle.cache_workers_per_cell),
                     progress_callback=(
                         (lambda _done, _total: None)
-                        if _durable_wave
+                        if _consumed_online
                         else _wave_progress(start)
                     ),
                     heartbeat=_heartbeat,
                     heartbeat_interval_s=zrt.RUN_MAX_SAMPLE_INTERVAL_S,
+                    consume=_wave_consumer,
+                    emit_done=not _consumed_online,
+                    live_telemetry=_wave_live,
+                    state_registry=_live_states,
+                    live_tick=_live_tick,
+                    on_fatal=None,
+                    wave_generation=int(wave_generation),
                 )
             except Exception as _wave_exc:
+                # ZM-CELL-LIVE-OBS: publish the last known live state BEFORE the
+                # terminal report below, so the run log shows the in-flight set
+                # (the fatal line itself is emitted by the executor hook before
+                # its drain).
+                _live_beat(force=True)
                 # ZM-P0-RESUME-INTEGRITY: a TERMINAL wave failure after accepted
                 # cells reports the ACTUAL durability of the work, never a
                 # generic "retained" claim. The original exception is the root
@@ -19755,276 +20650,44 @@ def _run_single(
                         )
                 raise
             wave_wall = time.perf_counter() - wave_t0
+            # One final bounded sample for THIS wave (the heartbeat may not have
+            # fired on a short wave): the published counts are the truth of the
+            # cells that really committed at reception.
+            _live_beat(force=True)
             if result_registry is not None:
-                # M1: accept each successful cell as its own transaction. The
-                # generation was captured at DISPATCH (before the wave), never
-                # adopted when a result arrives. A CPU wave may complete out of
-                # order; each result is independent and the registry (not this
-                # transient list) owns the payload afterwards.
-                try:
-                    for _index in range(len(wave_results)):
-                        _r = wave_results[_index]
-                        _cid = str(_r.get("cell_id", ""))
-                        _attempt = (
-                            f"cpu-wave:{int(wave_generation)}:"
-                            f"{wave_index}:{_cid}"
-                        )
-                        try:
-                            if _m3_fence is not None:
-                                _env = zrec.TaskGeneration(
-                                    run_id=str(result_registry.run_id),
-                                    cell_id=_cid,
-                                    attempt_id=_attempt,
-                                    plan_generation=int(wave_generation),
-                                )
-                                _out = _m3_fence.accept(
-                                    _env,
-                                    _r,
-                                    backend=str(
-                                        _r.get("backend_used") or "cpu"
-                                    ),
-                                )
-                                if not _out.accepted:
-                                    # A late/duplicate result that is no longer
-                                    # required never poisons accepted state.
-                                    # But a cell the run still NEEDS (pending)
-                                    # rejected by the generation fence — e.g. a
-                                    # generation transition in the middle of a
-                                    # CPU wave — leaves a permanent hole. Fail
-                                    # closed with the typed M1 conservation
-                                    # refusal instead of leaking a lower-level
-                                    # RunRegistryError during assembly.
-                                    if _cid in set(
-                                        result_registry.pending_cell_ids()
-                                    ):
-                                        _stale = _R55RunRefused(
-                                            "R55_RUN_RESULT_ACCEPTANCE",
-                                            (
-                                                f"cell {_cid} result rejected "
-                                                "by the M3 generation fence "
-                                                f"({_out.reason}: "
-                                                f"{_out.detail or ''}); the "
-                                                "required cell cannot be "
-                                                "accepted for the current "
-                                                "generation"
-                                            ),
-                                            record={
-                                                "schema": zrt.RUN_CONTROL_SCHEMA,
-                                                "status": "refused",
-                                                "reason_code": (
-                                                    "R55_RUN_RESULT_ACCEPTANCE"
-                                                ),
-                                                "detail": (
-                                                    f"{_out.reason}: "
-                                                    f"{_out.detail or ''}"
-                                                ),
-                                                "wave_index": int(wave_index),
-                                                "cell_id": _cid,
-                                                "generation": int(
-                                                    wave_generation
-                                                ),
-                                                "result_registry": (
-                                                    result_registry.snapshot()
-                                                ),
-                                                "publication": {
-                                                    "fits": False,
-                                                    "manifest": False,
-                                                    "assembly": False,
-                                                },
-                                                "note": (
-                                                    "A required cell's result "
-                                                    "was rejected by the "
-                                                    "generation fence; "
-                                                    "previously accepted "
-                                                    "payloads remain owned "
-                                                    "and nothing is published"
-                                                ),
-                                            },
-                                        )
-                                        _stale.result_registry = result_registry
-                                        raise _stale
-                                    # A late result from a replaced plan for a
-                                    # cell that is no longer required is never
-                                    # published; the run stays healthy.
-                                    _emit(
-                                        "ZeGrid: CPU result for "
-                                        f"{_cid} rejected by the M3 "
-                                        f"generation fence ({_out.reason}) — "
-                                        "not published",
-                                        lvl="WARN",
-                                        callback=progress_callback,
-                                    )
-                                    wave_results[_index] = None
-                                    continue
-                                _receipt = _out.receipt
-                            else:
-                                _receipt = result_registry.accept(
-                                    _r,
-                                    backend=str(
-                                        _r.get("backend_used") or "cpu"
-                                    ),
-                                    plan_generation=int(wave_generation),
-                                    attempt_id=_attempt,
-                                )
-                        except zrr.RunRegistryError as _reg_exc:
-                            _emit(
-                                "ZeGrid: CPU result acceptance failed for "
-                                f"{_cid}: {_reg_exc}",
-                                lvl="ERROR",
-                                callback=progress_callback,
+                if not _consumed_online:
+                    # FALLBACK (no consumer wired): the SAME single route, in
+                    # canonical task order, at the wave boundary. A cell the
+                    # consumer already transacted can never be touched again
+                    # (the route's ``processed`` guard refuses it).
+                    try:
+                        for _index in range(len(wave_results)):
+                            _r = wave_results[_index]
+                            if not isinstance(_r, Mapping):
+                                wave_results[_index] = None
+                                continue
+                            _cpu_cell_receipt(
+                                result=_r,
+                                wave_generation=int(wave_generation),
+                                wave_index=int(wave_index),
+                                progress=_cpu_progress,
+                                durable_intent=_durable_intent,
                             )
-                            _acceptance = _R55RunRefused(
-                                "R55_RUN_RESULT_ACCEPTANCE",
-                                f"cell {_cid} acceptance failed: {_reg_exc}",
-                                record={
-                                    "schema": zrt.RUN_CONTROL_SCHEMA,
-                                    "status": "refused",
-                                    "reason_code": "R55_RUN_RESULT_ACCEPTANCE",
-                                    "detail": str(_reg_exc),
-                                    "wave_index": int(wave_index),
-                                    "cell_id": _cid,
-                                    "generation": int(wave_generation),
-                                    "result_registry": (
-                                        result_registry.snapshot()
-                                    ),
-                                    "publication": {
-                                        "fits": False,
-                                        "manifest": False,
-                                        "assembly": False,
-                                    },
-                                    "note": (
-                                        "Internal acceptance/schema failure, "
-                                        "not a resource shortage; accepted "
-                                        "payloads remain owned"
-                                    ),
-                                },
-                            )
-                            _acceptance.result_registry = result_registry
-                            raise _acceptance from _reg_exc
-                        # M2: durable hand-off. The store commits the accepted
-                        # payload and only THEN releases the registry's large
-                        # arrays (light receipt retained). A store failure keeps
-                        # the payload in RAM and degrades to M1 conservation.
-                        _store = _store_state["store"]
-                        if (
-                            _store is not None
-                            and _store_state["publishing"]
-                            and _receipt is not None
-                            and not _receipt.idempotent
-                        ):
-                            try:
-                                _handoff = _store.commit_and_release(
-                                    result_registry,
-                                    _cid,
-                                    attempt_id=_receipt.attempt_id,
-                                    backend=_receipt.backend,
-                                    plan_generation=int(wave_generation),
-                                )
-                                # M4: COMMIT-THEN-DELETE. The Cell is durable;
-                                # only now may its external spool be removed.
-                                # A cleanup failure is accounted, never fatal.
-                                try:
-                                    _ws_b = (
-                                        _run_scope_bundle(_r55_active_bundle, _final).working_set_block or {}
-                                    )
-                                except Exception:
-                                    _ws_b = {}
-                                if _ws_b.get("class") == WORKING_SET_EXTERNAL:
-                                    try:
-                                        _root_b = (_ws_b.get("disk") or {}).get(
-                                            "spool_root"
-                                        )
-                                        _rep_b = zext.cleanup_after_commit(
-                                            _root_b,
-                                            _cid,
-                                            owner_token=_ws_b.get("owner_token"),
-                                        )
-                                        _ext_lifecycle["attempts_created"] += 1
-                                        _ext_lifecycle["cells_executed_external"] += 1
-                                        _ext_lifecycle["attempts_discarded_stale"] += int(
-                                            _rep_b.get("discarded_same_owner", 0)
-                                        ) + int(_rep_b.get("discarded_stale", 0))
-                                        _ext_lifecycle["cleaned_committed"] += int(
-                                            _rep_b.get("cleaned_committed", 0)
-                                        )
-                                        _ext_lifecycle["spool_bytes_written"] += int(
-                                            _ws_b["disk"]["cumulative_writes_bytes"]
-                                        )
-                                        _ext_lifecycle["spool_bytes_read"] += int(
-                                            _ws_b["disk"]["cumulative_reads_bytes"]
-                                        )
-                                        _ext_lifecycle["cleanup_failures"].extend(
-                                            _rep_b.get("failures", [])
-                                        )
-                                    except Exception as _ext_clean_exc:
-                                        _ext_lifecycle["cleanup_failures"].append({
-                                            "cell_id": _cid,
-                                            "error": f"{type(_ext_clean_exc).__name__}: {_ext_clean_exc}",
-                                        })
-                            except zrs.RunStoreError as _store_exc:
-                                _ext_lifecycle["spool_retained_after_failed_commit"] += 1
-                                _store_state["publishing"] = False
-                                _store_state["degraded_reason"] = (
-                                    f"{type(_store_exc).__name__}: "
-                                    f"{_store_exc}"
-                                )
-                                _store_state["commit_errors"].append(
-                                    {
-                                        "cell_id": _cid,
-                                        "attempt_id": _receipt.attempt_id,
-                                        "error": _store_state[
-                                            "degraded_reason"
-                                        ],
-                                    }
-                                )
-                                _emit(
-                                    "ZeGrid: durable commit FAILED for "
-                                    f"{_cid} ({_store_state['degraded_reason']}"
-                                    "). Refusing to continue: a cell whose "
-                                    "commit is not durable is never reported as "
-                                    "processed (fail fast, no silent degrade).",
-                                    lvl="ERROR",
-                                    callback=progress_callback,
-                                )
-                                # ZM-ZEGRID-COMMIT-INTEGRITY: a commit failure is
-                                # TERMINAL for a durable run. Continuing would
-                                # report processed cells that do not exist on
-                                # disk (the RESUME_NEW incident).
-                                raise zrs.StoreCommitNotDurable(
-                                    "durable commit FAILED for cell "
-                                    f"{_cid!r} attempt {_receipt.attempt_id!r} "
-                                    f"run_id={_store.run_id!r} "
-                                    f"store_root={_store.root}: "
-                                    f"{_store_state['degraded_reason']}",
-                                    run_id=_store.run_id,
-                                    cell_id=_cid,
-                                    store_root=_store.root,
-                                    attempt_id=_receipt.attempt_id,
-                                ) from _store_exc
-                            else:
-                                # Verify the commit is DURABLE before anything
-                                # (progress, release counters) treats the cell as
-                                # processed. Cheap local index lookup.
-                                _store.require_commit(
-                                    _cid, _receipt.attempt_id
-                                )
-                                _store_state["commits"] += 1
-                                _rel = _handoff.get("release") or {}
-                                if _rel.get("released"):
-                                    _store_state["released_cells"] += 1
-                                    _store_state["released_bytes"] += int(
-                                        _rel.get("released_bytes", 0)
-                                    )
-                                # Durable progress: advance ONLY now, on the
-                                # committed cell (never on worker completion).
-                                _stack_report(start + _index + 1, _cid)
-                        wave_results[_index] = None
-                finally:
-                    # Honest transient ownership: accepted payloads are owned by
-                    # the registry; unaccepted ones are dropped, and the local
-                    # list can never retain a large array through a traceback.
-                    for _index in range(len(wave_results)):
-                        wave_results[_index] = None
+                            wave_results[_index] = None
+                    finally:
+                        # Honest transient ownership: accepted payloads are
+                        # owned by the registry; unaccepted ones are dropped, and
+                        # the local list can never retain a large array through
+                        # a traceback.
+                        for _index in range(len(wave_results)):
+                            wave_results[_index] = None
+                        wave_results.clear()
+                else:
+                    # ZM-CELL-LIVE-COMMIT (lot 1): every cell of this wave was
+                    # accepted and durably committed AT RECEPTION by the parent
+                    # consumer. NO end-of-wave commit pass runs here — a second
+                    # pass could only duplicate a transaction or replay a cell —
+                    # and the list holds light receipts, never payloads.
                     wave_results.clear()
             else:
                 results_local.extend(wave_results)

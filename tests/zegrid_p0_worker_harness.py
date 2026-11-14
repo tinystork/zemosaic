@@ -19,7 +19,8 @@ producer/consumer pipeline. The only modifications are bounded test controls:
   (``_prepare_stack_cell -> _build_one_cell_cache -> nested pmap`` -> producer
   failure -> ``_R55GpuFallback`` -> conserved-results path).
 * ``executed_log``: record the ``cell_id`` of every cell the engine asked a
-  cell-cache pool to execute, so a resume can prove it ran ONLY pending cells.
+  CPU cell dispatcher (``pmap`` or ``pmap_reserved``) to execute, so a
+  resume can prove it ran ONLY pending cells.
 * ``record_path``: when the engine raises ``_R55RunConservedResults``, persist
   its terminal ``record`` for assertions (observation only).
 
@@ -200,6 +201,7 @@ def run_worker(
         zz.run_zegrid_mode = _observed_run_zegrid
 
     real_pmap = zpar.pmap
+    real_pmap_reserved = zpar.pmap_reserved
     state = {"cell_waves": 0, "cache_builds": 0}
 
     def _recording_pmap(worker, tasks, *args, **pmap_kwargs):
@@ -239,8 +241,14 @@ def run_worker(
                     "simulated native child pool death (P0 GPU harness)"
                 )
             return real_pmap(worker, task_list, *args, **pmap_kwargs)
-        if worker_name != "_stack_cell":
-            return real_pmap(worker, task_list, *args, **pmap_kwargs)
+        return _record_cell_batch(
+            worker, task_list,
+            lambda: real_pmap(worker, task_list, *args, **pmap_kwargs),
+        )
+
+    def _record_cell_batch(worker, task_list, invoke):
+        if getattr(worker, "__name__", "") != "_stack_cell":
+            return invoke()
         state["cell_waves"] += 1
         if executed_log:
             with open(executed_log, "a", encoding="utf-8") as handle:
@@ -258,7 +266,17 @@ def run_worker(
             ) from BrokenProcessPool(
                 "simulated native child pool death (P0 harness)"
             )
-        return real_pmap(worker, task_list, *args, **pmap_kwargs)
+        return invoke()
+
+    def _recording_pmap_reserved(worker, tasks, reservations, **reserved_kwargs):
+        task_list = list(tasks)
+        return _record_cell_batch(
+            worker, task_list,
+            lambda: real_pmap_reserved(
+                worker, task_list, reservations, **reserved_kwargs
+            ),
+        )
 
     zpar.pmap = _recording_pmap
+    zpar.pmap_reserved = _recording_pmap_reserved
     zw.run_hierarchical_mosaic_process(queue, **kwargs)

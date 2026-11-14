@@ -1776,12 +1776,19 @@ def reduce_spooled_tile(
     rejection_sink=None,
     rejection_mask=None,
     backend: str = "cpu",
+    block_probe=None,
 ) -> dict:
     """Reduce ONE spooled tile with exact contiguous row micro-batches.
 
     Returns the tile-local planes and this tile's scalar diagnostics. Only the
     INTERIOR is reduced (the RAM path writes/counts only the interior); the
     extended border exists solely for the taper and is never consumed.
+
+    ``block_probe`` (ZM-CELL-LIVE-OBS, optional) is ``callable(done, total)``
+    invoked after each executed micro-block with two plain integers. It carries
+    NO image/array/dtype and every failure is swallowed: it exists so a long
+    reduction can say ``block=j/m`` instead of going silent, and it can never
+    change the reduction.
     """
     validate_tile(tile)
     images = np.load(tile.images_path, mmap_mode="r")
@@ -1851,6 +1858,12 @@ def reduce_spooled_tile(
     # is the largest live column-batch block this tile actually formed.
     n_blocks = 0
     max_block_positions = 0
+    # ZM-CELL-LIVE-OBS: the block TOTAL is known before the loop, so a probe can
+    # publish an honest ``block=j/m`` (never a re-derived estimate).
+    _total_blocks = (
+        len(range(0, h_int, rows_per_batch))
+        * len(range(0, w_int, cols_per_batch))
+    )
 
     for a in range(0, h_int, rows_per_batch):
         b = min(h_int, a + rows_per_batch)
@@ -1959,6 +1972,11 @@ def reduce_spooled_tile(
             rejected_count += int(rejection_b.sum())
             low_n_count += int((init_sum < 3).sum())
             degenerate_count += int(degenerate_b.sum())
+            if block_probe is not None:
+                try:
+                    block_probe(int(n_blocks), int(_total_blocks))
+                except Exception:  # noqa: BLE001 - telemetry must never fail
+                    pass
 
     return {
         "science": science_t,
@@ -2009,6 +2027,7 @@ def run_cell_streaming_external(
     retain_on_failure: bool = False,
     gpu_fallback_out: dict | None = None,
     memory_probe=None,
+    progress_probe=None,
 ) -> CanonicalStackResult:
     """External-working-set execution of ONE canonical request.
 
@@ -2020,6 +2039,14 @@ def run_cell_streaming_external(
     is called as ``memory_probe(label)`` at the ``write`` / ``reduce`` /
     ``finalize`` phase boundaries so telemetry can attribute memory per phase.
     It defaults to ``None`` and can never change the computation.
+
+    ``progress_probe`` (ZM-CELL-LIVE-OBS) is an OPTIONAL ``callable(fields)``
+    receiving ONLY plain scalars: ``phase``, ``tile_current``/``tile_total``,
+    ``block_current``/``block_total``, ``force``. It is called once per tile, once
+    per executed micro-block and at the finalize boundaries — never per frame,
+    never with an image, mask or dtype. The CALLER owns the rate limit/coalescing
+    (see :mod:`zemosaic.core.zegrid.cell_status`); every call is wrapped so a
+    telemetry failure can never change a single scientific value.
     """
     if not isinstance(request, CanonicalStackRequest):
         raise CanonicalStackValidationError(
@@ -2056,6 +2083,16 @@ def run_cell_streaming_external(
     if rejection_sink is not None:
         _validate_rejection_sink(rejection_sink, n, h, w, c)
 
+    def _live(fields: dict) -> None:
+        """Bounded live progress: plain scalars only, never fatal."""
+        if progress_probe is None:
+            return
+        try:
+            progress_probe(dict(fields))
+        except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+            pass
+
+    _live({"phase": "phase1", "force": True})
     p1 = _fixed_phase1(provider, request, fixed)
 
     science_c = np.empty((h, w, c), dtype=np.float32)
@@ -2136,9 +2173,41 @@ def run_cell_streaming_external(
         except Exception:  # noqa: BLE001 - telemetry must never fail a cell
             pass
 
+    _tile_total = sum(1 for _ in _iter_tiles(h, w, tile_size))
+
+    def _reduce_extra(tile_index: int) -> dict:
+        """Reducer keywords for ONE tile, empty when no probe is armed.
+
+        R3 (rework-1): a BLOCK sample is SELF-CONTAINED — it carries its own
+        phase/tile as well as the block counters, so the transport can never
+        erase the current tile identity. The keyword is added ONLY when a probe
+        is armed, so the historical OFF transport (and every test double of the
+        reducer) keeps its exact call shape.
+        """
+        if progress_probe is None:
+            return {}
+
+        def _probe(done: int, total: int, _tile=int(tile_index)) -> None:
+            _live({
+                "phase": "reduce",
+                "tile_current": _tile,
+                "tile_total": _tile_total,
+                "block_current": done,
+                "block_total": total,
+            })
+
+        return {"block_probe": _probe}
+
     try:
         _phase_start("write")
-        for (y0, y1, x0, x1) in _iter_tiles(h, w, tile_size):
+        for _tile_index, (y0, y1, x0, x1) in enumerate(
+            _iter_tiles(h, w, tile_size), start=1
+        ):
+            _live({
+                "phase": "write",
+                "tile_current": _tile_index,
+                "tile_total": _tile_total,
+            })
             _probe("write")
             _tw = time.perf_counter()
             handle = spool.write_tile(
@@ -2154,6 +2223,11 @@ def run_cell_streaming_external(
             )
             _probe("reduce")
             _phase_start("reduce")
+            _live({
+                "phase": "reduce",
+                "tile_current": _tile_index,
+                "tile_total": _tile_total,
+            })
             _tr = time.perf_counter()
             try:
                 if gpu_active:
@@ -2164,6 +2238,7 @@ def run_cell_streaming_external(
                             rejection_sink=rejection_sink,
                             rejection_mask=rejection_mask,
                             backend="gpu",
+                            **_reduce_extra(_tile_index),
                         )
                     except Exception as exc:
                         # A3 — transactional fallback: a classified GPU runtime
@@ -2187,6 +2262,7 @@ def run_cell_streaming_external(
                             rejection_sink=rejection_sink,
                             rejection_mask=rejection_mask,
                             backend="cpu",
+                            **_reduce_extra(_tile_index),
                         )
                         gpu_fallback_tiles.append((int(y0), int(x0)))
                 else:
@@ -2196,6 +2272,7 @@ def run_cell_streaming_external(
                         rejection_sink=rejection_sink,
                         rejection_mask=rejection_mask,
                         backend="cpu",
+                        **_reduce_extra(_tile_index),
                     )
             finally:
                 spool.discard_tile(handle)
@@ -2308,6 +2385,7 @@ def run_cell_streaming_external(
 
     _probe("finalize")
     _phase_start("finalize")
+    _live({"phase": "finalize", "force": True})
     _tf = time.perf_counter()
     (science, weight_sum, valid_mask, surviving, support_w1, support_w2, n_eff, agg) = (
         _finalize_phase2_outputs(
@@ -2337,4 +2415,5 @@ def run_cell_streaming_external(
     )
     _phase_acc["finalize"] = time.perf_counter() - _tf
     _phase_line("end", "finalize", _phase_acc["finalize"])
+    _live({"phase": "finalize", "force": True})
     return _result
