@@ -1,0 +1,31 @@
+{
+ "environment": {
+  "m106_canvas": [
+   2403,
+   3278
+  ],
+  "m106_frames": 66
+ },
+ "retained_cells": [
+  {
+   "bytes_per_cell": 489.20627631075394,
+   "cells": 2613,
+   "grid": [
+    67,
+    39
+   ],
+   "retained_python_bytes": 1278296,
+   "scope": "per-Cell dicts retained for chosen-scan reuse + dict(c) worst copy; sys.getsizeof deep, Python objects only (no RSS, no transient peak)"
+  },
+  {
+   "bytes_per_cell": 489.6349024110218,
+   "cells": 2613,
+   "grid": [
+    67,
+    39
+   ],
+   "retained_python_bytes": 1279416,
+   "scope": "per-Cell dicts retained for chosen-scan reuse + dict(c) worst copy; sys.getsizeof deep, Python objects only (no RSS, no transient peak)"
+  }
+ ]
+}

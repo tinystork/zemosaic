@@ -1,0 +1,171 @@
+{
+ "cases": [
+  {
+   "budget_bytes": null,
+   "case": "m106 budget=None",
+   "chosen": [
+    3,
+    2
+   ],
+   "layout_origin": "auto_refinement",
+   "log_lines": 2,
+   "max_seconds": 0.19560705299954861,
+   "median_seconds": 0.18847995399846695,
+   "min_seconds": 0.18670176700106822,
+   "repeats": 5,
+   "rss_after_bytes_max": 183726080,
+   "rss_before_bytes": 181383168,
+   "signature_sha256": "b67ac406b1faa8bb21b7b293208e7e6cb11f6e0ef03883078d57293d604a970d"
+  },
+  {
+   "budget_bytes": 1073741824,
+   "case": "m106 budget=1073741824",
+   "chosen": [
+    8,
+    6
+   ],
+   "layout_origin": "auto_refinement",
+   "log_lines": 16,
+   "max_seconds": 0.6503074300126173,
+   "median_seconds": 0.6139006960002007,
+   "min_seconds": 0.6128812079987256,
+   "repeats": 5,
+   "rss_after_bytes_max": 187682816,
+   "rss_before_bytes": 184991744,
+   "signature_sha256": "29c9ba4c2dd601e305a6996c9c393b4aa2c21da32972891091c2da6ec270f85d"
+  },
+  {
+   "budget_bytes": 2147483648,
+   "case": "m106 budget=2147483648",
+   "chosen": [
+    4,
+    3
+   ],
+   "layout_origin": "auto_refinement",
+   "log_lines": 4,
+   "max_seconds": 0.24173624700051732,
+   "median_seconds": 0.23985606899077538,
+   "min_seconds": 0.23723248099850025,
+   "repeats": 5,
+   "rss_after_bytes_max": 190685184,
+   "rss_before_bytes": 188149760,
+   "signature_sha256": "3ffd4a48331cb0fb1fa8c7fd7fa56241ebd78f7951530bd41ebb25ed66cde5ba"
+  },
+  {
+   "budget_bytes": 1073741824,
+   "case": "dense2000 budget=1073741824",
+   "chosen": [
+    6,
+    7
+   ],
+   "layout_origin": "auto_refinement",
+   "log_lines": 2,
+   "max_seconds": 6.605746218003333,
+   "median_seconds": 6.4586377140076365,
+   "min_seconds": 6.445618678990286,
+   "repeats": 3,
+   "rss_after_bytes_max": 293941248,
+   "rss_before_bytes": 251568128,
+   "signature_sha256": "364dd41930b57482cc3f7d7523401bd720fe4e2865da82da118f4c50e45e2e96"
+  },
+  {
+   "budget_bytes": 536870912,
+   "case": "dense2000 budget=536870912",
+   "chosen": [
+    21,
+    23
+   ],
+   "layout_origin": "auto_refinement",
+   "log_lines": 11,
+   "max_seconds": 11.25933501299005,
+   "median_seconds": 10.940640782006085,
+   "min_seconds": 10.907758340996224,
+   "repeats": 3,
+   "rss_after_bytes_max": 350457856,
+   "rss_before_bytes": 308072448,
+   "signature_sha256": "b2f840f3fb8752e1ed7893c20c024a249eabc88179c0f4a004d5fc31d58ea502"
+  }
+ ],
+ "environment": {
+  "m106_canvas": [
+   2403,
+   3278
+  ],
+  "m106_frames": 66,
+  "synthetic_canvas": [
+   923,
+   1041
+  ]
+ },
+ "index": [
+  {
+   "backends": {
+    "sorted": {
+     "build_fallback": null,
+     "build_seconds": 0.00024422099522780627,
+     "indexed": 66,
+     "python_structures_bytes": 4568,
+     "rss_delta_bytes": 0,
+     "uncertain": 0
+    },
+    "strtree": {
+     "build_fallback": null,
+     "build_seconds": 0.00029634000384248793,
+     "indexed": 66,
+     "python_structures_bytes": 3432,
+     "rss_delta_bytes": 8192,
+     "uncertain": 0
+    }
+   },
+   "label": "real M106",
+   "polygons": 66
+  },
+  {
+   "backends": {
+    "sorted": {
+     "build_fallback": null,
+     "build_seconds": 0.08216441499826033,
+     "indexed": 21818,
+     "python_structures_bytes": 1342680,
+     "rss_delta_bytes": 3010560,
+     "uncertain": 0
+    },
+    "strtree": {
+     "build_fallback": null,
+     "build_seconds": 0.08764471500762738,
+     "indexed": 21818,
+     "python_structures_bytes": 973512,
+     "rss_delta_bytes": 4595712,
+     "uncertain": 0
+    }
+   },
+   "label": "synthetic 21818",
+   "polygons": 21818
+  },
+  {
+   "backends": {
+    "sorted": {
+     "build_fallback": null,
+     "build_seconds": 0.003800286998739466,
+     "indexed": 1024,
+     "python_structures_bytes": 61384,
+     "rss_delta_bytes": 0,
+     "uncertain": 0
+    },
+    "strtree": {
+     "build_fallback": null,
+     "build_seconds": 0.00409168099577073,
+     "indexed": 1024,
+     "python_structures_bytes": 44392,
+     "rss_delta_bytes": 0,
+     "uncertain": 0
+    }
+   },
+   "label": "synthetic 1024",
+   "polygons": 1024
+  }
+ ],
+ "measurement_notes": {
+  "rss_sampling": "RSS is sampled immediately AFTER each complete chooser call and the maximum of those samples is reported as rss_after_bytes_max. The transient peak DURING the scan is not measured. Key renamed from rss_peak_bytes in rework-1 (L2) with the SAME numbers."
+ }
+}

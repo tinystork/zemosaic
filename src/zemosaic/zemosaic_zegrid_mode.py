@@ -1932,18 +1932,61 @@ def _r55_prefetch_resident_bytes(
                       + _R55_CACHE_SUPPORT_DTYPE_BYTES)
 
 
-def _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
+#: ZM-LAYOUT-PRODUCT-20261115 — below this many projected footprints the bbox
+#: index is NOT built: a per-Cell query has a fixed overhead that a very short
+#: brute-force scan does not pay. The crossover was measured locally (see
+#: ``docs/qualification/zm-layout-product-20261115/``), and the exact predicate /
+#: count is IDENTICAL with or without the index, so this only trades cost.
+#: ZM-LAYOUT-PRODUCT-20261115 (rework-1 L1): DEDICATED, non-decision diagnostic
+#: prefix for the footprint-index state. It is routed through the same
+#: ``log_line``/``emit`` seam as the run log, is NEVER a ``layout scan:`` /
+#: ``layout load:`` decision line and is NEVER placed in the returned layout dict,
+#: so the published decision, its hashes and the decision log lines are unchanged.
+FOOTPRINT_INDEX_LOG_PREFIX = "layout index:"
+
+FOOTPRINT_INDEX_MIN_POLYGONS = 128
+
+
+def _build_footprint_index(footprints):
+    """Build the once-per-run exact bbox index over the projected footprints.
+
+    Returns ``None`` (no index -> historical full scan, exact) when the artifact
+    does not expose ``.polygons`` or the corpus is below
+    :data:`FOOTPRINT_INDEX_MIN_POLYGONS`. Construction is bounded O(N) and the
+    class itself falls back from ``STRtree`` to the pure-Python ``sorted``
+    backend (same exact semantics) when Shapely < 2 is installed.
+    """
+    polygons = getattr(footprints, "polygons", None)
+    if polygons is None or len(polygons) < int(FOOTPRINT_INDEX_MIN_POLYGONS):
+        return None
+    return zal.FootprintIndex(polygons, backend="auto")
+
+
+def _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size,
+                                 index=None):
     """Yield per-Cell dicts with BOTH in-memory and streaming peak bounds.
 
     Reuses the R4 membership primitive (:func:`auto_layout._cell_contributor_count`)
     and the R4/R6 published models verbatim — no science is duplicated.
+
+    ZM-LAYOUT-PRODUCT-20261115: the per-Cell patch is computed with the
+    GEOMETRY-ONLY seam (:func:`geometry.patch_geometry`) instead of
+    :func:`geometry.build_patch`. The scan reads only ``patch`` (membership
+    rectangle + area) and ``patch_shape_hw`` (streaming bound geometry); the
+    deep-copied WCS and the serialized FITS header of a real patch were built
+    for every Cell of every candidate and never read. Both functions share ONE
+    bounds implementation, so the geometry is identical by construction.
+
+    ``index`` (optional, ZM-LAYOUT-PRODUCT-20261115) is a
+    :class:`auto_layout.FootprintIndex` over ``footprints.polygons``: it narrows
+    the contributor scan while the exact production predicate still decides the
+    count. ``None`` (default) keeps the historical full scan.
     """
     layout = zg.build_layout(canvas, nx, ny)
     for row, col, bounds in layout.iter_cells(canvas):
         cid = zg.cell_id(row, col)
-        cell = zg.ZeGridCell(cid, canvas.canvas_id, layout.layout_id, row, col, bounds)
-        patch = zg.build_patch(canvas, cell, halo_px)
-        n = zal._cell_contributor_count(footprints, canvas, patch.patch)
+        patch = zg.patch_geometry(bounds, canvas, halo_px)
+        n = zal._cell_contributor_count(footprints, canvas, patch.patch, index=index)
         area = patch.patch.width * patch.patch.height
         inmem_b = zal.FITTED_MEMORY_MODEL.predict_bound_bytes(n, area)
         stream_b = _profile_stream_bytes(
@@ -1958,7 +2001,8 @@ def _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
         }
 
 
-def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
+def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size,
+                           index=None, cells_out=None):
     """Worst-cell cheaper-mode bound for a candidate layout.
 
     For every Cell, takes the CHEAPER of the in-memory and streaming bounds and
@@ -1974,6 +2018,13 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
     The primary ``cheaper_bound_bytes`` (at the passed ``tile_size``) is
     UNCHANGED, so existing consumers (R28 parity, ``predicted_bound_bytes``)
     keep their exact semantics.
+
+    ``index`` / ``cells_out`` (optional, ZM-LAYOUT-PRODUCT-20261115):
+    ``index`` is the once-built :class:`auto_layout.FootprintIndex` used for the
+    contributor counts (exact predicate preserved); ``cells_out``, when a list
+    is supplied, receives the per-Cell dicts of THIS scan in row-major order, so
+    a caller that later needs the chosen grid's cells can reuse them instead of
+    re-running the identical pass. Both default to the historical behaviour.
     """
     worst = None
     inmem_worst = 0
@@ -1986,7 +2037,11 @@ def _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
     load_max = 0
     load_cells = 0
     load_nonempty = 0
-    for c in _iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size):
+    for c in _iter_cell_bounds_mode_aware(
+        canvas, footprints, nx, ny, halo_px, tile_size, index=index
+    ):
+        if cells_out is not None:
+            cells_out.append(c)
         cheaper = min(c["inmem_bound_bytes"], c["stream_bound_bytes"])
         if worst is None or cheaper > worst["cheaper_bound_bytes"]:
             worst = dict(c)
@@ -2244,7 +2299,7 @@ def _load_candidate_family(canvas, mw, mh, nx, ny, floors, halo_px, halo_advisor
 def _admit_load_candidate(
     canvas, footprints, nx, ny, halo_px, tile_size, ram_budget,
     available_bytes, gauge_footprint_bytes, mw=0.0, floors=None,
-    halo_advisory=False,
+    halo_advisory=False, index=None, cells_out=None,
 ):
     """Evaluate ONE extra grid with the EXACT production admission rule.
 
@@ -2264,7 +2319,10 @@ def _admit_load_candidate(
     floors_ok = geom["min_patch_area"] >= floors.min_patch_area_px
     if (not halo_advisory) and geom["halo_overhead"] > floors.max_halo_overhead:
         floors_ok = False
-    worst = _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
+    worst = _scan_layout_mode_aware(
+        canvas, footprints, nx, ny, halo_px, tile_size,
+        index=index, cells_out=cells_out,
+    )
     selected_tile, trials, sel_reason = _select_cpu_streaming_tile(
         worst["stream_worst_by_tile"], ram_budget
     )
@@ -2326,6 +2384,7 @@ def _admit_load_candidate(
 def _load_aware_select(
     canvas, footprints, chosen, *, mw, mh, ram_budget, available_bytes,
     tile_size, halo_px, floors, halo_advisory, gauge_footprint_bytes,
+    index=None,
 ):
     """Membership-load pass over a BOUNDED extra candidate family.
 
@@ -2333,7 +2392,10 @@ def _load_aware_select(
     (the load signal is neutral: legacy / degenerate / well-covered corpora keep
     the historical grid and NO extra grid is scanned). Otherwise returns the
     published provenance block; its ``"chosen_state"`` key carries the candidate
-    dict to adopt (the historical one when nothing improves on it).
+    dict to adopt (the historical one when nothing improves on it) and
+    ``"chosen_cells"`` the EXACT per-Cell dicts of that adopted grid. The caller
+    pops BOTH private keys before publication, and reuses the cells instead of
+    re-running the identical scan for the chosen grid.
 
     The rule is explicit and deterministic:
 
@@ -2353,14 +2415,21 @@ def _load_aware_select(
     records = []
     best_state = chosen
     best_load = baseline
+    best_cells = None
     family = _load_candidate_family(
         canvas, mw, mh, chosen["nx"], chosen["ny"], floors, halo_px, halo_advisory
     )
     for cx, cy in family:
+        # ZM-LAYOUT-PRODUCT-20261115: the adopted grid's per-Cell dicts are kept
+        # so the final chosen-grid pass is not repeated. Only the BEST candidate's
+        # cells are retained (the others are released at once), so the extra
+        # resident cost is one candidate's cell list -- not the whole family.
+        _cells = []
         state = _admit_load_candidate(
             canvas, footprints, cx, cy, halo_px, tile_size, ram_budget,
             available_bytes, gauge_footprint_bytes, mw=mw,
             floors=floors, halo_advisory=halo_advisory,
+            index=index, cells_out=_cells,
         )
         load = state["worst_cell"]["membership_load"]
         acceptable = bool(state["admissible"]) and zal.load_candidate_is_acceptable(
@@ -2388,6 +2457,7 @@ def _load_aware_select(
         if take:
             best_state = state
             best_load = load
+            best_cells = _cells
 
     applied = (int(best_state["nx"]), int(best_state["ny"])) != (
         int(chosen["nx"]), int(chosen["ny"])
@@ -2437,6 +2507,9 @@ def _load_aware_select(
         "chosen": best_load.to_dict(),
         "candidates": records,
         "chosen_state": best_state,
+        # Private (popped by the caller, never published): the exact per-Cell
+        # dicts of ``best_state`` when they were collected, else ``None``.
+        "chosen_cells": best_cells,
     }
 
 
@@ -2630,6 +2703,39 @@ def _choose_layout_mode_aware(
         attempt_state["gauge_memory_model"] = dict(_gauge_memory_model)
     _gauge_memory_fp = int(_gauge_memory_model["footprint_bytes"])
 
+    # ZM-LAYOUT-PRODUCT-20261115: build the exact bbox index of the projected
+    # footprints ONCE for the whole choice (every candidate, the coarser rescue,
+    # the load pass, the pinned/rank windows and the final chosen-cell pass reuse
+    # it). The production predicate still decides every count; the index only
+    # skips polygons whose bounding box cannot touch the patch rectangle. None
+    # when the corpus is too small or the artifact exposes no polygons, in which
+    # case every scan keeps the historical full sweep.
+    _footprint_index = _build_footprint_index(footprints)
+
+    def _index_snapshot(stage):
+        """Log the CURRENT index state under the dedicated diagnostic prefix.
+
+        Called once after construction and once at every exit of the choice
+        (normal completion AND every refusal), so a silent degradation to the
+        ``sorted`` backend or a failing query that fell back to the full sweep is
+        visible in the real run log. Never raises, never alters the decision.
+        """
+        if _footprint_index is None:
+            return
+        _s = _footprint_index.stats()
+        _degraded = bool(_s["query_failures"]) or bool(_s["build_fallback"])
+        _log(
+            f"{FOOTPRINT_INDEX_LOG_PREFIX} {stage} backend={_s['backend']} "
+            f"polygons={_s['polygons']} indexed={_s['indexed']} "
+            f"uncertain={_s['uncertain']} queries={_s['query_calls']} "
+            f"query_failures={_s['query_failures']} "
+            f"build={_s['build_seconds']:.4f}s "
+            f"fallback={_s['build_fallback'] or 'none'}",
+            "WARN" if _degraded else "INFO",
+        )
+
+    _index_snapshot("build")
+
     if pinned_layout is not None:
         nx, ny = int(pinned_layout[0]), int(pinned_layout[1])
         if not (1 <= nx <= canvas.width and 1 <= ny <= canvas.height):
@@ -2687,11 +2793,14 @@ def _choose_layout_mode_aware(
                 + _dir
             )
             _log(msg, "ERROR")
+            _index_snapshot("refusal")
             raise zal.LayoutInfeasible(
                 msg,
                 refusal={"kind": "geometry", "source": "pinned_floors"},
             )
-        cells = list(_iter_cell_bounds_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size))
+        cells = list(_iter_cell_bounds_mode_aware(
+            canvas, footprints, nx, ny, halo_px, tile_size, index=_footprint_index
+        ))
         max_n = max((c["n"] for c in cells), default=0)
         worst_bound = max((min(c["inmem_bound_bytes"], c["stream_bound_bytes"]) for c in cells), default=0)
         inmem_worst = max((c["inmem_bound_bytes"] for c in cells), default=0)
@@ -2758,6 +2867,7 @@ def _choose_layout_mode_aware(
                         f"{_pinned_joint['reason_code']}: {_pinned_joint['detail']}"
                     )
                     _log(_jmsg, "ERROR")
+                    _index_snapshot("refusal")
                     raise zal.LayoutInfeasible(
                         _jmsg,
                         refusal={
@@ -2790,6 +2900,7 @@ def _choose_layout_mode_aware(
                     "WARN",
                 )
             else:
+                _index_snapshot("refusal")
                 raise zal.LayoutInfeasible(msg)
         contrib_ok = max_n >= floors.min_contributors
         warnings = []
@@ -2813,6 +2924,7 @@ def _choose_layout_mode_aware(
         _predicted_bound = _selected_admissible_bound(
             inmem_ok, inmem_worst, selected_tile, stream_worst_by_tile, worst_bound
         )
+        _index_snapshot("done")
         return {
             "nx": nx, "ny": ny,
             "cell_count": nx * ny,
@@ -2853,6 +2965,11 @@ def _choose_layout_mode_aware(
         )
     candidates = []
     seen = set()
+    # ZM-LAYOUT-PRODUCT-20261115: the scan that ADMITS a grid already produced its
+    # exact per-Cell dicts; keep only the MOST RECENT scan's cells (the forward
+    # scan stops at the first admissible candidate, so that is the chosen one).
+    scan_cells = None
+    scan_grid = None
     # ZM-ZEGRID-R55-E6: set ONLY when the FIRST rank-admitted auto candidate is
     # rejected solely by max_halo_overhead (patch floor OK). This is the sole
     # trigger for the bounded coarser rescue; every ordinary run leaves it None.
@@ -2929,7 +3046,13 @@ def _choose_layout_mode_aware(
                 "continuing to evaluate memory",
                 "WARN",
             )
-        worst = _scan_layout_mode_aware(canvas, footprints, nx, ny, halo_px, tile_size)
+        _scan_cells: list = []
+        worst = _scan_layout_mode_aware(
+            canvas, footprints, nx, ny, halo_px, tile_size,
+            index=_footprint_index, cells_out=_scan_cells,
+        )
+        scan_cells = _scan_cells
+        scan_grid = (int(nx), int(ny))
         selected_tile, trials, sel_reason = _select_cpu_streaming_tile(
             worst["stream_worst_by_tile"], ram_budget
         )
@@ -3068,6 +3191,7 @@ def _choose_layout_mode_aware(
             "(more cells) or more available RAM would be required."
         )
         _log(msg, "ERROR")
+        _index_snapshot("refusal")
         raise zal.LayoutInfeasible(
             msg,
             refusal={
@@ -3135,7 +3259,8 @@ def _choose_layout_mode_aware(
                     })
                     continue
                 rworst = _scan_layout_mode_aware(
-                    canvas, footprints, rnx, rny, halo_px, tile_size
+                    canvas, footprints, rnx, rny, halo_px, tile_size,
+                    index=_footprint_index,
                 )
                 rselected, rtrials, rreason = _select_cpu_streaming_tile(
                     rworst["stream_worst_by_tile"], ram_budget
@@ -3314,6 +3439,7 @@ def _choose_layout_mode_aware(
                 "source": "halo_conflict_no_feasible_rescue",
             }
         _log(msg, "ERROR")
+        _index_snapshot("refusal")
         raise zal.LayoutInfeasible(msg, refusal=_refusal)
 
     if chosen is None and not candidates:
@@ -3330,6 +3456,7 @@ def _choose_layout_mode_aware(
             "patch area; a FINER layout reduces it and cannot help."
         )
         _log(msg, "ERROR")
+        _index_snapshot("refusal")
         raise zal.LayoutInfeasible(
             msg,
             refusal={
@@ -3430,6 +3557,7 @@ def _choose_layout_mode_aware(
             )
             chosen = finest
         else:
+            _index_snapshot("refusal")
             raise zal.LayoutInfeasible(msg, refusal=_refusal)
 
     # ------------------------------------------------------------------
@@ -3445,6 +3573,7 @@ def _choose_layout_mode_aware(
     # neutral signal, a pinned grid, a coarser rescue or a refinement-rank
     # window. Existing runs are FROZEN: only NEW runs can differ.
     load_selection = None
+    load_cells = None
     if (
         chosen is not None
         and rescue_record is None
@@ -3457,6 +3586,7 @@ def _choose_layout_mode_aware(
             available_bytes=available_bytes, tile_size=tile_size,
             halo_px=halo_px, floors=floors, halo_advisory=_halo_advisory,
             gauge_footprint_bytes=_gauge_memory_fp,
+            index=_footprint_index,
         )
         if load_selection is not None:
             _base = load_selection["baseline"]
@@ -3498,12 +3628,29 @@ def _choose_layout_mode_aware(
                 )
             if load_selection["applied"]:
                 chosen = load_selection.pop("chosen_state")
+                load_cells = load_selection.pop("chosen_cells", None)
             else:
                 load_selection.pop("chosen_state", None)
+                load_selection.pop("chosen_cells", None)
 
-    cells = list(_iter_cell_bounds_mode_aware(
-        canvas, footprints, chosen["nx"], chosen["ny"], halo_px, tile_size
-    ))
+    # ZM-LAYOUT-PRODUCT-20261115: reuse the EXACT per-Cell dicts of the scan that
+    # admitted the chosen grid instead of re-running the identical pass. The reuse
+    # is permitted only for the same (nx, ny) and the same run-constant geometry
+    # (canvas, halo, tile ladder, storage profile), i.e. literally the same cells;
+    # otherwise the historical pass runs unchanged.
+    _grid = (int(chosen["nx"]), int(chosen["ny"]))
+    cells = None
+    if load_cells is not None:
+        # ``chosen`` IS the load pass's ``best_state`` when the pass applied, so
+        # these are the cells of exactly this grid.
+        cells = load_cells
+    elif scan_cells is not None and scan_grid == _grid:
+        cells = scan_cells
+    if cells is None:
+        cells = list(_iter_cell_bounds_mode_aware(
+            canvas, footprints, chosen["nx"], chosen["ny"], halo_px, tile_size,
+            index=_footprint_index,
+        ))
     max_n = max((c["n"] for c in cells), default=0)
     contrib_ok = max_n >= floors.min_contributors
     warnings = []
@@ -3551,6 +3698,7 @@ def _choose_layout_mode_aware(
         f"({chosen['selection_reason']})"
     )
 
+    _index_snapshot("done")
     return {
         "nx": chosen["nx"], "ny": chosen["ny"],
         "cell_count": chosen["nx"] * chosen["ny"],

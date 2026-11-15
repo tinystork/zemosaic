@@ -487,9 +487,9 @@ def test_neutral_signal_keeps_historical_grid_and_publishes_nothing(
     scanned = []
     real_scan = zz._scan_layout_mode_aware
 
-    def spy(canvas, footprints, nx, ny, halo_px, tile_size):
+    def spy(canvas, footprints, nx, ny, halo_px, tile_size, **kw):
         scanned.append((nx, ny))
-        return real_scan(canvas, footprints, nx, ny, halo_px, tile_size)
+        return real_scan(canvas, footprints, nx, ny, halo_px, tile_size, **kw)
 
     monkeypatch.setattr(zz, "_scan_layout_mode_aware", spy)
     layout = _run(canvas, descs)

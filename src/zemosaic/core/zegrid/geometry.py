@@ -584,16 +584,38 @@ class ProcessingPatch:
         return WCS(self.patch_wcs_header)
 
 
-def build_patch(canvas: GlobalCanvas, cell: ZeGridCell, halo_px: int) -> ProcessingPatch:
-    """Build a ProcessingPatch = cell + halo clipped to the canvas.
+@dataclass(frozen=True)
+class PatchGeometry:
+    """Geometry-only patch (ZM-LAYOUT-PRODUCT-20261115).
 
-    The patch WCS is the canvas WCS with CRPIX shifted by the patch origin (the
-    canvas offset is already baked), so a patch pixel centre ``(x,y)`` maps
-    exactly to canvas pixel ``(x + patch.x0, y + patch.y0)``.
+    EXACTLY the bounds/slice/halo of :class:`ProcessingPatch`, WITHOUT the
+    deep-copied WCS and the serialized FITS header. A layout candidate scan
+    needs only ``patch`` (membership rectangle, area) and ``patch_shape_hw``
+    (streaming bound geometry); building a header per Cell per candidate is the
+    dominant cell-scaffolding cost and produces nothing the scan reads.
+
+    Never persisted, never part of a manifest: an internal seam used by the
+    chooser only. A caller that needs pixels/headers calls :func:`build_patch`.
+    """
+
+    patch: GlobalBounds
+    core_slice: PatchBounds  # patch-local (y0,y1,x0,x1)
+    halo_px: int
+
+    @property
+    def patch_shape_hw(self) -> tuple[int, int]:
+        return (self.patch.height, self.patch.width)
+
+
+def patch_geometry(core: GlobalBounds, canvas: GlobalCanvas, halo_px: int) -> PatchGeometry:
+    """Geometry of the halo-extended patch of ``core``, clipped to the canvas.
+
+    SINGLE source of truth for the patch rectangle: :func:`build_patch` derives
+    its bounds/slice from this function, so a geometry-only scan and a real
+    patch can never disagree. Integer arithmetic only; deterministic.
     """
     if halo_px < 0:
         raise ValueError("negative halo")
-    core = cell.core
     px0 = max(0, core.x0 - halo_px)
     py0 = max(0, core.y0 - halo_px)
     px1 = min(canvas.width, core.x1 + halo_px)
@@ -605,15 +627,30 @@ def build_patch(canvas: GlobalCanvas, cell: ZeGridCell, halo_px: int) -> Process
     cs_x1 = core.x1 - px0
     cs_y1 = core.y1 - py0
     core_slice = PatchBounds(cs_x0, cs_y0, cs_x1, cs_y1)
+    return PatchGeometry(patch=patch, core_slice=core_slice, halo_px=int(halo_px))
+
+
+def build_patch(canvas: GlobalCanvas, cell: ZeGridCell, halo_px: int) -> ProcessingPatch:
+    """Build a ProcessingPatch = cell + halo clipped to the canvas.
+
+    The patch WCS is the canvas WCS with CRPIX shifted by the patch origin (the
+    canvas offset is already baked), so a patch pixel centre ``(x,y)`` maps
+    exactly to canvas pixel ``(x + patch.x0, y + patch.y0)``.
+
+    The bounds/slice come from :func:`patch_geometry` (shared with the
+    geometry-only layout scan, so both agree bit for bit).
+    """
+    geom = patch_geometry(cell.core, canvas, halo_px)
+    patch = geom.patch
 
     w = canvas.wcs()
     w = copy.deepcopy(w)
-    w.wcs.crpix -= np.array([px0, py0])
-    w.array_shape = (patch.height, patch.width)
+    w.wcs.crpix -= np.array([patch.x0, patch.y0])
+    w.array_shape = geom.patch_shape_hw
     return ProcessingPatch(
         cell_id=cell.cell_id,
         patch=patch,
-        core_slice=core_slice,
+        core_slice=geom.core_slice,
         halo_px=halo_px,
         patch_wcs_header=_serialize_wcs(w),
     )

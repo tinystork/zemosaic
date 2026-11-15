@@ -332,9 +332,9 @@ def test_early_stop_at_first_admissible_candidate(monkeypatch):
     real_scan = zz._scan_layout_mode_aware
     scanned = []
 
-    def spy(canvas, footprints, nx, ny, halo_px, tile_size):
+    def spy(canvas, footprints, nx, ny, halo_px, tile_size, **kw):
         scanned.append((nx, ny))
-        return real_scan(canvas, footprints, nx, ny, halo_px, tile_size)
+        return real_scan(canvas, footprints, nx, ny, halo_px, tile_size, **kw)
 
     monkeypatch.setattr(zz, "_scan_layout_mode_aware", spy)
 

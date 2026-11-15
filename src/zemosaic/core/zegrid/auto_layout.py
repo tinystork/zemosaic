@@ -68,13 +68,25 @@ model here).
 from __future__ import annotations
 
 import math
+import sys
+from bisect import bisect_right as _bisect_right
 from dataclasses import dataclass, field
+from time import perf_counter as _perf_counter
 from typing import Callable, Optional, Sequence
 
 import numpy as np
 
 from . import geometry as zg
 from . import sweep as zsw
+
+try:  # optional bbox-index accelerator (Shapely >= 2 only)
+    from shapely import STRtree as _strtree
+except Exception:  # pragma: no cover - Shapely 1.x / unavailable
+    _strtree = None
+try:  # vectorized coordinate access (Shapely >= 2 only)
+    from shapely import get_coordinates as _get_coordinates
+except Exception:  # pragma: no cover - Shapely 1.x / unavailable
+    _get_coordinates = None
 
 # ---------------------------------------------------------------------------
 # Memory model — DERIVED (measured), not invented.
@@ -559,8 +571,278 @@ def project_footprints(
     )
 
 
-def _cell_contributor_count(footprints, canvas, bounds: zg.GlobalBounds) -> int:
-    """Number of frames whose projected footprint intersects a cell's patch rect."""
+def count_contributors_exact(polygons, bounds: zg.GlobalBounds) -> int:
+    """Reference count: the production predicate over EVERY polygon."""
+    rect = zg._rect(bounds)
+    n = 0
+    for poly in polygons:
+        if poly.intersection(rect).area > zg.INTERSECTION_AREA_EPS:
+            n += 1
+    return n
+
+
+def _nonfinite_polygon_indices(polygons) -> set:
+    """Indices of polygons with at least one non-finite coordinate.
+
+    Such a polygon must NOT be filtered by the bbox index: its ``bounds`` can
+    hide the NaN (Shapely drops non-finite vertices from ``bounds``) while the
+    production ``intersection`` would raise on it. Keeping it "uncertain" and
+    always re-checking it preserves the historical behaviour exactly (same
+    exception, or same count). Vectorized when Shapely exposes
+    ``get_coordinates``; a bounded per-polygon scan otherwise.
+    """
+    if not polygons:
+        return set()
+    if _get_coordinates is not None:
+        try:
+            coords, owner = _get_coordinates(list(polygons), return_index=True)
+            finite = np.isfinite(coords).all(axis=1)
+            if bool(finite.all()):
+                return set()
+            return {int(i) for i in np.unique(owner[~finite])}
+        except Exception:
+            pass
+    out = set()
+    for i, poly in enumerate(polygons):
+        try:
+            ext = poly.exterior
+            ok = True
+            if ext is not None:
+                for xy in ext.coords:
+                    if not all(math.isfinite(float(v)) for v in xy):
+                        ok = False
+                        break
+            if not ok:
+                out.add(i)
+        except Exception:
+            out.add(i)
+    return out
+
+
+class FootprintIndex:
+    """Exact-preserving bounding-box prefilter over projected footprints.
+
+    ``query(rect)`` returns ASCENDING polygon indices that MAY satisfy the
+    production predicate ``poly.intersection(rect).area >
+    INTERSECTION_AREA_EPS``; the caller MUST still apply that exact predicate to
+    the returned subset. The returned set is a SUPERSET: any polygon with a
+    positive-area intersection has a bounding box overlapping ``rect``.
+
+    Polygons whose bounding box is unavailable/empty/non-finite are returned by
+    EVERY query (``uncertain``), so the exact predicate - never the index -
+    decides their membership. Degenerate geometry therefore cannot be silently
+    dropped, and the count stays exact.
+
+    SCOPE OF THAT GUARANTEE (rework-1 L3): for a FINITE polygon that is invalid
+    (e.g. a bowtie) and whose bbox does NOT overlap the query rect, the indexed
+    path evaluates no overlay for it. With the GEOS in use this is outcome
+    equivalent - a bbox-disjoint ``intersection`` short-circuits to an empty
+    geometry instead of raising - but the guarantee that is actually claimed is
+    the exact COUNT (plus the preserved exception for non-finite/uncertain
+    geometry), not "any error an engine could ever raise". A GEOS that raised on
+    bbox-disjoint input would still leave the count exact and is not covered.
+
+    Backends:
+
+    * ``strtree`` - Shapely 2 ``STRtree`` bbox query (optional accelerator, used
+      only when the installed Shapely exposes it);
+    * ``sorted`` - pure Python: polygons ordered by ``minx`` plus a linear
+      filter; no third-party accelerator required;
+    * ``bruteforce`` - no index: every index is returned (overhead baseline and
+      the reference used by tests).
+
+    ``auto`` picks ``strtree`` when available, else ``sorted``. A build failure
+    of the accelerator falls back to ``sorted`` (same exact semantics), and is
+    reported in :meth:`stats` - never silent.
+
+    The polygons are held by REFERENCE (never copied): the index is valid only
+    for the exact footprint artifact it was built from; a mismatch is refused
+    by :func:`_cell_contributor_count`.
+    """
+
+    _BACKENDS = ("auto", "strtree", "sorted", "bruteforce")
+
+    def __init__(self, polygons, backend: str = "auto"):
+        if backend not in self._BACKENDS:
+            raise ValueError(f"unknown footprint index backend: {backend}")
+        self.polygons = polygons if isinstance(polygons, tuple) else tuple(polygons)
+        self._requested_backend = backend
+        self.backend = backend
+        self.indexed = 0
+        self.uncertain = 0          # always-queried (degenerate bbox)
+        self.build_seconds = 0.0
+        self.build_fallback = None  # reason string when the accelerator failed
+        self.query_calls = 0
+        self.query_failures = 0
+        self._map: list[int] = []
+        self._mins: list[float] = []
+        self._maxs: list[float] = []
+        self._minys: list[float] = []
+        self._maxys: list[float] = []
+        self._sorted_minx: list[float] = []
+        self._order: list[int] = []
+        self._uncertain_idx: list[int] = []
+        self._tree = None
+        _t0 = _perf_counter()
+        self._build()
+        self.build_seconds = _perf_counter() - _t0
+
+    # -- construction -------------------------------------------------
+    def _build(self) -> None:
+        _want = self._requested_backend
+        if _want == "auto":
+            _want = "strtree" if _strtree is not None else "sorted"
+        if _want == "bruteforce":
+            self.backend = "bruteforce"
+            self.indexed = len(self.polygons)
+            return
+        _nonfinite = _nonfinite_polygon_indices(self.polygons)
+        for i, poly in enumerate(self.polygons):
+            if i in _nonfinite:
+                # Non-finite coordinates: bbox filtering is NOT sound (bounds can
+                # hide a NaN) and the historical predicate may raise on it, so the
+                # exact predicate must always see it.
+                self.uncertain += 1
+                self._uncertain_idx.append(i)
+                continue
+            try:
+                b = poly.bounds
+            except Exception:
+                b = None
+            if b is None or len(b) != 4 or not all(math.isfinite(float(v)) for v in b):
+                # Empty / non-finite / unusable bbox: never indexed, always
+                # re-checked by the exact predicate.
+                self.uncertain += 1
+                self._uncertain_idx.append(i)
+                continue
+            self._map.append(i)
+            self._mins.append(float(b[0]))
+            self._minys.append(float(b[1]))
+            self._maxs.append(float(b[2]))
+            self._maxys.append(float(b[3]))
+        self.indexed = len(self._map)
+        if _want == "strtree":
+            try:
+                self._tree = _strtree([self.polygons[i] for i in self._map])
+                self.backend = "strtree"
+                return
+            except Exception as exc:  # accelerator unavailable/failed
+                self._tree = None
+                self.build_fallback = f"strtree: {type(exc).__name__}: {exc}"
+                _want = "sorted"
+        # sorted-by-minx fallback (built from the same bounds arrays)
+        self._order = sorted(range(self.indexed), key=lambda j: self._mins[j])
+        self._sorted_minx = [self._mins[j] for j in self._order]
+        self.backend = "sorted"
+
+    # -- queries ------------------------------------------------------
+    def query(self, rect) -> list[int]:
+        """Conservative candidate indices (ascending original positions)."""
+        self.query_calls += 1
+        try:
+            return self._query_impl(rect)
+        except Exception:
+            # A failing accelerator must NEVER change the count: fall back to
+            # the full scan, which is exactly the historical behaviour.
+            self.query_failures += 1
+            return list(range(len(self.polygons)))
+
+    def _query_impl(self, rect) -> list[int]:
+        if self.backend == "bruteforce":
+            return list(range(len(self.polygons)))
+        rx0, ry0, rx1, ry1 = (float(v) for v in rect.bounds)
+        if self.backend == "strtree":
+            raw = self._tree.query(rect)
+            out = sorted(self._map[int(j)] for j in raw)
+            if self._uncertain_idx:
+                out = sorted(out + self._uncertain_idx)
+            return out
+        # sorted-by-minx: everything starting left of rx1, then bbox filter.
+        pos = _bisect_right(self._sorted_minx, rx1)
+        out = []
+        for k in range(pos):
+            j = self._order[k]
+            if self._maxs[j] < rx0 or self._maxys[j] < ry0 or self._minys[j] > ry1:
+                continue
+            out.append(self._map[j])
+        if self._uncertain_idx:
+            out.extend(self._uncertain_idx)
+        out.sort()
+        return out
+
+    def count(self, bounds: zg.GlobalBounds) -> int:
+        """EXACT contributor count of ``bounds`` (same predicate as production).
+
+        If a geometry operation RAISES while counting the candidate subset, the
+        count is recomputed with the historical full sweep in ascending polygon
+        order: identical result, and the same exception if the historical path
+        raised one (the first offending polygon is the same).
+
+        Precise limit (rework-1 L3): a finite-but-invalid polygon whose bbox does
+        not overlap the rect is not evaluated by the indexed path. With the GEOS
+        in use the historical path does not raise for it either (bbox-disjoint
+        overlays short-circuit), so the outcomes agree; the guarantee claimed
+        here is the exact COUNT and the preserved non-finite/uncertain error
+        path, not "no engine can ever raise".
+        """
+        rect = zg._rect(bounds)
+        try:
+            return sum(
+                1
+                for i in self.query(rect)
+                if self.polygons[i].intersection(rect).area
+                > zg.INTERSECTION_AREA_EPS
+            )
+        except Exception:
+            return count_contributors_exact(self.polygons, bounds)
+
+    # -- introspection ------------------------------------------------
+    def memory_bytes(self) -> int:
+        """Python-visible bytes of the index structures (NOT the native tree)."""
+        total = 0
+        for seq in (self._map, self._mins, self._maxs, self._minys,
+                    self._maxys, self._sorted_minx, self._order):
+            total += sys.getsizeof(seq)
+        return int(total)
+
+    def stats(self) -> dict:
+        return {
+            "backend": self.backend,
+            "requested_backend": self._requested_backend,
+            "build_fallback": self.build_fallback,
+            "polygons": len(self.polygons),
+            "indexed": int(self.indexed),
+            "uncertain": int(self.uncertain),
+            "build_seconds": float(self.build_seconds),
+            "query_calls": int(self.query_calls),
+            "query_failures": int(self.query_failures),
+            "python_structures_bytes": self.memory_bytes(),
+            "note": (
+                "native STRtree memory is outside sys.getsizeof/tracemalloc; "
+                "measure RSS around build for the real cost"
+            ),
+        }
+
+
+def _cell_contributor_count(footprints, canvas, bounds: zg.GlobalBounds, index=None) -> int:
+    """Number of frames whose projected footprint intersects a cell's patch rect.
+
+    The predicate is the production one (``poly.intersection(rect).area >
+    zg.INTERSECTION_AREA_EPS``).
+
+    ``index`` (optional, ZM-LAYOUT-PRODUCT-20261115) is a
+    :class:`FootprintIndex` built from the SAME footprint artifact: it narrows
+    the scan to the polygons whose bounding box can overlap the patch rect, and
+    the caller's count is then produced by the SAME exact predicate over that
+    superset. ``None`` (default) keeps the historical full scan.
+    """
+    if index is not None:
+        _polys = getattr(footprints, "polygons", None)
+        if _polys is None or index.polygons is not _polys:
+            raise ValueError(
+                "footprint index was not built from this footprint artifact"
+            )
+        return index.count(bounds)
     rect = zg._rect(bounds)
     n = 0
     for _f, poly in footprints:
