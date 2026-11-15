@@ -102,6 +102,10 @@ def _run(tmp_path, monkeypatch, *, use_gpu, resume_mode="never", corpus=None,
          progress=None):
     if use_gpu:
         R55._fake_gpu_available(monkeypatch)
+        # SIMULATED GPU KERNEL: the module docstring's seam. Without it the real
+        # canonical stack receives backend="gpu" and fails on a host without
+        # CuPy; the product resume contract is what these tests exercise.
+        _cpu_math(monkeypatch)
     corpus = corpus or _corpus(tmp_path)
     out = tmp_path / "out"
     store = out / "zegrid-durable"

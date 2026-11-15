@@ -1088,6 +1088,11 @@ class _ApplyBundle:
     gpu_streaming_host_peak_bytes: int | None = None
     gpu_used: bool = False
     gpu_pre_execution_fallback: dict | None = None
+    # Product fields written by ``_r55_active_gpu_apply`` (frozen identity +
+    # counts decoupling); the stub mirrors ExecutionBundle, never a weaker shape.
+    gpu_parity_qualified: bool = False
+    gauge_counts_workers: object = None
+    gauge_counts_footprint_bytes: object = None
     plan: dict = dataclasses.field(default_factory=dict)
     chosen_mode: str = "stream"
     cells_in_flight: int = 1

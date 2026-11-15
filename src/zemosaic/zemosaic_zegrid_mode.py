@@ -129,6 +129,7 @@ from .core.zegrid import instrumentation as zin
 from .core.zegrid import mosaic as zmosaic
 from .core.zegrid import observability as zobs
 from .core.zegrid import parallel as zpar
+from .core.zegrid import percell_tile as zpercell
 from .core.zegrid import photometric as zphot
 from .core.zegrid import ram_contract as rcontract
 from .core.zegrid import resource_envelope as renv
@@ -4646,6 +4647,21 @@ def _r55_require_frozen_gpu_mapping(frozen_admission, mapping) -> None:
         return
     frozen_tile = int(frozen_admission["tile_px"])
     got = int(mapping["gpu_streaming_tile"])
+    if frozen_admission.get("percell_tiles") is not None:
+        # v2 per-Cell: the frozen ``tile_px`` is the plan's MAXIMUM cap; the
+        # scheduler's reference mapping must stay at or below it. Each Cell's
+        # own frozen entry is validated separately and never grows.
+        if got > frozen_tile:
+            raise _frozen_gpu_admission_refusal(
+                frozen_admission,
+                detail=(
+                    "the resumed ACTIVE GPU reference admission selected "
+                    f"tile_px={got}, above the frozen per-Cell cap "
+                    f"tile_px={frozen_tile}"
+                ),
+                admitted_tile=got,
+            )
+        return
     if got != frozen_tile:
         raise _frozen_gpu_admission_refusal(
             frozen_admission,
@@ -6756,6 +6772,11 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         per_cell=(cell_gauge_mode == zphot.CELL_GAUGE_MODE_PER_CELL),
     )
     record = {
+        **(
+            {"percell_tile_px": int(tile_size)}
+            if prepared.get("_percell") is True and tile_size is not None
+            else {}
+        ),
         "cell_id": cid, "row": cell.row, "col": cell.col, "status": "complete",
         "mode": mode, "n_contributors": len(mem.patch_ids),
         "n_patch_contributors": len(mem.patch_ids),
@@ -6935,6 +6956,14 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         **(
             {"storage_profile": storage_profile}
             if zsp.is_bounded(storage_profile) else {}
+        ),
+        # ZM-GPU-PERCELL-PRODUCT: the ACTUAL per-Cell tile this unit executed
+        # (present only when the experimental option drove the unit). It is the
+        # durable evidence a restart uses to forbid re-growth after a shrink.
+        **(
+            {"percell_tile_px": int(tile_size)}
+            if prepared.get("_percell") is True and tile_size is not None
+            else {}
         ),
         # R34D: in per_cell mode the parent needs the PATCH planes (core + halo)
         # to measure the inter-cell overlaps and to feather-blend. Global mode
@@ -12130,6 +12159,25 @@ def _resolve_gauge_counts_decoupling(zconfig, scheduler_mode) -> bool:
     return bool(raw) and scheduler_mode == zsched.MODE_ACTIVE
 
 
+def _resolve_gpu_percell_tiles(zconfig) -> bool:
+    """The ONE pure resolution of the experimental per-Cell GPU tile option.
+
+    Persisted bool, DEFAULT OFF. An absent key, ``None`` config or any
+    non-boolean explicit value is OFF (the strict product validator refuses a
+    non-boolean before this point). The caller ANDs this intent with the
+    EFFECTIVE scheduler/backend: the option is relevant only for ZeGrid ACTIVE
+    with a GPU request. A user GPU OFF always wins and the saved value is never
+    erased by that decision.
+    """
+    if zconfig is None:
+        return False
+    if isinstance(zconfig, Mapping):
+        raw = zconfig.get("zegrid_gpu_percell_tiles", False)
+    else:
+        raw = getattr(zconfig, "zegrid_gpu_percell_tiles", False)
+    return bool(raw) if isinstance(raw, bool) else False
+
+
 def _r55_gauge_credit_diagnostics_fields(
     *,
     credit_applied,
@@ -12671,6 +12719,9 @@ class _R55GpuActiveDecision:
     worker_trail: tuple = ()
     # R55-E9: VRAM-derived max, declared GPU ladder and exact per-tile bounds.
     gpu_tile_max: int = 0
+    # Q1: the ACTUAL VramPolicy budget (70 % of fresh free VRAM) the ladder was
+    # derived from; never reconstructed from the qualification percent.
+    gpu_device_budget_bytes: int = 0
     gpu_tile_ladder: tuple = ()
     gpu_host_bound_by_tile: tuple = ()
     # R55-E10: the headroom-bounded budget the ladder was pruned against.
@@ -12680,6 +12731,82 @@ class _R55GpuActiveDecision:
     # instead of interpolating, guessing, or consulting a second planner.
     gpu_max_contributors: int = 1
     gpu_worst_patch_hw: tuple = (1, 1)
+    # ZM-GPU-PERCELL-PRODUCT: the optional experimental per-Cell plan. ``None``
+    # on every historical/OFF path (byte-identical decision).
+    percell_plan: object = None
+    percell_entries: tuple = ()
+
+
+@dataclass(frozen=True)
+class _PerCellRuntimeDecision:
+    """The minimal decision surface a per-Cell runtime revalidation reads.
+
+    It exposes EXACTLY the attributes ``_r55_runtime_tile_check`` /
+    ``_r55_runtime_tile_walk`` and the GPU consumer already consume, so the same
+    shrink-only math is reused verbatim (no second planner, no interpolated
+    bound). ``facts`` is the run-wide producer/prefetch credit.
+    """
+
+    device_peak_bytes_by_tile: dict
+    gpu_host_bound_by_tile: tuple
+    gpu_tile_ladder: tuple
+    facts: dict
+    policy: object
+    qualification: dict
+
+
+_PERCELL_SHRINK_CAPS_FILENAME = "zegrid_percell_shrink_caps.json"
+
+
+def _percell_shrink_caps_path(store_root) -> Path:
+    return Path(store_root) / _PERCELL_SHRINK_CAPS_FILENAME
+
+
+def _read_percell_shrink_caps(
+    store_root, *, plan, run_id, expected_cell_ids=None
+) -> dict:
+    path = _percell_shrink_caps_path(store_root)
+    if not path.is_file():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return zpercell.parse_shrink_caps_document(
+        raw,
+        plan=plan,
+        expected_run_id=run_id,
+        expected_cell_ids=expected_cell_ids,
+    )
+
+
+def _write_percell_shrink_caps(store_root, *, plan, run_id, caps) -> None:
+    payload = zpercell.build_shrink_caps_document(
+        run_id=run_id, plan=plan, caps=caps
+    )
+    data = (
+        json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    root = Path(store_root)
+    tmp_dir = root / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    zrs.atomic_write_bytes(
+        _percell_shrink_caps_path(root), data, tmp_dir=tmp_dir
+    )
+
+
+def _r55_percell_runtime_context(decision, entry):
+    """THE runtime context factory for one per-Cell entry.
+
+    It exposes the SAME authoritative floor-adjusted host bound PLAN/APPLY use
+    (``max(raw model bound, reservation - baseline)``), so a fresh runtime
+    checkpoint cannot re-admit a Cell below its own measured reservation floor.
+    """
+    return _PerCellRuntimeDecision(
+        device_peak_bytes_by_tile=dict(entry.device_peak_bytes_by_tile),
+        gpu_host_bound_by_tile=tuple(entry.admitted_host_bound_by_tile()),
+        gpu_tile_ladder=tuple(entry.declared_ladder),
+        facts=dict(decision.facts),
+        policy=decision.policy,
+        qualification=dict(decision.qualification),
+    )
 
 
 def _r55_gpu_host_bound_by_tile(*, max_n, worst_hw, tiles):
@@ -12719,7 +12846,7 @@ def _r55_cap_gpu_tile_ladder(tiles, max_gpu_tile):
     )
 
 
-def _r55_active_gpu_decide(
+def _r55_active_gpu_decide_single(
     *,
     bundle,
     cell_ctxs,
@@ -13190,6 +13317,7 @@ def _r55_active_gpu_decide(
         cache_workers=int(base["cache_workers"]),
         worker_trail=tuple(dict(entry) for entry in worker_trail),
         gpu_tile_max=int(max_tile),
+        gpu_device_budget_bytes=int(budget),
         gpu_tile_ladder=tuple(int(t) for t in gpu_tiles),
         gpu_selection_budget_bytes=int(selection_budget),
         gpu_host_bound_by_tile=tuple(
@@ -13197,6 +13325,308 @@ def _r55_active_gpu_decide(
         ),
         gpu_max_contributors=int(max_n),
         gpu_worst_patch_hw=(int(worst_hw[0]), int(worst_hw[1])),
+    )
+
+
+def _r55_percell_reference_ctx(cell_ctxs, cell_id):
+    """The EXACT (row, col, cell, patch, mem) tuple of one real Cell."""
+    wanted = str(cell_id)
+    for item in cell_ctxs:
+        if str(item[2].cell_id) == wanted:
+            return item
+    raise ValueError(f"per-Cell reference cell {wanted!r} is not active")
+
+
+def _r55_active_gpu_decide(
+    *,
+    bundle,
+    cell_ctxs,
+    canvas,
+    halo_px,
+    cache_root,
+    output_dir,
+    frame_ids,
+    gpu_probe,
+    readiness,
+    max_gpu_tile=None,
+    gauge_restored=False,
+    restored_gauge_resident_bytes=None,
+    percell_enabled=False,
+    percell_frozen=None,
+):
+    """ACTIVE GPU decision entry point.
+
+    ``percell_enabled=False`` reproduces the historical whole-run decision byte
+    for byte (one call to :func:`_r55_active_gpu_decide_single`).
+
+    ``percell_enabled=True`` builds the experimental per-Cell plan first. The
+    scheduler decision itself is built from ONE REAL reference Cell (the Cell
+    whose own admitted host peak is the largest), never from an independent
+    ``max(n)`` x ``max(area)`` product. The per-Cell entries are attached to the
+    returned decision and are the authority for every unit's start tile.
+    """
+    if not percell_enabled and percell_frozen is None:
+        return _r55_active_gpu_decide_single(
+            bundle=bundle,
+            cell_ctxs=cell_ctxs,
+            canvas=canvas,
+            halo_px=halo_px,
+            cache_root=cache_root,
+            output_dir=output_dir,
+            frame_ids=frame_ids,
+            gpu_probe=gpu_probe,
+            readiness=readiness,
+            max_gpu_tile=max_gpu_tile,
+            gauge_restored=gauge_restored,
+            restored_gauge_resident_bytes=restored_gauge_resident_bytes,
+        )
+
+    active_cells = [
+        item for item in cell_ctxs if item[4].patch_ids
+    ]
+    if not active_cells:
+        raise zsched.SchedulerConfigError(
+            "per-Cell GPU planning requires at least one non-empty cell"
+        )
+    facts = zpercell.CellTileFacts
+    cells = [
+        facts.build(
+            item[2].cell_id,
+            len(item[4].patch_ids),
+            item[3].patch_shape_hw,
+            int(item[3].patch.width) * int(item[3].patch.height),
+        )
+        for item in active_cells
+    ]
+    if percell_frozen is not None:
+        expected = {cell.cell_id for cell in cells}
+        frozen_plan = (
+            percell_frozen
+            if isinstance(percell_frozen, zpercell.PerCellPlan)
+            else zpercell.plan_from_admission(
+                percell_frozen, expected_cell_ids=expected
+            )
+        )
+        if set(frozen_plan.cell_ids()) != expected:
+            raise ValueError(
+                "frozen per-Cell plan coverage does not match the active Cell "
+                "set (missing="
+                f"{sorted(expected - set(frozen_plan.cell_ids()))}, extra="
+                f"{sorted(set(frozen_plan.cell_ids()) - expected)})"
+            )
+        # A frozen plan is NEVER recomputed. The reference Cell is still a real
+        # Cell and its own frozen entry is used only to build the scheduler
+        # infrastructure decision.
+        ref_entry = zpercell.reference_entry(frozen_plan)
+        ref_ctx = _r55_percell_reference_ctx(cell_ctxs, ref_entry.cell_id)
+        ref_bundle = replace(
+            bundle,
+            cell_ctxs=[ref_ctx],
+            cell_specs=[
+                spec
+                for spec in bundle.cell_specs
+                if spec[0].cell_id == ref_entry.cell_id
+            ],
+            cell_tasks=[
+                task
+                for task in bundle.cell_tasks
+                if task[0].cell_id == ref_entry.cell_id
+            ],
+        )
+        # NEVER grow on resume: the reference scheduler ladder is capped at the
+        # frozen reference entry's own tile (a later shrink is legal).
+        _frozen_ref_cap = (
+            int(ref_entry.tile_px)
+            if max_gpu_tile is None
+            else min(int(max_gpu_tile), int(ref_entry.tile_px))
+        )
+        single = _r55_active_gpu_decide_single(
+            bundle=ref_bundle,
+            cell_ctxs=[ref_ctx],
+            canvas=canvas,
+            halo_px=halo_px,
+            cache_root=cache_root,
+            output_dir=output_dir,
+            frame_ids=frame_ids,
+            gpu_probe=gpu_probe,
+            readiness=readiness,
+            max_gpu_tile=_frozen_ref_cap,
+            gauge_restored=gauge_restored,
+            restored_gauge_resident_bytes=restored_gauge_resident_bytes,
+        )
+        if int(single.mapping["gpu_streaming_tile"]) > int(ref_entry.tile_px):
+            raise ValueError(
+                "frozen per-Cell reference tile "
+                f"{ref_entry.tile_px} was grown by the resumed scheduler "
+                f"({single.mapping['gpu_streaming_tile']})"
+            )
+        return _r55_attach_percell_decision(single, frozen_plan, bundle, cells)
+
+    # Build the scheduler infrastructure decision from the largest REAL patch
+    # Cell first, then refine the reference with the plan's own host maximum.
+    provisional = max(
+        cells,
+        key=lambda cell: (
+            int(cell.patch_area_px),
+            int(cell.n_contributors),
+            cell.cell_id,
+        ),
+    )
+
+    def _single_for(cell):
+        ctx = _r55_percell_reference_ctx(cell_ctxs, cell.cell_id)
+        ref_bundle = replace(
+            bundle,
+            cell_ctxs=[ctx],
+            cell_specs=[
+                spec
+                for spec in bundle.cell_specs
+                if spec[0].cell_id == cell.cell_id
+            ],
+            cell_tasks=[
+                task
+                for task in bundle.cell_tasks
+                if task[0].cell_id == cell.cell_id
+            ],
+        )
+        return _r55_active_gpu_decide_single(
+            bundle=ref_bundle,
+            cell_ctxs=[ctx],
+            canvas=canvas,
+            halo_px=halo_px,
+            cache_root=cache_root,
+            output_dir=output_dir,
+            frame_ids=frame_ids,
+            gpu_probe=gpu_probe,
+            readiness=readiness,
+            max_gpu_tile=max_gpu_tile,
+            gauge_restored=gauge_restored,
+            restored_gauge_resident_bytes=restored_gauge_resident_bytes,
+        )
+
+    single = _single_for(provisional)
+    prefetch = int(single.mapping["prefetch_units"])
+    plan = None
+    _owner_by_cell: dict[str, int] = {}
+    _resident_by_cell: dict[str, int] = {}
+    for _attempt in range(4):
+        # Q2: REAL per-Cell producer/cache owner and prefetch residency. K=1
+        # bounds the consumer, not the queued prefetched owners, so every Cell is
+        # priced from its own patch/depth facts (never a synthetic cross product).
+        _cache_workers = int(single.facts.get("cache_workers", 0) or 0)
+        _profile = str(
+            getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)
+        )
+        _owner_by_cell = {}
+        _resident_by_cell = {}
+        for _cell in cells:
+            _px = int(_cell.patch_area_px)
+            _cache_fp = int(zpar.cache_footprint_bytes(_px))
+            _owner_by_cell[_cell.cell_id] = int(
+                max(
+                    int(
+                        rcontract.cache_per_cell_bytes(
+                            rcontract.PROCESS_BASELINE_BYTES,
+                            _cache_workers,
+                            _cache_fp,
+                        )
+                    ),
+                    2 * _px * (3 * 4 + 1),
+                )
+            )
+            _unit_cache = int(
+                _r55_cache_unit_bytes(_px, int(_cell.n_contributors))
+            )
+            _resident_by_cell[_cell.cell_id] = int(
+                _r55_prefetch_resident_bytes(
+                    storage_profile=_profile,
+                    per_unit_cache_bytes=_unit_cache,
+                    worst_patch_px=_px,
+                    channels=3,
+                )
+            )
+        try:
+            plan = zpercell.build_percell_plan(
+                cells=cells,
+                shared_bytes=int(bundle.shared_bytes),
+                producer_owner_bytes=int(
+                    single.facts.get("concurrent_producer_bytes", 0) or 0
+                ),
+                prefetch_units=int(prefetch),
+                prefetch_resident_per_slot_bytes=int(
+                    single.facts.get("per_unit_prefetch_host", 0) or 0
+                ),
+                plan_budget_bytes=int(bundle.envelope.budget_bytes),
+                device_budget_bytes=int(single.gpu_device_budget_bytes),
+                selection_budget_bytes=int(single.gpu_selection_budget_bytes),
+                storage_profile=_profile,
+                max_gpu_tile=max_gpu_tile,
+                margin_num=int(
+                    single.facts.get("margin_num", renv.DEFAULT_MARGIN_NUM)
+                ),
+                margin_den=int(
+                    single.facts.get("margin_den", renv.DEFAULT_MARGIN_DEN)
+                ),
+                producer_owner_by_cell=_owner_by_cell,
+                prefetch_resident_by_cell=_resident_by_cell,
+            )
+        except ValueError as _plan_exc:
+            raise _R55GpuRefused(
+                zgr.REASON_REFUSE_HOST_RAM,
+                f"per-Cell GPU planning refused: {_plan_exc}",
+            ) from _plan_exc
+        # The reference Cell is the REAL Cell carrying the largest producer/
+        # prefetch owner facts; its run-wide cache/prefetch credit then covers
+        # every Cell without forming a fictitious (max_n, max_area) pair.
+        wanted_cell_id = max(
+            (cell.cell_id for cell in cells),
+            key=lambda cid: (
+                int(_owner_by_cell[cid]),
+                int(_resident_by_cell[cid]),
+                int(next(c.patch_area_px for c in cells if c.cell_id == cid)),
+                int(next(c.n_contributors for c in cells if c.cell_id == cid)),
+                cid,
+            ),
+        )
+        if wanted_cell_id == provisional.cell_id:
+            break
+        provisional = next(
+            cell for cell in cells if cell.cell_id == wanted_cell_id
+        )
+        single = _single_for(provisional)
+        prefetch = int(single.mapping["prefetch_units"])
+    else:
+        raise _R55GpuRefused(
+            zgr.REASON_REFUSE_HOST_RAM,
+            "per-Cell GPU planning did not converge on a real reference Cell",
+        )
+    return _r55_attach_percell_decision(single, plan, bundle, cells)
+
+
+def _r55_attach_percell_decision(single, plan, bundle, cells):
+    """Attach the per-Cell plan and widen the declared ladder to its union.
+
+    The scheduler decision itself is untouched; only the declared ladder used by
+    apply validation becomes the union of the REAL per-Cell ladders. No second
+    scheduler runs.
+    """
+    union = tuple(
+        sorted(
+            {int(t) for entry in plan.entries for t in entry.declared_ladder},
+            reverse=True,
+        )
+    )
+    gpu_context = replace(
+        single.gpu_context,
+        tile_ladder=union,
+    )
+    # Facts stay the reference decision's facts; the per-Cell admission uses
+    # the run-wide producer/prefetch credit carried by those same facts.
+    return replace(
+        single,
+        gpu_context=gpu_context,
+        percell_plan=plan,
+        percell_entries=tuple(plan.entries),
     )
 
 
@@ -13276,8 +13706,16 @@ def _r55_active_gpu_apply(
     plan_factor_num=None,
     plan_factor_den=None,
     plan_budget_bytes=None,
+    percell_tiles=None,
 ):
-    """Apply an EXACT active GPU mapping to the frozen bundle."""
+    """Apply an EXACT active GPU mapping to the frozen bundle.
+
+    ZM-GPU-PERCELL-PRODUCT: when ``decision.percell_entries`` is present every
+    Cell is priced at ITS OWN admitted tile (optionally overridden by a runtime
+    shrink through ``percell_tiles``); the envelope uses the MAXIMUM of those
+    exact per-Cell added bounds (K=1, baseline counted once). The historical
+    OFF path is unchanged.
+    """
     if mapping.get("backend") != renv.BACKEND_GPU:
         raise zsched.ActivePlanRejected(
             renv.REASON_UNKNOWN_BACKEND,
@@ -13307,6 +13745,11 @@ def _r55_active_gpu_apply(
             mapping=mapping,
         )
 
+    _percell_plan = getattr(decision, "percell_plan", None)
+    _percell_override = {
+        str(cid): int(t) for cid, t in (percell_tiles or {}).items()
+    }
+    _percell_added_by_cell: dict[str, int] = {}
     cell_specs = []
     cell_tasks = []
     for (cell, patch, mem, cache_dir, _i, _s, _g) in bundle.cell_specs:
@@ -13316,13 +13759,40 @@ def _r55_active_gpu_apply(
                 cell, patch, mem, cache_dir, None, 0, getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
             continue
         n = len(mem.patch_ids)
+        cell_tile = int(tile)
+        if _percell_plan is not None:
+            entry = _percell_plan.entry_for(cell.cell_id)
+            cell_tile = int(
+                _percell_override.get(str(cell.cell_id), entry.tile_px)
+            )
+            if cell_tile not in entry.declared_ladder:
+                raise zsched.ActivePlanRejected(
+                    renv.REASON_SHRINK_TILE,
+                    f"per-Cell tile {cell_tile} for {cell.cell_id} is outside "
+                    "its declared ladder",
+                    mapping=mapping,
+                )
+            _percell_added_by_cell[str(cell.cell_id)] = int(
+                entry.admitted_host_bound(cell_tile)
+            )
         # TOTAL per-cell estimate: an execution/manifest input (includes the
         # process baseline). It is NOT the scheduler's host increment.
         gpu_b = int(_profile_stream_bytes(
-            n, patch.patch_shape_hw, tile, getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
+            n, patch.patch_shape_hw, cell_tile, getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
         cell_specs.append((cell, patch, mem, cache_dir, None, 0, gpu_b))
         cell_tasks.append(_cell_task(
             cell, patch, mem, cache_dir, "stream", gpu_b, getattr(bundle, "storage_profile", _STACK_STORAGE_PROFILE)))
+    if _percell_plan is not None:
+        # Descriptive run-level tile: the largest tile any Cell actually uses.
+        try:
+            tile = max(
+                int(_percell_override.get(str(spec[0].cell_id),
+                    _percell_plan.entry_for(spec[0].cell_id).tile_px))
+                for spec in cell_specs
+                if spec[2].patch_ids
+            )
+        except ValueError:
+            tile = int(mapping["gpu_streaming_tile"])
 
     # R55-E11 rework-3: planning uses the ADDED stack bound (estimate minus
     # PROCESS_BASELINE) because ``shared_bytes`` already carries that baseline
@@ -13330,7 +13800,10 @@ def _r55_active_gpu_apply(
     # +356,515,840 B on the M106 witness). Keep the total for the execution
     # task above; use the authoritative added bound for every envelope / plan /
     # aggregate field that claims scheduler consistency.
-    added_per_cell_stack = _r55_gpu_added_host_bound(decision, tile)
+    if _percell_added_by_cell:
+        added_per_cell_stack = int(max(_percell_added_by_cell.values()))
+    else:
+        added_per_cell_stack = _r55_gpu_added_host_bound(decision, tile)
     per_cell_total = max(
         (int(t[5]) for t in cell_tasks if t[4] is not None), default=0
     )
@@ -13457,6 +13930,25 @@ def _r55_active_gpu_apply(
             "stage": str(stage),
             "phase": mapping["phase"],
             "gpu_streaming_tile": int(tile),
+            # Q3: OFF adds NO key (the historical payload stays byte-identical).
+            **(
+                {}
+                if _percell_plan is None
+                else {
+                    "percell_tiles": {
+                        str(spec[0].cell_id): int(
+                            _percell_override.get(
+                                str(spec[0].cell_id),
+                                _percell_plan.entry_for(
+                                    spec[0].cell_id
+                                ).tile_px,
+                            )
+                        )
+                        for spec in cell_specs
+                        if spec[2].patch_ids
+                    }
+                }
+            ),
             "units_in_flight": 1,
             "workers_per_unit": int(workers),
             "prefetch_units": int(prefetch),
@@ -16882,19 +17374,25 @@ def _r55_build_run_store_identity(
     )
 
 
-def _admission_from_identity(identity):
+def _admission_from_identity(identity, percell_plan=None):
     """The run's OWN frozen admission contract, taken from its validated identity.
 
     ZM-ZEGRID-ACTIVE-RESUME-PARITY: the effective backend and the ``tile_px``
     that backend executes ARE part of the stored science identity, so the
     durable admission contract is a projection of it — never a new derivation,
     never a guess. ``identity`` must already be a validated run identity.
+
+    ZM-GPU-PERCELL-PRODUCT: when the experimental per-Cell plan is active, its
+    complete strict extension is frozen HERE, before the first unit executes.
     """
     block = identity["science_contract"]["backend"]
     return zres.build_admission(
         backend=block["backend"],
         tile_px=block["tile_px"],
         parity_qualified=block["parity_qualified"],
+        percell_tiles=(
+            None if percell_plan is None else percell_plan.to_admission()
+        ),
     )
 
 
@@ -17335,6 +17833,10 @@ def _run_single(
     _gauge_counts_decoupling = _resolve_gauge_counts_decoupling(
         zconfig, scheduler_mode
     )
+    # ZM-GPU-PERCELL-PRODUCT: default-OFF experimental product option. This is
+    # the UI/config intent only; it becomes effective at the ACTIVE GPU decision
+    # (scheduler=active AND a GPU request). It never enables GPU by itself.
+    _gpu_percell_opt_in = _resolve_gpu_percell_tiles(zconfig)
     _gauge_credit_session = None
     _gauge_credit_plan_applied = False
     # G2b: run-scoped observability of the policy. Never a decision input; it is
@@ -17639,6 +18141,97 @@ def _run_single(
             "never overwritten (safety checkpoints stay enabled)",
             callback=progress_callback,
         )
+    # ZM-GPU-PERCELL-PRODUCT: a frozen store is never silently reinterpreted.
+    #  * frozen v2 (percell_tiles present) + current option OFF => explicit
+    #    refusal before any execution/write;
+    #  * frozen v2 + current option ON  => the frozen entries are HONOURED
+    #    verbatim (no recomputation, no growth);
+    #  * frozen v1 + current option ON  => the run stays LEGACY whole-run with
+    #    an explicit diagnostic (never a silent replan).
+    _frozen_percell_plan = None
+    if _frozen_admission is not None:
+        _frozen_pc_raw = _frozen_admission.get("percell_tiles")
+        if _frozen_pc_raw is not None:
+            if str(_frozen_admission.get("backend")) != "gpu":
+                raise RuntimeError(
+                    "resume refused: the frozen admission carries a per-Cell "
+                    "GPU plan with backend="
+                    f"{_frozen_admission.get('backend')!r}; refusing an "
+                    "incoherent frozen contract"
+                )
+            if not _gpu_percell_opt_in:
+                raise RuntimeError(
+                    "resume refused: this durable run was frozen with the "
+                    "experimental per-Cell GPU tile plan, but the current "
+                    "option 'zegrid_gpu_percell_tiles' is OFF. The frozen "
+                    "plan is never silently reinterpreted or replanned; turn "
+                    "the option ON to resume this run, or start a NEW run in a "
+                    "NEW output folder."
+                )
+            try:
+                _frozen_percell_plan = zpercell.plan_from_admission(
+                    _frozen_pc_raw
+                )
+            except ValueError as _pc_exc:
+                raise RuntimeError(
+                    "resume refused: the frozen per-Cell GPU plan is invalid "
+                    f"({_pc_exc}); no execution and no write was attempted"
+                ) from _pc_exc
+            _emit(
+                "ZeGrid: resume per-Cell GPU plan REUSED — "
+                f"{len(_frozen_percell_plan.entries)} frozen Cell entries, "
+                f"max_tile_px={_frozen_percell_plan.max_tile_px}, "
+                f"policy={_frozen_percell_plan.policy} (never recomputed)",
+                callback=progress_callback,
+            )
+            # A prior attempt may have SHRUNK a Cell at runtime. Its durable
+            # commit records the executed tile; cap the resumed Cell there so a
+            # shrink can never be undone by memory recovery.
+            if _resume_boot is not None:
+                _committed_tiles = zres.percell_committed_tiles(
+                    _resume_boot.store
+                )
+                _durable_shrink_caps = _read_percell_shrink_caps(
+                    _resume_boot.store.root,
+                    plan=_frozen_percell_plan,
+                    run_id=str(_resume_boot.store.run_id),
+                    expected_cell_ids=set(
+                        _resume_boot.state.get("expected_cell_ids") or ()
+                    ),
+                )
+                _all_caps = dict(_durable_shrink_caps)
+                for _cid, _tile in _committed_tiles.items():
+                    _all_caps[_cid] = min(
+                        int(_tile), int(_all_caps.get(_cid, _tile))
+                    )
+                if _all_caps:
+                    try:
+                        _frozen_percell_plan = _frozen_percell_plan.with_caps(
+                            _all_caps
+                        )
+                    except ValueError as _cap_exc:
+                        raise RuntimeError(
+                            "resume refused: a per-Cell GPU tile cap is invalid "
+                            f"({_cap_exc}); no execution and no write was "
+                            "attempted"
+                        ) from _cap_exc
+                    _emit(
+                        "ZeGrid: per-Cell shrink caps REUSED — "
+                        f"{len(_all_caps)} Cell(s) restart at their durable "
+                        "executed tile (never re-grow; includes pending Cells "
+                        "that had shrunk before a stop)",
+                        callback=progress_callback,
+                    )
+        elif _gpu_percell_opt_in:
+            _emit(
+                "ZeGrid: the experimental per-Cell GPU option is ON, but the "
+                "frozen run is a LEGACY whole-run admission (v1). Staying "
+                "legacy for this resume; no silent replan. Start a NEW run "
+                "to use per-Cell GPU tiles.",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            _gpu_percell_opt_in = False
     # ZM-ZEGRID-R37-D (F1): when a capture is requested, fail-closed invalidate the
     # fixed target in THIS run's actual output dir IMMEDIATELY at run start (before
     # descriptors/layout/gauge). Idempotent with the outer invalidation; protects
@@ -18379,6 +18972,15 @@ def _run_single(
         # The bundle consistency check below still fails closed the inverse
         # case (GPU-shaped bundle while the product backend is CPU).
         _r55_gpu_active_requested = bool(gpu_used)
+        # ZM-GPU-PERCELL-PRODUCT: relevant ONLY for the ACTIVE scheduler with a
+        # GPU request. A user GPU OFF always wins; the saved option is kept.
+        _r55_gpu_percell_enabled = bool(
+            _gpu_percell_opt_in
+            and scheduler_mode == zsched.MODE_ACTIVE
+            and _r55_gpu_active_requested
+        )
+        if _frozen_percell_plan is not None:
+            _r55_gpu_percell_enabled = True
         if bool(_initial_bundle.gpu_used) and not _r55_gpu_active_requested:
             # Fail closed on an INCONSISTENT bundle (GPU-shaped but the product
             # GPU backend is not selected): never silently execute it on CPU.
@@ -18436,6 +19038,8 @@ def _run_single(
                     restored_gauge_resident_bytes=(
                         _resume_gauge_resident_bytes
                     ),
+                    percell_enabled=_r55_gpu_percell_enabled,
+                    percell_frozen=_frozen_percell_plan,
                 )
                 _admitted = _r55_active_gpu_admit(
                     initial_bundle=initial_bundle,
@@ -22177,6 +22781,72 @@ def _run_single(
         tile_lock = threading.Lock()
         initial_tile = int(tile)
         initial_device_peak = int(device_peak)
+        # ZM-GPU-PERCELL-PRODUCT: one independent, monotonically shrinking tile
+        # state PER CELL. A deep Cell can never cap a later Cell, and a Cell can
+        # never grow on memory recovery or retry (its ladder is frozen).
+        _percell_states = {}
+        if tuple(getattr(gpu_decision, "percell_entries", ()) or ()):
+            for _entry in gpu_decision.percell_entries:
+                _percell_states[str(_entry.cell_id)] = {
+                    "entry": _entry,
+                    "tile": int(_entry.tile_px),
+                    "shrink_history": [],
+                    "units": [],
+                }
+
+        def _percell_context(state):
+            return _r55_percell_runtime_context(
+                gpu_decision, state["entry"]
+            )
+
+        # D3: durable shrink caps. A Cell that shrinks (even if still PENDING,
+        # before any commit) writes its effective cap BEFORE the unit executes.
+        _percell_caps_cache: dict[str, int] = {}
+        _percell_caps_store = _store_state.get("store")
+        _percell_plan_obj = getattr(gpu_decision, "percell_plan", None)
+        if (
+            _percell_states
+            and _percell_caps_store is not None
+            and _percell_plan_obj is not None
+        ):
+            _loaded_caps = _read_percell_shrink_caps(
+                _percell_caps_store.root,
+                plan=_percell_plan_obj,
+                run_id=str(_percell_caps_store.run_id),
+                expected_cell_ids=set(_percell_states),
+            )
+            _percell_caps_cache.update(_loaded_caps)
+            # Reloaded caps ALSO seed the runtime start tile (never grow).
+            for _cid, _cap in _loaded_caps.items():
+                _st = _percell_states.get(str(_cid))
+                if _st is not None:
+                    _st["tile"] = min(int(_st["tile"]), int(_cap))
+
+        def _persist_percell_shrink_cap(cell_id, tile_px):
+            if _percell_caps_store is None or _percell_plan_obj is None:
+                return
+            new_caps = zpercell.merge_shrink_cap(
+                _percell_plan_obj,
+                _percell_caps_cache,
+                cell_id,
+                tile_px,
+            )
+            if new_caps == _percell_caps_cache:
+                return
+            try:
+                _write_percell_shrink_caps(
+                    _percell_caps_store.root,
+                    plan=_percell_plan_obj,
+                    run_id=str(_percell_caps_store.run_id),
+                    caps=new_caps,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "per-Cell shrink persistence FAILED for Cell "
+                    f"{cell_id!r} tile {tile_px}: {type(exc).__name__}: {exc}"
+                ) from exc
+            _percell_caps_cache.clear()
+            _percell_caps_cache.update(new_caps)
 
         def _current_tile() -> int:
             with tile_lock:
@@ -22232,6 +22902,14 @@ def _run_single(
             # The lease follows the tile current at STAGING time. A later shrink
             # only ever lowers the executing peak, so a lease is a conservative
             # upper bound for the unit it covers (never an oversubscription).
+            if _percell_states:
+                _st = _percell_states.get(
+                    str(getattr(payload.get("cell"), "cell_id", ""))
+                )
+                if _st is not None:
+                    return int(
+                        _st["entry"].device_peak_for(int(_st["tile"]))
+                    )
             return int(_current_peak())
 
         def _release(payload):
@@ -22429,6 +23107,9 @@ def _run_single(
                 "factor_num": int(rcontract.ADMIT_FACTOR_NUM),
                 "factor_den": int(rcontract.ADMIT_FACTOR_DEN),
             }
+            _pcell_state = _percell_states.get(
+                str(getattr(payload.get("cell"), "cell_id", ""))
+            )
             try:
                 free_vram = int(zgr.read_vram_free_bytes(0))
             except zgr.InvalidVramObservation as exc:
@@ -22441,8 +23122,16 @@ def _run_single(
                     "attempted": True,
                     "completed": False,
                     "discarded": True,
-                    "tile_px": int(_current_tile()),
-                    "initial_tile_px": int(initial_tile),
+                    "tile_px": (
+                        int(_pcell_state["tile"])
+                        if _pcell_state is not None
+                        else int(_current_tile())
+                    ),
+                    "initial_tile_px": (
+                        int(_pcell_state["entry"].tile_px)
+                        if _pcell_state is not None
+                        else int(initial_tile)
+                    ),
                     "reason_code": str(zgr.REASON_GPU_OBSERVATION_FAILED),
                     "detail": f"fresh VRAM observation failed: {exc}",
                     "host": dict(host_facts),
@@ -22464,10 +23153,15 @@ def _run_single(
                     },
                 ) from exc
 
-            tile_now = _current_tile()
+            _unit_decision = gpu_decision
+            if _pcell_state is not None:
+                _unit_decision = _percell_context(_pcell_state)
+                tile_now = int(_pcell_state["tile"])
+            else:
+                tile_now = _current_tile()
             _run_mapping = _current_mapping()
             check = _r55_runtime_tile_check(
-                gpu_decision,
+                _unit_decision,
                 tile=int(tile_now),
                 free_bytes=int(free_vram),
                 host_budget_bytes=int(budget),
@@ -22479,7 +23173,7 @@ def _run_single(
             if not check["eligible"]:
                 # RUN-time pressure: walk the SAME admitted ladder strictly down.
                 shrink_attempts, chosen = _r55_runtime_tile_walk(
-                    gpu_decision,
+                    _unit_decision,
                     current_tile=int(tile_now),
                     free_bytes=int(free_vram),
                     host_budget_bytes=int(budget),
@@ -22497,7 +23191,11 @@ def _run_single(
                         "completed": False,
                         "discarded": True,
                         "tile_px": int(tile_now),
-                        "initial_tile_px": int(initial_tile),
+                        "initial_tile_px": (
+                        int(_pcell_state["entry"].tile_px)
+                        if _pcell_state is not None
+                        else int(initial_tile)
+                    ),
                         "reason_code": (
                             str(check["vram_reason_code"])
                             if not check["device_ok"]
@@ -22555,7 +23253,11 @@ def _run_single(
                         unit={
                             "unit_index": int(unit_index),
                             "tile_px": int(tile_now),
-                            "initial_tile_px": int(initial_tile),
+                            "initial_tile_px": (
+                        int(_pcell_state["entry"].tile_px)
+                        if _pcell_state is not None
+                        else int(initial_tile)
+                    ),
                         },
                         host_facts=host_facts,
                         device_snapshot=boundary.get("after"),
@@ -22582,91 +23284,139 @@ def _run_single(
                             "diagnostics_path": _refusal_path,
                         },
                     )
-                # Apply the shrink coherently: mapping -> bundle -> peak -> state.
-                # F1: derive the reduced rung from the CURRENT admitted
-                # candidate, preserving its reduced prefetch/workers/K.
-                probe = replace(_current_candidate(), tile_px=int(chosen))
-                materialized = _r55_gpu_candidate_lookup(gpu_decision, probe)
-                mapping_new = zsched.active_gpu_mapping_for_candidate(
-                    materialized,
-                    tile_ladder=tuple(
-                        int(t) for t in gpu_decision.gpu_context.tile_ladder
-                    ),
-                    workers_ladder=tuple(
-                        int(w) for w in zsched.WORKERS_LADDER
-                    ),
-                    prefetch_cap=int(_R55E2_PREFETCH_LADDER[-1]),
-                )
-                bundle_new = _r55_active_gpu_apply(
-                    gpu_bundle,
-                    mapping=mapping_new,
-                    decision=gpu_decision,
-                    stage="runtime_tile_shrink",
-                    plan_raw_available_bytes=int(raw),
-                    plan_factor_num=int(rcontract.ADMIT_FACTOR_NUM),
-                    plan_factor_den=int(rcontract.ADMIT_FACTOR_DEN),
-                    plan_budget_bytes=int(budget),
-                )
-                # ARCH REWORK-2: materialize the EFFECTIVE projection once, from
-                # the reduced mapping/bundle, BEFORE taking tile_lock. The old
-                # calls omitted ``prefetch_units`` and fell back to the PLAN
-                # p2, publishing +435 565 168 B of stale host accounting.
-                _shrink_prefetch = int(mapping_new["prefetch_units"])
-                _shrink_aggregate = int(
-                    _r55_gpu_host_aggregate_for_tile(
-                        gpu_decision,
-                        bundle_new,
+                if _pcell_state is not None:
+                    # Persist the cap BEFORE the unit executes (D3). A pending
+                    # Cell that never commits still restarts at its shrink.
+                    _persist_percell_shrink_cap(
+                        str(getattr(payload.get("cell"), "cell_id", "")),
                         int(chosen),
-                        prefetch_units=_shrink_prefetch,
                     )
-                )
-                with tile_lock:
-                    tile_state["tile"] = int(chosen)
-                    tile_state["device_peak"] = int(
-                        gpu_decision.device_peak_bytes_by_tile[int(chosen)]
+                    # Per-Cell shrink: ONLY this Cell moves, on ITS declared
+                    # ladder, and it can never grow later. The run-wide mapping
+                    # and every other Cell are untouched.
+                    with tile_lock:
+                        _prev_tile = int(_pcell_state["tile"])
+                        _pcell_state["tile"] = int(chosen)
+                        _pcell_state["shrink_history"].append(
+                            {
+                                "schema": _R55E11_TILE_RUNTIME_SCHEMA,
+                                "unit_index": int(unit_index),
+                                "cell_id": str(
+                                    getattr(payload.get("cell"), "cell_id", "")
+                                ),
+                                "from_tile_px": int(_prev_tile),
+                                "to_tile_px": int(chosen),
+                                "vram_free_bytes": int(free_vram),
+                                "vram_percent": int(vram_percent),
+                                "host_budget_bytes": int(budget),
+                                "prefetch_units": int(
+                                    _run_mapping["prefetch_units"]
+                                ),
+                                "attempts": [dict(a) for a in shrink_attempts],
+                            }
+                        )
+                    tile_now = int(chosen)
+                    action = "shrink"
+                    check = _r55_runtime_tile_check(
+                        _unit_decision,
+                        tile=int(tile_now),
+                        free_bytes=int(free_vram),
+                        host_budget_bytes=int(budget),
+                        bundle=_gpu_current_bundle(),
+                        prefetch_units=int(_run_mapping["prefetch_units"]),
                     )
-                    tile_state["mapping"] = dict(mapping_new)
-                    tile_state["candidate"] = materialized
-                    tile_state["bundle"] = bundle_new
-                    tile_state["attempts"].extend(
-                        [dict(a) for a in shrink_attempts]
+                    # Skip the run-wide candidate/mapping rebuild below.
+                    _pcell_skip_apply = True
+                else:
+                    _pcell_skip_apply = False
+                if not _pcell_skip_apply:
+                    # Apply the shrink coherently: mapping -> bundle -> peak -> state.
+                    # F1: derive the reduced rung from the CURRENT admitted
+                    # candidate, preserving its reduced prefetch/workers/K.
+                    probe = replace(_current_candidate(), tile_px=int(chosen))
+                    materialized = _r55_gpu_candidate_lookup(gpu_decision, probe)
+                    mapping_new = zsched.active_gpu_mapping_for_candidate(
+                        materialized,
+                        tile_ladder=tuple(
+                            int(t) for t in gpu_decision.gpu_context.tile_ladder
+                        ),
+                        workers_ladder=tuple(
+                            int(w) for w in zsched.WORKERS_LADDER
+                        ),
+                        prefetch_cap=int(_R55E2_PREFETCH_LADDER[-1]),
                     )
-                    tile_state["shrink_history"].append(
-                        {
-                            "schema": _R55E11_TILE_RUNTIME_SCHEMA,
-                            "unit_index": int(unit_index),
-                            "from_tile_px": int(tile_now),
-                            "to_tile_px": int(chosen),
-                            "from_device_peak_bytes": int(
-                                gpu_decision.device_peak_bytes_by_tile[
-                                    int(tile_now)
-                                ]
-                            ),
-                            "to_device_peak_bytes": int(
-                                gpu_decision.device_peak_bytes_by_tile[
-                                    int(chosen)
-                                ]
-                            ),
-                            "vram_free_bytes": int(free_vram),
-                            "vram_percent": int(vram_percent),
-                            "host_budget_bytes": int(budget),
-                            "host_aggregate_bytes": int(_shrink_aggregate),
-                            "prefetch_units": int(_shrink_prefetch),
-                            "attempts": [dict(a) for a in shrink_attempts],
-                        }
+                    bundle_new = _r55_active_gpu_apply(
+                        gpu_bundle,
+                        mapping=mapping_new,
+                        decision=gpu_decision,
+                        stage="runtime_tile_shrink",
+                        plan_raw_available_bytes=int(raw),
+                        plan_factor_num=int(rcontract.ADMIT_FACTOR_NUM),
+                        plan_factor_den=int(rcontract.ADMIT_FACTOR_DEN),
+                        plan_budget_bytes=int(budget),
                     )
-                tile_now = int(chosen)
-                action = "shrink"
-                check = _r55_runtime_tile_check(
-                    gpu_decision,
-                    tile=int(tile_now),
-                    free_bytes=int(free_vram),
-                    host_budget_bytes=int(budget),
-                    bundle=bundle_new,
-                    prefetch_units=int(_shrink_prefetch),
-                )
+                    # ARCH REWORK-2: materialize the EFFECTIVE projection once, from
+                    # the reduced mapping/bundle, BEFORE taking tile_lock. The old
+                    # calls omitted ``prefetch_units`` and fell back to the PLAN
+                    # p2, publishing +435 565 168 B of stale host accounting.
+                    _shrink_prefetch = int(mapping_new["prefetch_units"])
+                    _shrink_aggregate = int(
+                        _r55_gpu_host_aggregate_for_tile(
+                            gpu_decision,
+                            bundle_new,
+                            int(chosen),
+                            prefetch_units=_shrink_prefetch,
+                        )
+                    )
+                    with tile_lock:
+                        tile_state["tile"] = int(chosen)
+                        tile_state["device_peak"] = int(
+                            gpu_decision.device_peak_bytes_by_tile[int(chosen)]
+                        )
+                        tile_state["mapping"] = dict(mapping_new)
+                        tile_state["candidate"] = materialized
+                        tile_state["bundle"] = bundle_new
+                        tile_state["attempts"].extend(
+                            [dict(a) for a in shrink_attempts]
+                        )
+                        tile_state["shrink_history"].append(
+                            {
+                                "schema": _R55E11_TILE_RUNTIME_SCHEMA,
+                                "unit_index": int(unit_index),
+                                "from_tile_px": int(tile_now),
+                                "to_tile_px": int(chosen),
+                                "from_device_peak_bytes": int(
+                                    gpu_decision.device_peak_bytes_by_tile[
+                                        int(tile_now)
+                                    ]
+                                ),
+                                "to_device_peak_bytes": int(
+                                    gpu_decision.device_peak_bytes_by_tile[
+                                        int(chosen)
+                                    ]
+                                ),
+                                "vram_free_bytes": int(free_vram),
+                                "vram_percent": int(vram_percent),
+                                "host_budget_bytes": int(budget),
+                                "host_aggregate_bytes": int(_shrink_aggregate),
+                                "prefetch_units": int(_shrink_prefetch),
+                                "attempts": [dict(a) for a in shrink_attempts],
+                            }
+                        )
+                    tile_now = int(chosen)
+                    action = "shrink"
+                    check = _r55_runtime_tile_check(
+                        gpu_decision,
+                        tile=int(tile_now),
+                        free_bytes=int(free_vram),
+                        host_budget_bytes=int(budget),
+                        bundle=bundle_new,
+                        prefetch_units=int(_shrink_prefetch),
+                    )
 
-            peak_used = int(gpu_decision.device_peak_bytes_by_tile[int(tile_now)])
+            peak_used = int(
+                _unit_decision.device_peak_bytes_by_tile[int(tile_now)]
+            )
             reserved_peak = int(_device_bytes(payload))
             # Keep the per-cell record's bound truthful for the EXECUTED tile.
             try:
@@ -22689,7 +23439,11 @@ def _run_single(
                 "completed": False,
                 "discarded": False,
                 "tile_px": int(tile_now),
-                "initial_tile_px": int(initial_tile),
+                "initial_tile_px": (
+                    int(_pcell_state["entry"].tile_px)
+                    if _pcell_state is not None
+                    else int(initial_tile)
+                ),
                 "host": dict(host_facts),
                 "vram": {
                     "free_bytes": int(free_vram),
@@ -22730,6 +23484,8 @@ def _run_single(
                 )
             t_unit = time.perf_counter()
             payload["_stack_tile_size"] = int(tile_now)
+            if _pcell_state is not None:
+                payload["_percell"] = True
             # F2 (rework R1): carry the AUTHORITATIVE checkpoint facts for the
             # EFFECTIVE tile (post-shrink ``check``) into the consumer. The
             # executor admits the slot only when
@@ -22761,6 +23517,8 @@ def _run_single(
             record["stack_seconds"] = float(time.perf_counter() - t_unit)
             with tile_lock:
                 tile_state["units"].append(record)
+                if _pcell_state is not None:
+                    _pcell_state["units"].append(dict(record))
                 tile_state["last_host_facts"] = dict(host_facts)
             return result
             facts = _r55_run_checkpoint_sample(disk_root)
@@ -23211,6 +23969,19 @@ def _run_single(
         # final_execution describe what actually ran (never the initial tile).
         effective_tile = int(_current_tile())
         effective_peak = int(_current_peak())
+        _percell_effective_tiles = {}
+        if _percell_states:
+            _percell_effective_tiles = {
+                str(cid): int(state["tile"])
+                for cid, state in _percell_states.items()
+            }
+            effective_tile = int(max(_percell_effective_tiles.values()))
+            effective_peak = int(
+                max(
+                    state["entry"].device_peak_for(int(state["tile"]))
+                    for state in _percell_states.values()
+                )
+            )
         with tile_lock:
             effective_mapping = dict(tile_state["mapping"])
             host_facts_last = (
@@ -23223,15 +23994,19 @@ def _run_single(
         # mapping, envelope, execution and final hash must all describe the same
         # depth (an admission p2->p0 or a runtime tile shrink must survive here).
         effective_candidate = _current_candidate()
-        if int(effective_candidate.tile_px) != int(effective_tile):
+        if not _percell_states and int(effective_candidate.tile_px) != int(effective_tile):
             effective_candidate = _r55_gpu_candidate_lookup(
                 gpu_decision,
                 replace(
                     effective_candidate, tile_px=int(effective_tile)
                 ),
             )
+        if _percell_states:
+            effective_mapping = dict(effective_mapping)
+            effective_mapping["gpu_streaming_tile"] = int(effective_tile)
         if host_facts_last is not None and (
-            int(effective_tile) != initial_tile
+            bool(_percell_states)
+            or int(effective_tile) != initial_tile
             or effective_mapping != dict(gpu_mapping)
         ):
             effective_bundle = _r55_active_gpu_apply(
@@ -23245,6 +24020,9 @@ def _run_single(
                 plan_factor_num=int(host_facts_last["factor_num"]),
                 plan_factor_den=int(host_facts_last["factor_den"]),
                 plan_budget_bytes=int(host_facts_last["budget_bytes"]),
+                percell_tiles=(
+                    _percell_effective_tiles if _percell_states else None
+                ),
             )
         else:
             effective_bundle = _gpu_current_bundle()
@@ -23306,6 +24084,93 @@ def _run_single(
                     ),
                 }
             )
+        _percell_block = None
+        if _percell_states:
+            _plan = getattr(gpu_decision, "percell_plan", None)
+            _entries = []
+            for _cid in sorted(_percell_states):
+                _state = _percell_states[_cid]
+                _entry = _state["entry"]
+                _entries.append(
+                    {
+                        "cell_id": str(_cid),
+                        "n_contributors": int(_entry.n_contributors),
+                        "patch_hw": [
+                            int(_entry.patch_hw[0]),
+                            int(_entry.patch_hw[1]),
+                        ],
+                        "planned_tile_px": int(_entry.tile_px),
+                        "effective_tile_px": int(_state["tile"]),
+                        "declared_ladder": [
+                            int(t) for t in _entry.declared_ladder
+                        ],
+                        "reservation_bytes": int(_entry.reservation_bytes),
+                        "planned_host_aggregate_bytes": int(
+                            _entry.host_aggregate_bytes
+                        ),
+                        "device_peak_bytes_by_tile": {
+                            str(int(t)): int(b)
+                            for t, b in _entry.device_peak_bytes_by_tile
+                        },
+                        "host_bound_bytes_by_tile": {
+                            str(int(t)): int(b)
+                            for t, b in _entry.host_bound_by_tile
+                        },
+                        "shrink_history": [
+                            dict(item)
+                            for item in _state["shrink_history"]
+                        ],
+                        "executed_units": int(len(_state["units"])),
+                        "final_action": (
+                            "shrink"
+                            if _state["shrink_history"] else "planned"
+                        ),
+                        "reason_code": (
+                            "PERCELL_SHRINK"
+                            if _state["shrink_history"]
+                            else "PERCELL_OK"
+                        ),
+                    }
+                )
+            _percell_block = {
+                "schema": zpercell.PERCELL_SCHEMA,
+                "enabled": True,
+                "policy": (
+                    str(_plan.policy)
+                    if _plan is not None
+                    else zpercell.PERCELL_POLICY
+                ),
+                "device_budget_bytes": (
+                    int(_plan.device_budget_bytes)
+                    if _plan is not None else None
+                ),
+                "selection_budget_bytes": (
+                    int(_plan.selection_budget_bytes)
+                    if _plan is not None else None
+                ),
+                "host_budget_bytes": (
+                    int(_plan.host_budget_bytes)
+                    if _plan is not None else None
+                ),
+                "max_tile_px": (
+                    int(_plan.max_tile_px) if _plan is not None else None
+                ),
+                "storage_profile": (
+                    str(_plan.storage_profile)
+                    if _plan is not None else None
+                ),
+                "entries": _entries,
+                "units_in_flight": 1,
+                "second_scheduler": False,
+                "budget_relaxation": False,
+                "growth": "forbidden",
+                "labels": {
+                    "bounds": "MODEL (product arithmetic)",
+                    "tiles_and_shrinks": "MEASURED_RUN",
+                    "device_execution": "NOT_RUN on this host",
+                },
+                "performance_guarantee": False,
+            }
         meta = {
             "executor": "gpu_pipeline_single_owner",
             "wave_executors": ["gpu_pipeline"],
@@ -23323,6 +24188,10 @@ def _run_single(
             "heartbeat_modes": ["pipeline_boundary"],
             "heartbeat_interval_s": float(zrt.RUN_MAX_SAMPLE_INTERVAL_S),
             "pipeline": pipeline_telemetry,
+            **(
+                {} if _percell_block is None
+                else {"percell_tiles": _percell_block}
+            ),
         }
         run_block = {
             "schema": zrt.RUN_DECISION_SCHEMA,
@@ -23400,6 +24269,10 @@ def _run_single(
             },
             "checkpoints": deterministic_checkpoints,
             "units": units_block,
+            **(
+                {} if _percell_block is None
+                else {"percell_tiles": _percell_block}
+            ),
             "initial_execution": _r55_active_execution(
                 gpu_bundle, gpu_mapping
             ),
@@ -24169,7 +25042,14 @@ def _run_single(
                     # so a restart reuses it instead of re-deriving it from the
                     # current free RAM. Written ONCE here from the validated
                     # identity, preserved verbatim by every later state rewrite.
-                    admission=_admission_from_identity(_store_identity),
+                    admission=_admission_from_identity(
+                        _store_identity,
+                        percell_plan=getattr(
+                            _r55_active_gpu_decision,
+                            "percell_plan",
+                            None,
+                        ),
+                    ),
                 )
                 _store_state["state_path"] = str(
                     zres.state_path(_store.root)
@@ -26101,6 +26981,35 @@ def _run_single(
                 _r55_scheduler_block["gpu_fallback"] = dict(
                     _r55_gpu_fallback_reason
                 )
+            # ZM-GPU-PERCELL-PRODUCT: the automatic manifest publishes the
+            # effective option state, every Cell's planned/effective tile, its
+            # exact model bounds, and every shrink/refusal reason.
+            _pc_block = (
+                (_r55_run_block or {}).get("percell_tiles")
+                if isinstance(_r55_run_block, dict)
+                else None
+            )
+            if _pc_block is None and _r55_active_gpu_decision is not None:
+                _pc_plan = getattr(
+                    _r55_active_gpu_decision, "percell_plan", None
+                )
+                if _pc_plan is not None:
+                    _pc_block = {
+                        "schema": zpercell.PERCELL_SCHEMA,
+                        "enabled": True,
+                        "policy": str(_pc_plan.policy),
+                        "max_tile_px": int(_pc_plan.max_tile_px),
+                        "entries": [
+                            _e.to_dict() for _e in _pc_plan.entries
+                        ],
+                        "labels": {
+                            "bounds": "MODEL (product arithmetic)",
+                            "device_execution": "NOT_RUN on this host",
+                        },
+                        "performance_guarantee": False,
+                    }
+            if _pc_block is not None:
+                _r55_scheduler_block["percell_tiles"] = dict(_pc_block)
 
         # R55-C rework-2: the observe block was built from the SELECTED backend.
         # Reconcile its nested readiness provenance with the backend that actually

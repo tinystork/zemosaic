@@ -313,6 +313,11 @@ class _Bundle:
     gpu_streaming_host_peak_bytes: int = 0
     gpu_used: bool = False
     gpu_pre_execution_fallback: object = None
+    # Product fields written/read by ``_r55_active_gpu_apply``; the stub must
+    # mirror the real ``ExecutionBundle`` contract (never a weaker shape).
+    gpu_parity_qualified: bool = False
+    gauge_counts_workers: object = None
+    gauge_counts_footprint_bytes: object = None
     cell_tasks: list = field(default_factory=list)
     plan: dict = field(default_factory=dict)
     chosen_mode: str = "stream"

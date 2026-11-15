@@ -201,6 +201,12 @@ DEFAULT_CONFIG = {
     # 15 % margin (Fc <= Fp; the gauge phase is priced max(Nc*Fc, Np*Fp)).
     # False keeps the historical single-worker-count behaviour byte for byte.
     "zegrid_gauge_counts_decoupling": True,
+    # ZM-GPU-PERCELL-PRODUCT: EXPERIMENTAL, DEFAULT OFF. When ON and the run is
+    # ZeGrid ACTIVE on GPU, each ACTIVE Cell is planned on its OWN GPU ladder and
+    # starts at its own admitted tile (shrink-only per Cell). OFF keeps the
+    # historical whole-run plan byte for byte. A user GPU OFF always wins; the
+    # platform/GPU no-op does not erase this persisted choice.
+    "zegrid_gpu_percell_tiles": False,
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
@@ -539,6 +545,9 @@ ZEGRID_RUN_POLICY_KEYS = (
     "zegrid_gauge_memory_policy",
     # ZM-GAUGE-COUNTS-DECOUPLING: strict counts/pairs worker decoupling policy.
     "zegrid_gauge_counts_decoupling",
+    # ZM-GPU-PERCELL-PRODUCT: experimental per-Cell GPU tile planning (default
+    # OFF). Strict boolean: a non-boolean is refused, never coerced.
+    "zegrid_gpu_percell_tiles",
 )
 
 _ZEGRID_GAUGE_MODES = ("auto", "global", "per_cell")
@@ -686,6 +695,13 @@ def validate_zegrid_run_policy(config: Any) -> dict:
             f"{type(counts_decoupling_raw).__name__}={counts_decoupling_raw!r}"
         )
 
+    gpu_percell_raw = _policy_value(config, "zegrid_gpu_percell_tiles")
+    if not isinstance(gpu_percell_raw, bool):
+        raise ValueError(
+            "zegrid_gpu_percell_tiles must be a boolean, got "
+            f"{type(gpu_percell_raw).__name__}={gpu_percell_raw!r}"
+        )
+
     return {
         "zegrid_resource_recovery_enabled": enabled,
         "zegrid_resource_recovery_deadline_s": deadline,
@@ -696,6 +712,7 @@ def validate_zegrid_run_policy(config: Any) -> dict:
         "zegrid_stack_phase_profiling": profiling_raw,
         "zegrid_gauge_memory_policy": gauge_memory_policy,
         "zegrid_gauge_counts_decoupling": counts_decoupling_raw,
+        "zegrid_gpu_percell_tiles": gpu_percell_raw,
     }
 
 

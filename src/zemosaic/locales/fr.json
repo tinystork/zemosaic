@@ -1035,5 +1035,7 @@
   "qt_zegrid_resume_staging_recovery": "Staging de plantage du même run détecté (sans CURRENT.json) : reprise. Le moteur vérifie l’identité/les commits et publie ; les octets préparés ne sont pas considérés comme complets.",
   "qt_zegrid_resume_pre_marker_residue": "Résidu pré-marker vide du même run détecté ({generations}, sans CURRENT.json) : reprise. Il n’est jamais considéré comme une publication complète ; rien n’est supprimé ni modifié, et le moteur publie une NOUVELLE génération.",
   "qt_zegrid_resume_staging_refused": "Aucune publication vérifiée n’existe pour le run sélectionné, et le staging du même run ne peut pas être prouvé sûr ({reason}). Rien n’a été modifié.",
-  "qt_zegrid_resume_publication_ownership": "La racine des publications contient du contenu qui n’appartient pas au run sélectionné ({reason}). Choisissez un autre dossier de sortie ; rien n’a été modifié."
+  "qt_zegrid_resume_publication_ownership": "La racine des publications contient du contenu qui n’appartient pas au run sélectionné ({reason}). Choisissez un autre dossier de sortie ; rien n’a été modifié.",
+  "qt_field_zegrid_gpu_percell_label": "Tuiles GPU adaptatives par cellule — expérimental",
+  "qt_field_zegrid_gpu_percell_tip": "Expérimental et désactivé par défaut. Activé sur un run ZeGrid ACTIVE avec GPU, chaque cellule est planifiée sur sa propre échelle de tuiles GPU et démarre à sa propre tuile admise en mémoire ; une cellule ne peut que rétrécir pendant le run, jamais grandir. Désactivé, le plan GPU global historique reste inchangé. La science, la géométrie, le halo, la gauge et les sorties ne changent pas ; l’option est ignorée si le GPU est désactivé ou si l’ordonnanceur n’est pas Active."
 }

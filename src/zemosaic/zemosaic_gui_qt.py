@@ -138,6 +138,8 @@ _ZEGRID_POLICY_VALID_DEFAULTS = {
     "zegrid_stack_phase_profiling": False,
     # ZM-GAUGE-COUNTS-DECOUPLING: default ON since beta 5.1.4, no GUI control.
     "zegrid_gauge_counts_decoupling": True,
+    # ZM-GPU-PERCELL-PRODUCT: experimental, default OFF.
+    "zegrid_gpu_percell_tiles": False,
 }
 
 # ZM-GAUGE-SWAP-G2b: the two policy tokens the checkbox maps to. The engine
@@ -2188,6 +2190,30 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._zegrid_recovery_deadline_label = deadline_label
         self._zegrid_recovery_deadline_edit = deadline_edit
 
+        # ZM-GPU-PERCELL-PRODUCT: EXPERIMENTAL, default OFF. Relevant only for
+        # ZeGrid ACTIVE with GPU. A user GPU OFF always wins (the control is
+        # disabled), and disabling never erases the saved choice.
+        gpu_percell = QCheckBox(
+            self._tr(
+                "qt_field_zegrid_gpu_percell_label",
+                "Adaptive GPU tiles per Cell — experimental",
+            )
+        )
+        gpu_percell.setToolTip(
+            self._tr(
+                "qt_field_zegrid_gpu_percell_tip",
+                "Experimental and OFF by default. When enabled on a ZeGrid "
+                "ACTIVE run with GPU, every Cell is planned on its own GPU "
+                "tile ladder and starts at its own memory-admitted tile; a "
+                "Cell may only shrink during the run, never grow. OFF keeps "
+                "the historical whole-run GPU plan unchanged. It does not "
+                "change the science, geometry, halo, gauge or outputs; it is "
+                "ignored when GPU is OFF or the scheduler is not Active.",
+            )
+        )
+        layout.addRow(gpu_percell)
+        self._zegrid_gpu_percell_checkbox = gpu_percell
+
         budget_label = QLabel(
             self._tr(
                 "qt_field_zegrid_store_budget_label",
@@ -2589,6 +2615,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": save_checkpoints,
             "type": bool,
         }
+        self._config_fields["zegrid_gpu_percell_tiles"] = {
+            "kind": "checkbox",
+            "widget": gpu_percell,
+            "type": bool,
+        }
         self._config_fields["zegrid_durable_store_dir"] = {
             "kind": "line_edit",
             "widget": store_edit,
@@ -2615,6 +2646,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         }
 
         recovery.toggled.connect(self._on_zegrid_recovery_toggled)  # type: ignore[arg-type]
+        gpu_percell.toggled.connect(
+            lambda _checked=False: self._sync_config_key_from_widget(
+                "zegrid_gpu_percell_tiles"
+            )
+        )
         deadline_edit.textEdited.connect(
             lambda _text=None: self._on_zegrid_policy_text_edited(
                 "zegrid_resource_recovery_deadline_s", user_edit=True
@@ -3388,6 +3424,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
             finally:
                 save_checkbox.blockSignals(False)
 
+        percell_raw = self.config.get("zegrid_gpu_percell_tiles", False)
+        if not isinstance(percell_raw, bool):
+            percell_raw = False
+            invalid["zegrid_gpu_percell_tiles"] = True
+        percell_checkbox = getattr(self, "_zegrid_gpu_percell_checkbox", None)
+        if percell_checkbox is not None:
+            percell_checkbox.blockSignals(True)
+            try:
+                percell_checkbox.setChecked(bool(percell_raw))
+            finally:
+                percell_checkbox.blockSignals(False)
+
         store_dir_raw = self.config.get("zegrid_durable_store_dir")
         store_edit = getattr(self, "_zegrid_checkpoint_store_edit", None)
         if store_edit is not None:
@@ -3698,6 +3746,28 @@ class ZeMosaicQtMainWindow(QMainWindow):
             )
         return None
 
+    def _zegrid_gpu_percell_relevant(self) -> bool:
+        """True only where the option can take effect (ZeGrid ACTIVE + GPU)."""
+        try:
+            if self._selected_processing_mode() != "zegrid":
+                return False
+            raw_sched = self.config.get(
+                "zegrid_scheduler_mode", zsched.DEFAULT_MODE
+            )
+            if str(raw_sched) != str(zsched.MODE_ACTIVE):
+                return False
+            gpu_raw = self.config.get("use_gpu_phase5")
+            if not isinstance(gpu_raw, bool):
+                # Legacy aliases are already normalized into the config by the
+                # loader; an absent canonical key is conservatively GPU ON.
+                for key in ("use_gpu_grid", "stack_use_gpu", "use_gpu_stack"):
+                    if isinstance(self.config.get(key), bool):
+                        gpu_raw = self.config.get(key)
+                        break
+            return bool(gpu_raw) if isinstance(gpu_raw, bool) else True
+        except Exception:
+            return False
+
     def _apply_zegrid_policy_control_state(self, running: bool | None = None) -> None:
         """Disable the policy controls outside ZeGrid / while running.
 
@@ -3733,6 +3803,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         ):
             if widget is not None:
                 widget.setEnabled(enabled)
+        percell_box = getattr(self, "_zegrid_gpu_percell_checkbox", None)
+        if percell_box is not None:
+            # Relevant only for ZeGrid ACTIVE + GPU. Disabling keeps the saved
+            # value untouched (a later GPU/Active launch restores it).
+            percell_box.setEnabled(bool(enabled and self._zegrid_gpu_percell_relevant()))
 
     def _validate_zegrid_policy_for_start(self) -> bool:
         """Strictly validate the six keys; block only an effective ZeGrid run.

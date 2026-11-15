@@ -30987,6 +30987,11 @@ _ZEGRID_POLICY_TRANSPORT_KEYS = (
     "zegrid_sip_mode",
     # ZM-GAUGE-SWAP-G2b: execution-only gauge memory policy (closed enum).
     "zegrid_gauge_memory_policy",
+    # ZM-STACK-INSTRUMENTATION + ZM-GAUGE-COUNTS-DECOUPLING + ZM-GPU-PERCELL:
+    # the remaining declared run-policy keys cross the SAME boundary.
+    "zegrid_stack_phase_profiling",
+    "zegrid_gauge_counts_decoupling",
+    "zegrid_gpu_percell_tiles",
 )
 
 
@@ -31137,6 +31142,13 @@ def run_hierarchical_mosaic(
     # ZM-GAUGE-SWAP-G2b: execution-only gauge memory policy (closed enum,
     # default ``ram_only``). Same absence semantics as the six policy keys.
     zegrid_gauge_memory_policy: Any = _ZEGRID_POLICY_UNSET,
+    # ZM-STACK-INSTRUMENTATION / ZM-GAUGE-COUNTS-DECOUPLING: declared policy
+    # keys with the same absence semantics.
+    zegrid_stack_phase_profiling: Any = _ZEGRID_POLICY_UNSET,
+    zegrid_gauge_counts_decoupling: Any = _ZEGRID_POLICY_UNSET,
+    # ZM-GPU-PERCELL-PRODUCT: EXPERIMENTAL, default OFF. Absent keeps the
+    # persisted config value; the engine ANDs it with ACTIVE + GPU.
+    zegrid_gpu_percell_tiles: Any = _ZEGRID_POLICY_UNSET,
     # ZM-ZEGRID-M6-QT-STOP-RESUME: explicit GUI -> worker transport of the
     # durable resume settings. Same absence semantics as the six policy keys:
     # absent keeps the persisted config, an explicit value wins. The engine
@@ -31231,6 +31243,9 @@ def run_hierarchical_mosaic(
         "zegrid_layout": zegrid_layout,
         "zegrid_sip_mode": zegrid_sip_mode,
         "zegrid_gauge_memory_policy": zegrid_gauge_memory_policy,
+        "zegrid_stack_phase_profiling": zegrid_stack_phase_profiling,
+        "zegrid_gauge_counts_decoupling": zegrid_gauge_counts_decoupling,
+        "zegrid_gpu_percell_tiles": zegrid_gpu_percell_tiles,
     }
     _zegrid_durable_transport = {
         "zegrid_durable_store_dir": zegrid_durable_store_dir,

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import run_store as zrs
+from . import percell_tile as zpercell
 
 RESUME_MODE_AUTO = "auto"
 RESUME_MODE_NEVER = "never"
@@ -46,6 +47,9 @@ RESUME_STATE_FILENAME = "state.json"
 # chosen tile between two launches of the SAME run).
 ADMISSION_SCHEMA = "zegrid-run-admission-contract-v1"
 ADMISSION_VERSION = "1"
+#: Version 2 is used ONLY when the optional experimental ``percell_tiles``
+#: extension is present. A v1 store keeps its exact old reader behaviour.
+ADMISSION_VERSION_PERCELL = "2"
 ADMISSION_BACKENDS = ("cpu", "gpu")
 ADMISSION_REMEDY = (
     "free enough memory so the frozen tile fits on this host again, or start "
@@ -475,16 +479,27 @@ def validate_admission(admission: Any) -> dict:
     _strict_keys(
         admission, "admission",
         ("schema", "schema_version", "backend", "tile_px", "parity_qualified"),
-        ("working_set",),
+        ("working_set", "percell_tiles"),
     )
     if admission["schema"] != ADMISSION_SCHEMA:
         raise ResumeStateError(
             f"admission schema {admission['schema']!r} != {ADMISSION_SCHEMA!r}"
         )
-    if str(admission["schema_version"]) != ADMISSION_VERSION:
+    _has_percell = "percell_tiles" in admission
+    _allowed_versions = (
+        (ADMISSION_VERSION, ADMISSION_VERSION_PERCELL)
+        if _has_percell
+        else (ADMISSION_VERSION,)
+    )
+    if str(admission["schema_version"]) not in _allowed_versions:
         raise ResumeStateError(
             f"admission version {admission['schema_version']!r} is not "
-            f"supported ({ADMISSION_VERSION})"
+            f"supported ({_allowed_versions})"
+        )
+    if _has_percell and str(admission["schema_version"]) != ADMISSION_VERSION_PERCELL:
+        raise ResumeStateError(
+            "admission.percell_tiles requires schema_version "
+            f"{ADMISSION_VERSION_PERCELL!r}"
         )
     backend = admission["backend"]
     if not isinstance(backend, str) or backend not in ADMISSION_BACKENDS:
@@ -531,13 +546,32 @@ def validate_admission(admission: Any) -> dict:
             "tile_px": int(ws_tile),
             "column_batch": (None if ws_batch is None else int(ws_batch)),
         }
+    norm_percell = None
+    if _has_percell:
+        if str(backend) != "gpu":
+            raise ResumeStateError(
+                "admission.percell_tiles is a GPU-only extension but "
+                f"admission.backend is {backend!r}"
+            )
+        try:
+            norm_percell = zpercell.plan_from_admission(
+                admission["percell_tiles"]
+            ).to_admission()
+        except ValueError as exc:
+            raise ResumeStateError(
+                f"admission.percell_tiles is invalid: {exc}"
+            ) from exc
     return {
         "schema": ADMISSION_SCHEMA,
-        "schema_version": ADMISSION_VERSION,
+        "schema_version": (
+            ADMISSION_VERSION_PERCELL if norm_percell is not None
+            else ADMISSION_VERSION
+        ),
         "backend": str(backend),
         "tile_px": int(tile_px),
         "parity_qualified": bool(parity),
         **({} if norm_ws is None else {"working_set": norm_ws}),
+        **({} if norm_percell is None else {"percell_tiles": norm_percell}),
     }
 
 
@@ -757,17 +791,26 @@ def build_admission(
     tile_px: Any,
     parity_qualified: Any,
     working_set: Any = None,
+    percell_tiles: Any = None,
 ) -> dict:
     """Build and validate the frozen admission contract (never fabricated)."""
+    if percell_tiles is not None and isinstance(percell_tiles, Mapping):
+        percell_tiles = dict(percell_tiles)
     raw = {
         "schema": ADMISSION_SCHEMA,
-        "schema_version": ADMISSION_VERSION,
+        "schema_version": (
+            ADMISSION_VERSION_PERCELL
+            if percell_tiles is not None
+            else ADMISSION_VERSION
+        ),
         "backend": backend,
         "tile_px": tile_px,
         "parity_qualified": parity_qualified,
     }
     if working_set is not None:
         raw["working_set"] = working_set
+    if percell_tiles is not None:
+        raw["percell_tiles"] = percell_tiles
     return validate_admission(raw)
 
 
@@ -1409,6 +1452,9 @@ def attach_working_set(
         tile_px=admission["tile_px"],
         parity_qualified=admission["parity_qualified"],
         working_set=working_set,
+        # ZM-GPU-PERCELL-PRODUCT: the optional per-Cell extension is part of the
+        # FROZEN admission; attaching the working-set class never drops it.
+        percell_tiles=admission.get("percell_tiles"),
     )["working_set"]
     existing = admission.get("working_set")
     if existing is not None:
@@ -1424,6 +1470,7 @@ def attach_working_set(
         tile_px=admission["tile_px"],
         parity_qualified=admission["parity_qualified"],
         working_set=candidate,
+        percell_tiles=admission.get("percell_tiles"),
     )
     return write_state(
         run_root,
@@ -1474,6 +1521,38 @@ def update_policy(
         # ... neither is the explicit column-batch shrink audit trail.
         column_batch_transitions=state.get("column_batch_transitions"),
     )
+
+
+def percell_committed_tiles(store) -> dict[str, int]:
+    """The ACTUAL per-Cell GPU tile of every durable commit (shrink-only cap).
+
+    A previous attempt may have SHRUNK a Cell at runtime. The durable commit
+    record carries the executed tile; a later resume must never re-grow that
+    Cell. Multiple attempts keep the SMALLEST recorded tile (the strictest
+    shrink). Missing/old records simply do not cap (legacy stores untouched).
+    """
+    caps: dict[str, int] = {}
+    try:
+        records = store.iter_commit_records()
+    except Exception:
+        return caps
+    for record in records:
+        try:
+            manifest = getattr(record, "manifest", None) or {}
+            meta = manifest.get("payload_meta") or {}
+            row = meta.get("record") or {}
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("percell_tile_px")
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+                continue
+            cid = str(getattr(record, "cell_id", ""))
+            if not cid:
+                continue
+            caps[cid] = min(int(raw), caps.get(cid, int(raw)))
+        except Exception:
+            continue
+    return caps
 
 
 def policy_from_snapshot(snapshot: Mapping[str, Any]) -> dict:
