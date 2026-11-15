@@ -119,6 +119,8 @@ except Exception:  # pragma: no cover - defensive
         "zegrid_layout",
         "zegrid_sip_mode",
         "zegrid_gauge_memory_policy",
+        "zegrid_stack_phase_profiling",
+        "zegrid_gauge_counts_decoupling",
     )
 
 _ZEGRID_POLICY_VALID_DEFAULTS = {
@@ -130,6 +132,12 @@ _ZEGRID_POLICY_VALID_DEFAULTS = {
     "zegrid_sip_mode": "keep",
     # ZM-GAUGE-SWAP-G2b: closed enum, default RAM-only.
     "zegrid_gauge_memory_policy": "ram_only",
+    # ZM-STACK-INSTRUMENTATION: boolean, historical default OFF. Missing here
+    # made the strict-policy RECOVERY path fail on a sanitised ``None`` (a
+    # pre-existing debt); declared so recovery is testable again.
+    "zegrid_stack_phase_profiling": False,
+    # ZM-GAUGE-COUNTS-DECOUPLING: default ON since beta 5.1.4, no GUI control.
+    "zegrid_gauge_counts_decoupling": True,
 }
 
 # ZM-GAUGE-SWAP-G2b: the two policy tokens the checkbox maps to. The engine

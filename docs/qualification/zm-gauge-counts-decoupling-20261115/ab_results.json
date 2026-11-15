@@ -1,0 +1,207 @@
+{
+  "arms": {
+    "off_w1": {
+      "children_cpu_s_median": 0.0,
+      "coefficients_sha256": "34f116bd6d0fc1292bcbd553f98f6653e4cf310267e341689862b96e0a4341a5",
+      "counts_executor": "serial",
+      "counts_seconds_median": 7.446181699997396,
+      "counts_worker_field": null,
+      "counts_workers": null,
+      "exclusions": [],
+      "fallback": false,
+      "ids": [
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230047.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230107.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230149.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230231.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230252.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230334.fit"
+      ],
+      "memory": {
+        "canvas_px": 2776080,
+        "note": "R32a keeps the reference frame as ONE full-canvas float32 plane (+ bool support) in RAM (see R32b for the tiled/bounded reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the sum of worker peaks.",
+        "peak_rss_kib_end": 635128,
+        "peak_rss_kib_start": 175996,
+        "reference_plane_canvas_px": 2776080,
+        "stage_peak_rss_kib": {
+          "after_counts": 502456,
+          "after_pairs": 635128,
+          "after_reference": 502456
+        },
+        "worker_rss_kib_max": 635128
+      },
+      "norm_active_sha256": "dfea2964b5deedea7b1ef077de529c3959e6788bdbb3441e70c77a1ae875bb48",
+      "pairs_executor": "serial",
+      "pairs_seconds_median": 14.499785460997373,
+      "pairs_worker_field": null,
+      "parent_cpu_s_median": 24.372443999999998,
+      "payload_bit_equal_to_off": true,
+      "reference_index": 1,
+      "reps": 2,
+      "wall_s_median": 24.047149994999927,
+      "weight_active_sha256": "dfea2964b5deedea7b1ef077de529c3959e6788bdbb3441e70c77a1ae875bb48",
+      "weights_sha256": "d9eeaed3af23023fe756ec201060f7ba9510bf518669062c191a6616be86ed75",
+      "workers": 1
+    },
+    "on_nc2_pairs2": {
+      "children_cpu_s_median": 30.117187,
+      "coefficients_sha256": "34f116bd6d0fc1292bcbd553f98f6653e4cf310267e341689862b96e0a4341a5",
+      "counts_executor": "process",
+      "counts_seconds_median": 5.533594656997593,
+      "counts_worker_field": 2,
+      "counts_workers": 2,
+      "exclusions": [],
+      "fallback": false,
+      "ids": [
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230047.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230107.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230149.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230231.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230252.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230334.fit"
+      ],
+      "memory": {
+        "canvas_px": 2776080,
+        "note": "R32a keeps the reference frame as ONE full-canvas float32 plane (+ bool support) in RAM (see R32b for the tiled/bounded reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the sum of worker peaks.",
+        "peak_rss_kib_end": 637324,
+        "peak_rss_kib_start": 637324,
+        "reference_plane_canvas_px": 2776080,
+        "stage_peak_rss_kib": {
+          "after_counts": 637324,
+          "after_pairs": 637324,
+          "after_reference": 637324
+        },
+        "worker_rss_kib_max": 590452
+      },
+      "norm_active_sha256": "dfea2964b5deedea7b1ef077de529c3959e6788bdbb3441e70c77a1ae875bb48",
+      "pairs_executor": "process",
+      "pairs_seconds_median": 10.943715966997843,
+      "pairs_worker_field": null,
+      "parent_cpu_s_median": 2.1541525000000092,
+      "payload_bit_equal_to_off": true,
+      "reference_index": 1,
+      "reps": 2,
+      "wall_s_median": 18.604792623998947,
+      "weight_active_sha256": "dfea2964b5deedea7b1ef077de529c3959e6788bdbb3441e70c77a1ae875bb48",
+      "weights_sha256": "d9eeaed3af23023fe756ec201060f7ba9510bf518669062c191a6616be86ed75",
+      "workers": 2
+    },
+    "on_nc2_w1": {
+      "children_cpu_s_median": 11.262269499999999,
+      "coefficients_sha256": "34f116bd6d0fc1292bcbd553f98f6653e4cf310267e341689862b96e0a4341a5",
+      "counts_executor": "process",
+      "counts_seconds_median": 5.788843490503496,
+      "counts_worker_field": 2,
+      "counts_workers": 2,
+      "exclusions": [],
+      "fallback": false,
+      "ids": [
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230047.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230107.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230149.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230231.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230252.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230334.fit"
+      ],
+      "memory": {
+        "canvas_px": 2776080,
+        "note": "R32a keeps the reference frame as ONE full-canvas float32 plane (+ bool support) in RAM (see R32b for the tiled/bounded reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the sum of worker peaks.",
+        "peak_rss_kib_end": 635380,
+        "peak_rss_kib_start": 635128,
+        "reference_plane_canvas_px": 2776080,
+        "stage_peak_rss_kib": {
+          "after_counts": 635128,
+          "after_pairs": 635380,
+          "after_reference": 635128
+        },
+        "worker_rss_kib_max": 635380
+      },
+      "norm_active_sha256": "dfea2964b5deedea7b1ef077de529c3959e6788bdbb3441e70c77a1ae875bb48",
+      "pairs_executor": "serial",
+      "pairs_seconds_median": 14.401359351497376,
+      "pairs_worker_field": null,
+      "parent_cpu_s_median": 16.68665,
+      "payload_bit_equal_to_off": true,
+      "reference_index": 1,
+      "reps": 2,
+      "wall_s_median": 22.311311581506743,
+      "weight_active_sha256": "dfea2964b5deedea7b1ef077de529c3959e6788bdbb3441e70c77a1ae875bb48",
+      "weights_sha256": "d9eeaed3af23023fe756ec201060f7ba9510bf518669062c191a6616be86ed75",
+      "workers": 1
+    },
+    "on_nc4_w1": {
+      "children_cpu_s_median": 16.422297,
+      "coefficients_sha256": "34f116bd6d0fc1292bcbd553f98f6653e4cf310267e341689862b96e0a4341a5",
+      "counts_executor": "process",
+      "counts_seconds_median": 5.168777268496342,
+      "counts_worker_field": 4,
+      "counts_workers": 4,
+      "exclusions": [],
+      "fallback": false,
+      "ids": [
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230047.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230107.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230149.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230231.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230252.fit",
+        "Light_mosaic_M 106_20.0s_IRCUT_20250518-230334.fit"
+      ],
+      "memory": {
+        "canvas_px": 2776080,
+        "note": "R32a keeps the reference frame as ONE full-canvas float32 plane (+ bool support) in RAM (see R32b for the tiled/bounded reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the sum of worker peaks.",
+        "peak_rss_kib_end": 637324,
+        "peak_rss_kib_start": 635380,
+        "reference_plane_canvas_px": 2776080,
+        "stage_peak_rss_kib": {
+          "after_counts": 635380,
+          "after_pairs": 637324,
+          "after_reference": 635380
+        },
+        "worker_rss_kib_max": 637324
+      },
+      "norm_active_sha256": "dfea2964b5deedea7b1ef077de529c3959e6788bdbb3441e70c77a1ae875bb48",
+      "pairs_executor": "serial",
+      "pairs_seconds_median": 14.426846182002919,
+      "pairs_worker_field": null,
+      "parent_cpu_s_median": 16.735807,
+      "payload_bit_equal_to_off": true,
+      "reference_index": 1,
+      "reps": 2,
+      "wall_s_median": 21.729189791498356,
+      "weight_active_sha256": "dfea2964b5deedea7b1ef077de529c3959e6788bdbb3441e70c77a1ae875bb48",
+      "weights_sha256": "d9eeaed3af23023fe756ec201060f7ba9510bf518669062c191a6616be86ed75",
+      "workers": 1
+    }
+  },
+  "corpus": {
+    "canvas": [
+      1290,
+      2152
+    ],
+    "frames": 6,
+    "normalization": "sky_mean",
+    "source": "/home/tristan/M106/lights",
+    "weighting": "noise_variance"
+  },
+  "host": {
+    "cpu_count": 8,
+    "platform": "Linux-6.12.117+deb13-amd64-x86_64-with-glibc2.41",
+    "python": "3.13.5"
+  },
+  "mission": "ZM-GAUGE-COUNTS-DECOUPLING-20261115",
+  "model": {
+    "counts_footprint_bytes": 634999168,
+    "max_bbox_px": 2123268,
+    "max_frame_px": 2073600,
+    "pairs_footprint_bytes": 797559568,
+    "peak_phase": "pairs_normalize"
+  },
+  "note": "Model/planning numbers on this local subset are NOT the M33 admission. This measures the execution decoupling only; Windows spawn/psutil behaviour remains unproven until a physical Windows qualification.",
+  "schema": "zm-gauge-counts-decoupling-ab-v1",
+  "spawn_probe": {
+    "counts_executor": "process",
+    "counts_workers": 2,
+    "status": "ok",
+    "wall_s": 16.82444186801149
+  }
+}

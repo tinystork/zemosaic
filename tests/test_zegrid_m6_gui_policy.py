@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -137,6 +138,47 @@ def _set_widgets(win, values: dict) -> None:
             combo, values["zegrid_sip_mode"]
         )
         combo.setCurrentIndex(index)
+
+
+def test_policy_valid_defaults_cover_keys_and_recovery_round_trip(tmp_path):
+    """F3: every declared policy key has a valid recovery default.
+
+    No QApplication and no GUI construction: the real loader and the real
+    recovery helper are exercised directly on a temporary config file.
+    """
+    from zemosaic import zemosaic_gui_qt as gui
+
+    declared = set(zc.ZEGRID_RUN_POLICY_KEYS)
+    assert declared <= set(gui._ZEGRID_POLICY_VALID_DEFAULTS)
+    defaults = {
+        key: gui._ZEGRID_POLICY_VALID_DEFAULTS[key] for key in declared
+    }
+    # The defaults themselves pass the ONE strict validator through the REAL
+    # loader (round-trip), including the two previously missing booleans.
+    path = tmp_path / "zemosaic_config.json"
+    path.write_text(json.dumps(defaults, indent=2), encoding="utf-8")
+    loaded = zc.load_config(path)
+    validated = zc.validate_zegrid_run_policy(loaded)
+    assert validated["zegrid_stack_phase_profiling"] is False
+    assert validated["zegrid_gauge_counts_decoupling"] is True
+
+    # Recovery path: an invalid persisted stack value no longer crashes on a
+    # sanitised ``None``; the raw value is preserved verbatim for the user.
+    path.write_text(
+        json.dumps({"zegrid_stack_phase_profiling": "yes"}), encoding="utf-8"
+    )
+    fake_self = SimpleNamespace(_config_path=path)
+    recovered = (
+        gui.ZeMosaicQtMainWindow._recover_config_after_policy_value_error(
+            fake_self,
+            ValueError(
+                "zegrid_stack_phase_profiling must be a boolean, got "
+                "str='yes'"
+            ),
+        )
+    )
+    assert recovered["zegrid_stack_phase_profiling"] == "yes"
+    assert recovered["zegrid_gauge_counts_decoupling"] is True
 
 
 # ---------------------------------------------------------------------------

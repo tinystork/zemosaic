@@ -196,6 +196,11 @@ DEFAULT_CONFIG = {
     # never enters the scientific identity. Strict enum: an unknown value is
     # refused by the engine (``validate_zegrid_run_policy``), never coerced.
     "zegrid_gauge_memory_policy": "ram_only",
+    # ZM-GAUGE-COUNTS-DECOUPLING: enabled by default since beta 5.1.4. The ACTIVE
+    # planner derives a DISTINCT counts worker count under the SAME B_plan /
+    # 15 % margin (Fc <= Fp; the gauge phase is priced max(Nc*Fc, Np*Fp)).
+    # False keeps the historical single-worker-count behaviour byte for byte.
+    "zegrid_gauge_counts_decoupling": True,
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
@@ -532,6 +537,8 @@ ZEGRID_RUN_POLICY_KEYS = (
     "zegrid_stack_phase_profiling",
     # ZM-GAUGE-SWAP-G2b: execution-only gauge memory policy (closed enum).
     "zegrid_gauge_memory_policy",
+    # ZM-GAUGE-COUNTS-DECOUPLING: strict counts/pairs worker decoupling policy.
+    "zegrid_gauge_counts_decoupling",
 )
 
 _ZEGRID_GAUGE_MODES = ("auto", "global", "per_cell")
@@ -670,6 +677,15 @@ def validate_zegrid_run_policy(config: Any) -> dict:
             f"{type(gauge_memory_raw).__name__}={gauge_memory_raw!r}"
         )
 
+    counts_decoupling_raw = _policy_value(
+        config, "zegrid_gauge_counts_decoupling"
+    )
+    if not isinstance(counts_decoupling_raw, bool):
+        raise ValueError(
+            "zegrid_gauge_counts_decoupling must be a boolean, got "
+            f"{type(counts_decoupling_raw).__name__}={counts_decoupling_raw!r}"
+        )
+
     return {
         "zegrid_resource_recovery_enabled": enabled,
         "zegrid_resource_recovery_deadline_s": deadline,
@@ -679,6 +695,7 @@ def validate_zegrid_run_policy(config: Any) -> dict:
         "zegrid_sip_mode": sip_mode,
         "zegrid_stack_phase_profiling": profiling_raw,
         "zegrid_gauge_memory_policy": gauge_memory_policy,
+        "zegrid_gauge_counts_decoupling": counts_decoupling_raw,
     }
 
 

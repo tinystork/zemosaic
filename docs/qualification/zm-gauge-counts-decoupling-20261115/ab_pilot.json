@@ -1,0 +1,159 @@
+{
+  "arms": {
+    "off_w1": {
+      "children_cpu_s_median": 0.0,
+      "counts_executor": "serial",
+      "counts_seconds_median": 12.486105282005155,
+      "counts_worker_field": null,
+      "counts_workers": null,
+      "exclusions": [],
+      "fallback": false,
+      "memory": {
+        "canvas_px": 2776080,
+        "note": "R32a keeps the reference frame as ONE full-canvas float32 plane (+ bool support) in RAM (see R32b for the tiled/bounded reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the sum of worker peaks.",
+        "peak_rss_kib_end": 638320,
+        "peak_rss_kib_start": 179404,
+        "reference_plane_canvas_px": 2776080,
+        "stage_peak_rss_kib": {
+          "after_counts": 508644,
+          "after_pairs": 638320,
+          "after_reference": 508644
+        },
+        "worker_rss_kib_max": 638320
+      },
+      "pairs_executor": "serial",
+      "pairs_seconds_median": 15.224116341996705,
+      "pairs_worker_field": null,
+      "parent_cpu_s_median": 30.129724000000003,
+      "payload_bit_equal_to_off": true,
+      "reference_index": 1,
+      "reps": 1,
+      "wall_s_median": 29.853206870990107,
+      "workers": 1
+    },
+    "on_nc2_pairs2": {
+      "children_cpu_s_median": 33.290926999999996,
+      "counts_executor": "process",
+      "counts_seconds_median": 6.462727712991182,
+      "counts_worker_field": 2,
+      "counts_workers": 2,
+      "exclusions": [],
+      "fallback": false,
+      "memory": {
+        "canvas_px": 2776080,
+        "note": "R32a keeps the reference frame as ONE full-canvas float32 plane (+ bool support) in RAM (see R32b for the tiled/bounded reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the sum of worker peaks.",
+        "peak_rss_kib_end": 638336,
+        "peak_rss_kib_start": 638336,
+        "reference_plane_canvas_px": 2776080,
+        "stage_peak_rss_kib": {
+          "after_counts": 638336,
+          "after_pairs": 638336,
+          "after_reference": 638336
+        },
+        "worker_rss_kib_max": 593156
+      },
+      "pairs_executor": "process",
+      "pairs_seconds_median": 11.784326240987866,
+      "pairs_worker_field": null,
+      "parent_cpu_s_median": 2.140072999999987,
+      "payload_bit_equal_to_off": true,
+      "reference_index": 1,
+      "reps": 1,
+      "wall_s_median": 20.350136218999978,
+      "workers": 2
+    },
+    "on_nc2_w1": {
+      "children_cpu_s_median": 11.63031,
+      "counts_executor": "process",
+      "counts_seconds_median": 5.926156621993869,
+      "counts_worker_field": 2,
+      "counts_workers": 2,
+      "exclusions": [],
+      "fallback": false,
+      "memory": {
+        "canvas_px": 2776080,
+        "note": "R32a keeps the reference frame as ONE full-canvas float32 plane (+ bool support) in RAM (see R32b for the tiled/bounded reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the sum of worker peaks.",
+        "peak_rss_kib_end": 638336,
+        "peak_rss_kib_start": 638320,
+        "reference_plane_canvas_px": 2776080,
+        "stage_peak_rss_kib": {
+          "after_counts": 638320,
+          "after_pairs": 638336,
+          "after_reference": 638320
+        },
+        "worker_rss_kib_max": 638336
+      },
+      "pairs_executor": "serial",
+      "pairs_seconds_median": 14.767790393001633,
+      "pairs_worker_field": null,
+      "parent_cpu_s_median": 17.079310999999997,
+      "payload_bit_equal_to_off": true,
+      "reference_index": 1,
+      "reps": 1,
+      "wall_s_median": 22.82510242400167,
+      "workers": 1
+    },
+    "on_nc4_w1": {
+      "children_cpu_s_median": 16.351926,
+      "counts_executor": "process",
+      "counts_seconds_median": 5.183696206993773,
+      "counts_worker_field": 4,
+      "counts_workers": 4,
+      "exclusions": [],
+      "fallback": false,
+      "memory": {
+        "canvas_px": 2776080,
+        "note": "R32a keeps the reference frame as ONE full-canvas float32 plane (+ bool support) in RAM (see R32b for the tiled/bounded reference). peak_rss_kib_* are SINGLE-process ru_maxrss, not the sum of worker peaks.",
+        "peak_rss_kib_end": 638336,
+        "peak_rss_kib_start": 638336,
+        "reference_plane_canvas_px": 2776080,
+        "stage_peak_rss_kib": {
+          "after_counts": 638336,
+          "after_pairs": 638336,
+          "after_reference": 638336
+        },
+        "worker_rss_kib_max": 638336
+      },
+      "pairs_executor": "serial",
+      "pairs_seconds_median": 15.568023322004592,
+      "pairs_worker_field": null,
+      "parent_cpu_s_median": 17.89490399999999,
+      "payload_bit_equal_to_off": true,
+      "reference_index": 1,
+      "reps": 1,
+      "wall_s_median": 22.885304637005902,
+      "workers": 1
+    }
+  },
+  "corpus": {
+    "canvas": [
+      1290,
+      2152
+    ],
+    "frames": 6,
+    "normalization": "sky_mean",
+    "source": "/home/tristan/M106/lights",
+    "weighting": "noise_variance"
+  },
+  "host": {
+    "cpu_count": 8,
+    "platform": "Linux-6.12.117+deb13-amd64-x86_64-with-glibc2.41",
+    "python": "3.13.5"
+  },
+  "mission": "ZM-GAUGE-COUNTS-DECOUPLING-20261115",
+  "model": {
+    "counts_footprint_bytes": 634999168,
+    "max_bbox_px": 2123268,
+    "max_frame_px": 2073600,
+    "pairs_footprint_bytes": 797559568,
+    "peak_phase": "pairs_normalize"
+  },
+  "note": "Model/planning numbers on a 10-frame subset are NOT the M33 admission. This measures the execution decoupling only; Windows spawn/psutil behaviour remains unproven until a physical Windows qualification.",
+  "schema": "zm-gauge-counts-decoupling-ab-v1",
+  "spawn_probe": {
+    "counts_executor": "process",
+    "counts_workers": 2,
+    "status": "ok",
+    "wall_s": 17.244286266010022
+  }
+}

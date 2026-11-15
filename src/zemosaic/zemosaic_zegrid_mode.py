@@ -7469,6 +7469,12 @@ def _write_run_log(
             f"  executor: {gd.get('executor')}  parent_daemon: {gd.get('parent_daemon')}  "
             f"workers: {gd.get('workers')}  fallback: {gd.get('fallback')}"
         )
+        if gd.get("counts_workers") is not None:
+            lines.append(
+                "  counts_workers: "
+                f"{int(gd['counts_workers'])} (distinct sequential counts pool; "
+                f"pairs workers={gd.get('workers')})"
+            )
         for phase_name in ("counts", "pairs"):
             ph = (gd.get("phases") or {}).get(phase_name) or {}
             lines.append(
@@ -7792,6 +7798,13 @@ class ExecutionBundle:
     # producer, consumed verbatim by every later gate; ``None`` only for
     # historical fixtures that never build a gauge phase.
     gauge_memory_model: dict | None = None
+    # ZM-GAUGE-COUNTS-DECOUPLING: the PLAN-time counts worker count and its
+    # per-worker footprint. ``None`` means the default-OFF historical path
+    # (counts executes with ``gauge_workers``); a positive int is a frozen
+    # decision chosen under the SAME B_plan/15 % margin, never re-derived at
+    # run time. Additive fields: OFF bundles keep the exact old payload.
+    gauge_counts_workers: int | None = None
+    gauge_counts_footprint_bytes: int | None = None
     # ZM-ZEGRID-PER-CELL-SCHEDULER: ONE reservation per ACTIVE cell (from the
     # SAME ``auto_layout.reservation_bytes`` path the planner used) and the
     # plan-time dispatch cap. Both are consumed verbatim by the per-cell
@@ -8755,6 +8768,7 @@ def _build_execution_bundle(
     combine="mean",
     halo_policy=None,
     memory_observations=None,
+    gauge_counts_decoupling=False,
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -9024,6 +9038,26 @@ def _build_execution_bundle(
         _cache_workers = _r55_coherent_worker_count(
             cache_build_workers, worker_budget, _cache_fp
         )
+        # ZM-GAUGE-COUNTS-DECOUPLING (default OFF): expose the counts-only
+        # per-worker cost the frozen model already contains and derive its
+        # coherent worker count from the SAME raw ceiling/margin. The pairs
+        # footprint ``_gauge_fp`` is untouched, so the reference/canonical
+        # peak keeps its full historical coverage. ``Fc <= Fp`` by
+        # construction; a zero-accounting model charges nothing and stays at
+        # ONE worker instead of fabricating a gauge phase.
+        _gauge_counts_workers = None
+        _gauge_counts_fp = None
+        if bool(gauge_counts_decoupling):
+            _gauge_counts_fp = int(
+                zphot.gauge_counts_footprint_bytes(_gauge_memory_model)
+            )
+            _gauge_counts_workers = (
+                1
+                if _gauge_counts_fp <= 0
+                else _r55_coherent_worker_count(
+                    None, worker_budget, _gauge_counts_fp
+                )
+            )
 
         # ZM-ZEGRID-R22/R36: VRAM-bounded GPU tile, determined BEFORE the joint
         # plan so the GPU RAM gate is evaluated at the GPU's OWN execution tile.
@@ -10062,6 +10096,14 @@ def _build_execution_bundle(
             gauge_workers=int(_gauge_workers),
             cache_build_workers=int(_cache_workers),
             gauge_memory_model=dict(_gauge_memory_model),
+            gauge_counts_workers=(
+                None
+                if _gauge_counts_workers is None
+                else int(_gauge_counts_workers)
+            ),
+            gauge_counts_footprint_bytes=(
+                None if _gauge_counts_fp is None else int(_gauge_counts_fp)
+            ),
             worker_budget_bytes=int(worker_budget),
             attempts=attempts,
             cell_reservations=dict(_cell_reservations),
@@ -10156,6 +10198,18 @@ def _ram_contract_diagnostics(
         "worst_patch_px": int(bundle.worst_patch_px),
         "worker_budget_bytes": int(bundle.worker_budget_bytes),
         "gauge_workers": int(bundle.gauge_workers),
+        **(
+            {
+                "gauge_counts_workers": int(bundle.gauge_counts_workers),
+                "gauge_counts_footprint_bytes": int(
+                    bundle.gauge_counts_footprint_bytes
+                ),
+            }
+            if getattr(bundle, "gauge_counts_workers", None) is not None
+            and getattr(bundle, "gauge_counts_footprint_bytes", None)
+            is not None
+            else {}
+        ),
         "cache_build_workers": int(bundle.cache_build_workers),
         "backend": str(plan_env.backend),
         "mode": str(bundle.chosen_mode),
@@ -11048,10 +11102,37 @@ def _r55_active_facts(
         _restored_resident is None or int(_restored_resident) <= 0
     ):
         _gauge_restored = False
+    # ZM-GAUGE-COUNTS-DECOUPLING: the counts pool is priced ONLY on a fresh
+    # compute gauge, and only when the bundle carries the PLAN-time decision.
+    # A restored gauge charges its measured residency and never a compute
+    # worker; the historical (OFF) path keeps its exact footprint x workers.
+    _counts_workers_fact = getattr(bundle, "gauge_counts_workers", None)
+    _counts_footprint_fact = getattr(
+        bundle, "gauge_counts_footprint_bytes", None
+    )
+    _counts_priced = bool(
+        not _gauge_restored
+        and _counts_workers_fact is not None
+        and _counts_footprint_fact is not None
+    )
+    if _counts_priced:
+        _counts_workers_fact = max(1, int(_counts_workers_fact))
+        _counts_footprint_fact = max(0, int(_counts_footprint_fact))
     if _gauge_restored:
         gauge_workers = 1
         _gauge_phase_basis = "restored"
         _gauge_phase_bytes = int(_restored_resident)
+    elif _counts_priced:
+        _gauge_phase_basis = "compute"
+        # Sequential gauge envelope: max(counts pool, pairs pool). The two
+        # pools NEVER overlap (counts is joined before the reference is built
+        # and before pairs exists), so their non-overlapping peaks are not
+        # summed. The pairs leg keeps the full historical bound, including the
+        # separate parent reference step priced by the frozen model.
+        _gauge_phase_bytes = max(
+            int(_counts_workers_fact) * int(_counts_footprint_fact),
+            int(gauge_footprint) * int(gauge_workers),
+        )
     else:
         _gauge_phase_basis = "compute"
         _gauge_phase_bytes = int(gauge_footprint) * int(gauge_workers)
@@ -11122,6 +11203,15 @@ def _r55_active_facts(
         "gauge_phase_bytes": int(_gauge_phase_bytes),
         "gauge_compute_priced": bool(not _gauge_restored),
         "gauge_compute_workers_unpriced": int(_gauge_compute_workers),
+        **(
+            {
+                "gauge_counts_workers": int(_counts_workers_fact),
+                "gauge_counts_footprint_bytes": int(_counts_footprint_fact),
+                "gauge_sequential_peak_bytes": int(_gauge_phase_bytes),
+            }
+            if _counts_priced
+            else {}
+        ),
         "cache_workers": int(cache_workers),
         # ZM-ZEGRID-R56 REWORK-1 (F2): the ONE producer phase that genuinely
         # coexists with the GPU consumer in the bounded pipeline. Cache-build
@@ -11166,6 +11256,46 @@ def _r55_active_facts(
     return facts
 
 
+def _r55_gauge_phase_peak_bytes(facts) -> int:
+    """The EFFECTIVE priced gauge-phase peak for the CURRENT trial facts.
+
+    One synchronous definition for the request, the diagnostics and the
+    refusal trail. A selection trial mutates ``facts["gauge_workers"]`` (Np
+    shrink); the counts pool is unchanged, so the honest sequential peak is
+    ALWAYS ``max(Nc*Fc, Np_trial*Fp)`` — never a value frozen from the bundle's
+    pre-shrink Np. A restored gauge keeps its measured residency and prices no
+    counts pool.
+    """
+    if bool(facts.get("gauge_restored")):
+        return int(facts.get("gauge_phase_bytes") or 0)
+    gauge_workers = max(1, int(facts.get("gauge_workers") or 1))
+    pairs = int(facts.get("gauge_footprint_bytes") or 0) * gauge_workers
+    counts_workers = facts.get("gauge_counts_workers")
+    counts_footprint = facts.get("gauge_counts_footprint_bytes")
+    if counts_workers is not None and counts_footprint is not None:
+        return max(int(counts_workers) * int(counts_footprint), pairs)
+    return int(pairs)
+
+
+def _r55_trial_with_workers(facts, gauge_workers, cache_workers):
+    """Copy trial facts for ONE (Np, Nc) pair and sync the effective gauge peak.
+
+    The counts worker count is FROZEN at PLAN time; only Np is enumerated by the
+    bounded ladder. ``gauge_phase_bytes`` / ``gauge_sequential_peak_bytes`` must
+    therefore be recomputed for THIS trial so no diagnostic or trace can publish
+    the bundle's pre-shrink value (F2).
+    """
+    trial = dict(facts)
+    trial["gauge_workers"] = int(gauge_workers)
+    trial["cache_workers"] = int(cache_workers)
+    # OFF (no counts facts) keeps the historical trial payload byte for byte:
+    # the historical diagnostics/trails are not re-derived on a shrink.
+    if "gauge_counts_workers" in facts:
+        trial["gauge_phase_bytes"] = _r55_gauge_phase_peak_bytes(trial)
+        trial["gauge_sequential_peak_bytes"] = int(trial["gauge_phase_bytes"])
+    return trial
+
+
 def _r55_active_phase_requests(facts) -> tuple:
     """Build the non-stack phase requests for the CURRENT gauge/cache workers.
 
@@ -11178,11 +11308,23 @@ def _r55_active_phase_requests(facts) -> tuple:
     # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: a VERIFIED restored gauge is a single
     # resident charge, never a compute worker phase. Every fresh/unproven case
     # keeps the historical footprint x workers component verbatim.
+    _counts_workers = facts.get("gauge_counts_workers")
+    _counts_footprint = facts.get("gauge_counts_footprint_bytes")
     if bool(facts.get("gauge_restored")):
         gauge_components = {
             "restored_gauge_resident_bytes": int(facts["gauge_phase_bytes"])
         }
         gauge_units = 1
+    elif _counts_workers is not None and _counts_footprint is not None:
+        # ZM-GAUGE-COUNTS-DECOUPLING: ONE pre-aggregated sequential component.
+        # ``max`` (not a sum) because the two pools never overlap, and the
+        # published concurrency metadata stays the historical pairs count
+        # (the counts pool is reported in diagnostics, never as a second
+        # in-flight unit of the SAME phase).
+        gauge_components = {
+            "gauge_sequential_peak_bytes": _r55_gauge_phase_peak_bytes(facts)
+        }
+        gauge_units = int(gauge_workers)
     else:
         gauge_components = {
             "gauge_worker_footprint_bytes": (
@@ -11359,17 +11501,39 @@ def _r55_worker_adaptation_detail(facts, trail):
         "gauge_ladder": list(_r55_worker_ladder(int(facts["gauge_workers"]))),
         "cache_ladder": list(_r55_worker_ladder(int(facts["cache_workers"]))),
         "selected_gauge_workers": int(facts["gauge_workers"]),
+        # ZM-GAUGE-COUNTS-DECOUPLING: additive ONLY when the option is ON, so
+        # OFF manifests keep their historical payload. The sequential peak is
+        # the priced max(...) — never presented as a concurrent sum.
+        **(
+            {
+                "selected_gauge_counts_workers": int(
+                    facts["gauge_counts_workers"]
+                ),
+                "gauge_counts_footprint_bytes": int(
+                    facts["gauge_counts_footprint_bytes"]
+                ),
+                "gauge_sequential_peak_bytes": _r55_gauge_phase_peak_bytes(
+                    facts
+                ),
+            }
+            if "gauge_counts_workers" in facts
+            else {}
+        ),
         "selected_cache_workers": int(facts["cache_workers"]),
         # ZM-ZEGRID-RESTORED-GAUGE-ADMISSION: the gauge phase's priced BASIS is
         # explicit, so an aggregate is explainable without reading code.
         "gauge_phase": {
             "basis": str(facts.get("gauge_phase_basis", "compute")),
             "restored": bool(facts.get("gauge_restored", False)),
-            "phase_bytes": int(
-                facts.get(
-                    "gauge_phase_bytes",
-                    int(facts["gauge_footprint_bytes"])
-                    * int(facts["gauge_workers"]),
+            "phase_bytes": (
+                _r55_gauge_phase_peak_bytes(facts)
+                if "gauge_counts_workers" in facts
+                else int(
+                    facts.get(
+                        "gauge_phase_bytes",
+                        int(facts["gauge_footprint_bytes"])
+                        * int(facts["gauge_workers"]),
+                    )
                 )
             ),
             "restored_resident_bytes": facts.get(
@@ -11504,10 +11668,25 @@ def _gauge_phase_refusal_components(facts, bundle, canvas_px: int) -> str:
             f"reference_tile_px={model.get('tile_px')}, "
             f"canvas_px={model.get('canvas_px', int(canvas_px))}"
         )
+    _counts_trace = ""
+    if "gauge_counts_workers" in facts:
+        _counts_workers = max(1, int(facts["gauge_counts_workers"]))
+        _counts_footprint = max(
+            0, int(facts.get("gauge_counts_footprint_bytes") or 0)
+        )
+        _counts_trace = (
+            f"; counts_workers={_counts_workers} x counts_footprint_bytes="
+            f"{_counts_footprint} = {_counts_workers * _counts_footprint} B; "
+            f"gauge_sequential_peak_bytes="
+            f"{_r55_gauge_phase_peak_bytes(facts)} B "
+            "(max(counts,pairs) — sequential pools, never a sum)"
+        )
     return (
         "phase=gauge components: "
         f"footprint_bytes={footprint} x gauge_workers={workers} = "
-        f"{footprint * workers} B; mode={model.get('mode')}, "
+        f"{footprint * workers} B"
+        + _counts_trace
+        + f"; mode={model.get('mode')}, "
         f"peak_phase={model.get('peak_phase')}, "
         f"max_bbox_px={model.get('max_bbox_px')}, "
         f"reference_tile_px={model.get('tile_px')}, "
@@ -11618,6 +11797,17 @@ def _r55_active_external_decide(
         )
         if _credit_session.grants_credit(_credit_decision):
             facts["gauge_workers"] = 1
+            # ZM-GAUGE-COUNTS-DECOUPLING: a swap credit finances exactly ONE
+            # gauge worker. Counts may NEVER run concurrently on a credited
+            # plan (no swap-financed concurrency), so Nc = Np = 1 strictly.
+            if "gauge_counts_workers" in facts:
+                facts["gauge_counts_workers"] = 1
+                facts["gauge_phase_bytes"] = int(
+                    facts["gauge_footprint_bytes"]
+                )
+                facts["gauge_sequential_peak_bytes"] = int(
+                    facts["gauge_footprint_bytes"]
+                )
             facts["gauge_credit_applied"] = True
     trail: list[dict] = []
     last_exc = None
@@ -11625,9 +11815,7 @@ def _r55_active_external_decide(
     external_context = None
     for gauge in _r55_worker_ladder(int(facts["gauge_workers"])):
         for cache in _r55_worker_ladder(int(facts["cache_workers"])):
-            trial = dict(facts)
-            trial["gauge_workers"] = int(gauge)
-            trial["cache_workers"] = int(cache)
+            trial = _r55_trial_with_workers(facts, gauge, cache)
             requests = _r55_active_phase_requests(trial)
             _trial_credit = None
             if _credit_session is not None:
@@ -11668,6 +11856,15 @@ def _r55_active_external_decide(
                     "reason_code": "R55_OK",
                     "aggregate_host_peak_bytes": int(
                         plan_set.aggregate_host_peak_bytes
+                    ),
+                    **(
+                        {
+                            "gauge_phase_bytes": _r55_gauge_phase_peak_bytes(
+                                trial
+                            )
+                        }
+                        if "gauge_counts_workers" in trial
+                        else {}
                     ),
                 }
             )
@@ -11755,6 +11952,34 @@ def _r55_gauge_workers_effective(*, credit_applied, proposed):
     if bool(credit_applied):
         return 1
     return int(proposed)
+
+
+def _resolve_gauge_counts_decoupling(zconfig, scheduler_mode) -> bool:
+    """The ONE pure resolution of the counts/pairs policy (beta default ON).
+
+    The product chain is persisted JSON -> ``load_config`` ->
+    ``SimpleNamespace`` -> ``run_zegrid_mode`` -> ``_run_single``. This helper
+    is the ONLY place that turns that value into a decision:
+
+    * absent key in a config             -> ``True`` (beta 5.1.4 default) ;
+    * ``None`` config                    -> ``False`` (no product config) ;
+    * a non-boolean explicit value       -> ``False`` (fail closed; the strict
+      product validator already refuses it before this point) ;
+    * ``True`` only on the ACTIVE scheduler, whose joint PLAN/ACTIVE admission
+      prices the separate pool. Legacy/observe keep their single worker count.
+
+    It is PURE (no globals, no I/O) so the config -> engine link is directly
+    executable in a test without mounting the product engine.
+    """
+    if zconfig is None:
+        return False
+    if isinstance(zconfig, Mapping):
+        raw = zconfig.get("zegrid_gauge_counts_decoupling", True)
+    else:
+        raw = getattr(zconfig, "zegrid_gauge_counts_decoupling", True)
+    if not isinstance(raw, bool):
+        return False
+    return bool(raw) and scheduler_mode == zsched.MODE_ACTIVE
 
 
 def _r55_gauge_credit_diagnostics_fields(
@@ -12023,6 +12248,17 @@ def _r55_active_decide(
             # SHRINK of the admissible ladder, only taken when the credit is
             # actually granted (never on comfortable RAM).
             facts["gauge_workers"] = 1
+            # ZM-GAUGE-COUNTS-DECOUPLING: a swap credit finances exactly ONE
+            # gauge worker. Counts may NEVER run concurrently on a credited
+            # plan (no swap-financed concurrency), so Nc = Np = 1 strictly.
+            if "gauge_counts_workers" in facts:
+                facts["gauge_counts_workers"] = 1
+                facts["gauge_phase_bytes"] = int(
+                    facts["gauge_footprint_bytes"]
+                )
+                facts["gauge_sequential_peak_bytes"] = int(
+                    facts["gauge_footprint_bytes"]
+                )
             facts["gauge_credit_applied"] = True
     trail: list[dict] = []
     last_exc = None
@@ -12031,9 +12267,7 @@ def _r55_active_decide(
     stream_context = None
     for gauge in _r55_worker_ladder(int(facts["gauge_workers"])):
         for cache in _r55_worker_ladder(int(facts["cache_workers"])):
-            trial = dict(facts)
-            trial["gauge_workers"] = int(gauge)
-            trial["cache_workers"] = int(cache)
+            trial = _r55_trial_with_workers(facts, gauge, cache)
             requests = _r55_active_phase_requests(trial)
             _trial_credit = None
             if _credit_session is not None:
@@ -12062,8 +12296,8 @@ def _r55_active_decide(
                         "accepted": False,
                         "reason_code": exc.reason_code,
                         "detail": exc.detail,
-                        "gauge_phase_bytes": (
-                            int(trial["gauge_footprint_bytes"]) * int(gauge)
+                        "gauge_phase_bytes": _r55_gauge_phase_peak_bytes(
+                            trial
                         ),
                         "cache_phase_bytes": (
                             int(trial["cache_footprint_bytes"]) * int(cache)
@@ -12082,6 +12316,15 @@ def _r55_active_decide(
                     "reason_code": "R55_OK",
                     "aggregate_host_peak_bytes": int(
                         plan_set.aggregate_host_peak_bytes
+                    ),
+                    **(
+                        {
+                            "gauge_phase_bytes": _r55_gauge_phase_peak_bytes(
+                                trial
+                            )
+                        }
+                        if "gauge_counts_workers" in trial
+                        else {}
                     ),
                 }
             )
@@ -12610,9 +12853,7 @@ def _r55_active_gpu_decide(
     gpu_context = None
     for gauge in _r55_worker_ladder(int(base["gauge_workers"])):
         for cache in _r55_worker_ladder(int(base["cache_workers"])):
-            trial = dict(base)
-            trial["gauge_workers"] = int(gauge)
-            trial["cache_workers"] = int(cache)
+            trial = _r55_trial_with_workers(base, gauge, cache)
             requests = _r55_active_phase_requests(trial)
             in_c, st_c, gpu_c = _gpu_pair_contexts(
                 int(gauge), int(cache), trial
@@ -12696,8 +12937,8 @@ def _r55_active_gpu_decide(
                             if last_exc is not None
                             else "no jointly feasible GPU candidate"
                         ),
-                        "gauge_phase_bytes": (
-                            int(trial["gauge_footprint_bytes"]) * int(gauge)
+                        "gauge_phase_bytes": _r55_gauge_phase_peak_bytes(
+                            trial
                         ),
                         "cache_phase_bytes": (
                             int(trial["cache_footprint_bytes"]) * int(cache)
@@ -12721,6 +12962,15 @@ def _r55_active_gpu_decide(
                     ),
                     "aggregate_device_peak_bytes": int(
                         plan_set.aggregate_device_peak_bytes
+                    ),
+                    **(
+                        {
+                            "gauge_phase_bytes": _r55_gauge_phase_peak_bytes(
+                                trial
+                            )
+                        }
+                        if "gauge_counts_workers" in trial
+                        else {}
                     ),
                 }
             )
@@ -13114,6 +13364,22 @@ def _r55_active_gpu_apply(
         gauge_workers=int(decision.gauge_workers or bundle.gauge_workers),
         cache_build_workers=int(
             decision.cache_workers or bundle.cache_build_workers
+        ),
+        # ZM-GAUGE-COUNTS-DECOUPLING: the frozen counts decision follows the
+        # admitted bundle (None keeps the historical OFF payload).
+        gauge_counts_workers=(
+            None
+            if getattr(decision, "facts", {}).get("gauge_counts_workers")
+            is None
+            else int(decision.facts["gauge_counts_workers"])
+        ),
+        gauge_counts_footprint_bytes=(
+            None
+            if getattr(decision, "facts", {}).get(
+                "gauge_counts_footprint_bytes"
+            )
+            is None
+            else int(decision.facts["gauge_counts_footprint_bytes"])
         ),
     )
 
@@ -13610,6 +13876,16 @@ def _r55_active_apply(
         # bundle values).
         gauge_workers=int(facts["gauge_workers"]),
         cache_build_workers=int(facts["cache_workers"]),
+        gauge_counts_workers=(
+            None
+            if facts.get("gauge_counts_workers") is None
+            else int(facts["gauge_counts_workers"])
+        ),
+        gauge_counts_footprint_bytes=(
+            None
+            if facts.get("gauge_counts_footprint_bytes") is None
+            else int(facts["gauge_counts_footprint_bytes"])
+        ),
         stack_working_set=(
             WORKING_SET_EXTERNAL if external_class
             else getattr(bundle, "stack_working_set", WORKING_SET_INMEM)
@@ -16904,6 +17180,13 @@ def _run_single(
     from .core.zegrid import gauge_credit as zgcredit
 
     _gauge_memory_policy = zgcredit.resolve_gauge_memory_policy(zconfig)
+    # ZM-GAUGE-COUNTS-DECOUPLING: default-OFF opt-in, resolved ONCE per pass
+    # from the strict run-policy value. Only the ACTIVE scheduler prices a
+    # separate counts pool under the joint PLAN/ACTIVE admission; legacy and
+    # observe keep their historical single-worker-count behaviour byte for byte.
+    _gauge_counts_decoupling = _resolve_gauge_counts_decoupling(
+        zconfig, scheduler_mode
+    )
     _gauge_credit_session = None
     _gauge_credit_plan_applied = False
     # G2b: run-scoped observability of the policy. Never a decision input; it is
@@ -17272,6 +17555,14 @@ def _run_single(
 
     def _emit_live(msg, lvl="INFO"):
         _emit(msg, lvl=lvl, callback=progress_callback)
+
+    if _gauge_counts_decoupling:
+        _emit_live(
+            "ZeGrid: gauge counts/pairs decoupling ENABLED — the ACTIVE planner "
+            "derives a distinct counts worker count under the SAME B_plan / "
+            f"{int(renv.DEFAULT_MARGIN_NUM)}/{int(renv.DEFAULT_MARGIN_DEN)} "
+            "margin (sequential pools; the pairs count is unchanged)"
+        )
 
     def _stage_live(stage_str, current, total):
         # ZM-ETA-INTEGRITY-R32: the run-log ETA consumes the SAME stable stage
@@ -17784,6 +18075,9 @@ def _run_single(
         combine=str(getattr(science_config, "combine", "mean")),
         normalization=str(getattr(science_config, "normalization", "sky_mean")),
         weighting=str(getattr(science_config, "weighting", "noise_variance")),
+        # ZM-GAUGE-COUNTS-DECOUPLING (default OFF): frozen into every bundle
+        # build of this run, including bounded rebuilds/fallbacks.
+        gauge_counts_decoupling=bool(_gauge_counts_decoupling),
         emit=_emit_live,
         log_line=_log_line,
     )
@@ -18689,6 +18983,29 @@ def _run_single(
             callback=progress_callback,
         )
     gauge_cache_dir = cache_root / "__gauge__"
+    # ZM-GAUGE-COUNTS-DECOUPLING: the execution-side counts count, frozen from
+    # the ADMITTED decision (which already carries any credit-induced 1/1 and
+    # plan shrink). ``None`` is the historical OFF path: compute_global_gauge
+    # then sizes BOTH pools with ``workers``.
+    _gauge_counts_workers = getattr(
+        _initial_bundle, "gauge_counts_workers", None
+    )
+    _gauge_counts_decision = (
+        _r55_active_gpu_decision
+        if _r55_active_gpu_decision is not None
+        else _r55_active_decision
+    )
+    _gauge_counts_facts = (
+        getattr(_gauge_counts_decision, "facts", {}) or {}
+        if _gauge_counts_decision is not None
+        else {}
+    )
+    if _gauge_counts_facts.get("gauge_counts_workers") is not None:
+        _gauge_counts_workers = int(
+            _gauge_counts_facts["gauge_counts_workers"]
+        )
+    elif _gauge_counts_workers is not None:
+        _gauge_counts_workers = int(_gauge_counts_workers)
     _gauge_rep = _reporter()
     # rework-1 (M1): the gauge phase spans TWO sub-passes (counts N + pairs N-1),
     # so the honest phase total is 2N-1 and progress is CUMULATIVE across them.
@@ -18774,6 +19091,9 @@ def _run_single(
             workers = _r55_gauge_workers_effective(
                 credit_applied=True, proposed=workers
             )
+            # ZM-GAUGE-COUNTS-DECOUPLING: no swap-financed concurrency.
+            if _gauge_counts_workers is not None:
+                _gauge_counts_workers = 1
         # G2b observability: defined for EVERY path (a session that never opens
         # or a non-credited run keeps them ``None``) so the manifest block can be
         # built unconditionally after the gauge.
@@ -18809,6 +19129,10 @@ def _run_single(
                     workers = _r55_gauge_workers_effective(
                         credit_applied=True, proposed=workers
                     )
+                    # ZM-GAUGE-COUNTS-DECOUPLING: a credit opened at RUN time
+                    # also collapses the counts pool to ONE worker.
+                    if _gauge_counts_workers is not None:
+                        _gauge_counts_workers = 1
                     _gauge_swap_state["open_event"] = dict(
                         _gauge_credit_open_event
                     )
@@ -18829,6 +19153,7 @@ def _run_single(
                 try:
                     global_gauge, global_frame_ids = zphot.compute_global_gauge(
                         descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
+                        counts_workers=_gauge_counts_workers,
                         progress_callback=_gauge_progress,
                         emit=_emit_live,
                         diagnostics=gauge_diagnostics,

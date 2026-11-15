@@ -115,6 +115,7 @@ from zemosaic.core.zegrid import parallel as zpar
 __all__ = [
     "compute_global_gauge",
     "compute_cell_gauge",
+    "gauge_counts_footprint_bytes",
     "resolve_cell_gauge_mode",
     "select_auto_gauge_mode",
     "CellGaugeResult",
@@ -577,6 +578,61 @@ def _gauge_phase_peaks(
             + (_GAUGE_REPROJECT_WORK_BYTES_PER_PX + 13) * a
         )
     return peaks
+
+
+_GAUGE_COUNTS_PEAK_NAMES = (
+    "decode",
+    "counts_reproject",
+    "counts_prepare",
+)
+
+
+def gauge_counts_footprint_bytes(model) -> int:
+    """Per-worker COUNT-phase footprint derived from a frozen gauge model.
+
+    The counts pass runs ONLY reproject + prepare sub-phases; it never builds
+    the reference plane, the canonical batch nor the quality weights. Its exact
+    per-worker bound is therefore ``process_baseline + max(counts sub-phase
+    peaks)``, reusing the peaks the frozen model already publishes:
+
+    * ``decode``            — the decoded HWC source,
+    * ``counts_reproject``  — decoded source + owned float64 copy + workspace,
+    * ``counts_prepare``    — decoded source + owned NHWC copy/mask/finite.
+
+    ``process_baseline_bytes`` is charged EXACTLY ONCE per worker (it is the
+    same ``parallel._PER_WORKER_BASELINE_BYTES`` term the historical pairs
+    footprint already carries) and sequential sub-phases are NEVER summed.
+
+    The pairs bound is deliberately NOT derived here: ``footprint_bytes`` stays
+    the historical per-worker pairs/reference bound. The reference plane and the
+    canonical/weighting workspace are therefore still covered by the pairs leg
+    of ``max(counts_workers * Fc, pairs_workers * Fp)``; nothing about the
+    reference peak is reduced by exposing this separate counts cost.
+
+    ``zero_accounting`` models (tests/benchmarks that neutralize the gauge
+    phase) return 0 so a caller can never fabricate a gauge charge. A missing /
+    empty model also returns 0 (the caller must then keep the historical path).
+    """
+    if not isinstance(model, dict):
+        return 0
+    if bool(model.get("zero_accounting")):
+        return 0
+    peaks = model.get("phase_peaks") or {}
+    added = 0
+    for name in _GAUGE_COUNTS_PEAK_NAMES:
+        entry = peaks.get(name)
+        if isinstance(entry, dict):
+            value = entry.get("added_bytes")
+        else:
+            value = entry
+        if value is None:
+            continue
+        added = max(added, max(0, int(value)))
+    components = model.get("components") or {}
+    baseline = max(0, int(components.get("process_baseline_bytes") or 0))
+    if baseline <= 0 and added <= 0:
+        return 0
+    return int(baseline) + int(added)
 
 
 def gauge_memory_model(
@@ -1189,6 +1245,7 @@ def compute_global_gauge(
     *,
     reuse_cache: bool = True,
     workers: int = 1,
+    counts_workers: int | None = None,
     progress_callback=None,
     emit=None,
     diagnostics=None,
@@ -1212,11 +1269,22 @@ def compute_global_gauge(
     The result is DETERMINISTIC and matches the R11 full-canvas gauge exactly
     when bboxes ≈ canvas; on partial-overlap corpora it is equivalent up to
     ~1e-4 relative reprojection FP noise (see the module docstring).
+
+    ``counts_workers`` is an ADDITIVE execution knob (default ``None``).
+    ``None`` reproduces the historical behaviour exactly (both pools use
+    ``workers``). A positive integer sizes ONLY the counts pool; the pairs
+    (and therefore the reference/ties/exclusions/coefficients/weights) keep
+    ``workers``. Both pools remain fully sequential (counts is joined before
+    the reference is built and before the pairs pool exists), so the science
+    outputs are independent of the counts worker count.
     """
     ordered = sorted(frames, key=lambda f: f.frame_id)
     frame_ids = [f.frame_id.logical_path for f in ordered]
     n = len(ordered)
     c = 3
+    _counts_workers = (
+        int(workers) if counts_workers is None else max(1, int(counts_workers))
+    )
 
     # ZM-ZEGRID-R32a internal levers (NON-DEFAULT; see module constants).
     _prefilter = _resolve_switch(prefilter_pairs, _GAUGE_PREFILTER_PAIRS_DEFAULT)
@@ -1273,11 +1341,14 @@ def compute_global_gauge(
     counts_meta: dict = {}
     if emit is not None:
         try:
-            emit(f"[ZEGRID] gauge phase=counts units={n} workers={workers}", "INFO")
+            emit(
+                f"[ZEGRID] gauge phase=counts units={n} workers={_counts_workers}",
+                "INFO",
+            )
         except Exception:
             pass
     count_results = zpar.pmap(
-        _counts_worker, count_tasks, workers,
+        _counts_worker, count_tasks, _counts_workers,
         progress_callback=count_progress, emit=emit, meta=counts_meta,
     )
     counts = np.asarray([r["count"] for r in count_results], dtype=np.int64)
@@ -1531,6 +1602,10 @@ def compute_global_gauge(
     if diagnostics is not None:
         diagnostics["workers"] = int(workers)
         diagnostics["memory_model"] = dict(_gauge_memory_model)
+        # Additive: published ONLY when a distinct counts pool was requested,
+        # so a default OFF run keeps its historical diagnostics byte-identical.
+        if counts_workers is not None:
+            diagnostics["counts_workers"] = int(_counts_workers)
         diagnostics["parent_daemon"] = bool(zpar._parent_is_daemonic())
         diagnostics["executor"] = pairs_meta.get("executor")
         diagnostics["fallback"] = bool(
@@ -1542,6 +1617,11 @@ def compute_global_gauge(
                 "units": int(n),
                 "seconds": counts_meta.get("seconds"),
                 "seconds_per_unit": counts_meta.get("seconds_per_unit"),
+                **(
+                    {"workers": int(_counts_workers)}
+                    if counts_workers is not None
+                    else {}
+                ),
             },
             "pairs": {
                 "executor": pairs_meta.get("executor"),
