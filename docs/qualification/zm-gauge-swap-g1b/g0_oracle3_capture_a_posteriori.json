@@ -1,0 +1,1355 @@
+{
+  "baseline_head": "e25fb5133768adf4eb26950c63f86b970909b370",
+  "cases": [
+    {
+      "b_ram": 500,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 460,
+        "aggregate_raw_bytes": 400,
+        "decision_hash": "sha256:c2ab86154c96be850d8789625e14103001b379d836d16e4176fbbca1a289f269",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 500,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 115,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 100
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 500,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 230,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 200
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 500,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 345,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 300
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 500,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 460,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 400
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 500,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 58,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 50
+          }
+        ],
+        "legacy_plan_hash": "sha256:c2ab86154c96be850d8789625e14103001b379d836d16e4176fbbca1a289f269",
+        "peak_group": [
+          "assembly"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 400,
+        "cache_build": 200,
+        "cell_stack_stream": 300,
+        "export": 50,
+        "gauge": 100
+      }
+    },
+    {
+      "b_ram": 1,
+      "decision": {
+        "admitted": false,
+        "aggregate_margined_bytes": 2,
+        "aggregate_raw_bytes": 1,
+        "decision_hash": "sha256:b333769cf7fc7f0bb1eaa93659e291fdffaf89555d99e01177dd1adc381f2efc",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": false,
+            "ceiling_bytes": 1,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 2,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": false,
+            "ceiling_bytes": 1,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": false,
+            "ceiling_bytes": 1,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": false,
+            "ceiling_bytes": 1,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": false,
+            "ceiling_bytes": 1,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 1
+          }
+        ],
+        "legacy_plan_hash": "sha256:b333769cf7fc7f0bb1eaa93659e291fdffaf89555d99e01177dd1adc381f2efc",
+        "peak_group": [
+          "gauge"
+        ],
+        "reason_code": "R55_REFUSE_HOST_RAM"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 1,
+        "cache_build": 1,
+        "cell_stack_stream": 1,
+        "export": 1,
+        "gauge": 1
+      }
+    },
+    {
+      "b_ram": 100000,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 46000,
+        "aggregate_raw_bytes": 40000,
+        "decision_hash": "sha256:6195f6edea39b058215e3f922ca6a3cbcec704fa4eace1a517b4d147497b179d",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 100000,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 11500,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 10000
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 100000,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 23000,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 20000
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 100000,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 34500,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 30000
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 100000,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 46000,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 40000
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 100000,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 5750,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 5000
+          }
+        ],
+        "legacy_plan_hash": "sha256:6195f6edea39b058215e3f922ca6a3cbcec704fa4eace1a517b4d147497b179d",
+        "peak_group": [
+          "assembly"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 40000,
+        "cache_build": 20000,
+        "cell_stack_stream": 30000,
+        "export": 5000,
+        "gauge": 10000
+      }
+    },
+    {
+      "b_ram": 57,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 22,
+        "aggregate_raw_bytes": 19,
+        "decision_hash": "sha256:f95a8de8855019a30c698280fe6613073073471843ef00c4acded4d5e9cb0025",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 57,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 9,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 7
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 57,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 13,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 11
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 57,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 15,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 13
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 57,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 20,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 17
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 57,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 22,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 19
+          }
+        ],
+        "legacy_plan_hash": "sha256:f95a8de8855019a30c698280fe6613073073471843ef00c4acded4d5e9cb0025",
+        "peak_group": [
+          "export"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 17,
+        "cache_build": 11,
+        "cell_stack_stream": 13,
+        "export": 19,
+        "gauge": 7
+      }
+    },
+    {
+      "b_ram": 56,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 22,
+        "aggregate_raw_bytes": 19,
+        "decision_hash": "sha256:f95a8de8855019a30c698280fe6613073073471843ef00c4acded4d5e9cb0025",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 56,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 9,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 7
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 56,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 13,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 11
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 56,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 15,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 13
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 56,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 20,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 17
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 56,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 22,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 19
+          }
+        ],
+        "legacy_plan_hash": "sha256:f95a8de8855019a30c698280fe6613073073471843ef00c4acded4d5e9cb0025",
+        "peak_group": [
+          "export"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 17,
+        "cache_build": 11,
+        "cell_stack_stream": 13,
+        "export": 19,
+        "gauge": 7
+      }
+    },
+    {
+      "b_ram": 500000000,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 255555556,
+        "aggregate_raw_bytes": 222222222,
+        "decision_hash": "sha256:ad67bd1b5fc90af80d34f2993c50cae032442ec38507711f45372fae152eb441",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 500000000,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 141975308,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 123456789
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 500000000,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 113580247,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 98765432
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 500000000,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 127777778,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 111111111
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 500000000,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 255555556,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 222222222
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 500000000,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 38333333,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 33333333
+          }
+        ],
+        "legacy_plan_hash": "sha256:ad67bd1b5fc90af80d34f2993c50cae032442ec38507711f45372fae152eb441",
+        "peak_group": [
+          "assembly"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 222222222,
+        "cache_build": 98765432,
+        "cell_stack_stream": 111111111,
+        "export": 33333333,
+        "gauge": 123456789
+      }
+    },
+    {
+      "b_ram": 460,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 230,
+        "aggregate_raw_bytes": 200,
+        "decision_hash": "sha256:3f5f40c8d19989074a6993cb274d0128a42a96eb8a260a18106b2af2db46719f",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 460,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 115,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 100
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 460,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 230,
+            "phases": [
+              "cache_build",
+              "assembly"
+            ],
+            "raw_bytes": 200
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 460,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 115,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 100
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 460,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 115,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 100
+          }
+        ],
+        "legacy_plan_hash": "sha256:3f5f40c8d19989074a6993cb274d0128a42a96eb8a260a18106b2af2db46719f",
+        "peak_group": [
+          "cache_build",
+          "assembly"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [
+        [
+          "cache_build",
+          "assembly"
+        ]
+      ],
+      "peaks": {
+        "assembly": 100,
+        "cache_build": 100,
+        "cell_stack_stream": 100,
+        "export": 100,
+        "gauge": 100
+      }
+    },
+    {
+      "b_ram": 459,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 230,
+        "aggregate_raw_bytes": 200,
+        "decision_hash": "sha256:3f5f40c8d19989074a6993cb274d0128a42a96eb8a260a18106b2af2db46719f",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 459,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 115,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 100
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 459,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 230,
+            "phases": [
+              "cache_build",
+              "assembly"
+            ],
+            "raw_bytes": 200
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 459,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 115,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 100
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 459,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 115,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 100
+          }
+        ],
+        "legacy_plan_hash": "sha256:3f5f40c8d19989074a6993cb274d0128a42a96eb8a260a18106b2af2db46719f",
+        "peak_group": [
+          "cache_build",
+          "assembly"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [
+        [
+          "cache_build",
+          "assembly"
+        ]
+      ],
+      "peaks": {
+        "assembly": 100,
+        "cache_build": 100,
+        "cell_stack_stream": 100,
+        "export": 100,
+        "gauge": 100
+      }
+    },
+    {
+      "b_ram": 322,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 242,
+        "aggregate_raw_bytes": 210,
+        "decision_hash": "sha256:63b6c512f47bc7cf56e0498e245a40993f633654a12bc273a9da4a1412ae4051",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 322,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 58,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 50
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 322,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 242,
+            "phases": [
+              "cache_build",
+              "cell_stack_stream",
+              "assembly"
+            ],
+            "raw_bytes": 210
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 322,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 104,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 90
+          }
+        ],
+        "legacy_plan_hash": "sha256:63b6c512f47bc7cf56e0498e245a40993f633654a12bc273a9da4a1412ae4051",
+        "peak_group": [
+          "cache_build",
+          "cell_stack_stream",
+          "assembly"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [
+        [
+          "cache_build",
+          "cell_stack_stream"
+        ],
+        [
+          "cell_stack_stream",
+          "assembly"
+        ]
+      ],
+      "peaks": {
+        "assembly": 80,
+        "cache_build": 60,
+        "cell_stack_stream": 70,
+        "export": 90,
+        "gauge": 50
+      }
+    },
+    {
+      "b_ram": 44,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 15,
+        "aggregate_raw_bytes": 13,
+        "decision_hash": "sha256:d3feb40ae8fe64f2944ebc2a78cb5ff75fccd35673758544183bec25519c8daa",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 44,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 4,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 3
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 44,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 6,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 5
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 44,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 9,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 7
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 44,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 13,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 11
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 44,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 15,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 13
+          }
+        ],
+        "legacy_plan_hash": "sha256:d3feb40ae8fe64f2944ebc2a78cb5ff75fccd35673758544183bec25519c8daa",
+        "peak_group": [
+          "export"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 11,
+        "cache_build": 5,
+        "cell_stack_stream": 7,
+        "export": 13,
+        "gauge": 3
+      }
+    },
+    {
+      "b_ram": 0,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 0,
+        "aggregate_raw_bytes": 0,
+        "decision_hash": "sha256:225e86293e475081cd1815f858951a072b4f0a5773c5345f19353447cf1ac5a1",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 0,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 0,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 0
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 0,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 0,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 0
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 0,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 0,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 0
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 0,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 0,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 0
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 0,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 0,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 0
+          }
+        ],
+        "legacy_plan_hash": "sha256:225e86293e475081cd1815f858951a072b4f0a5773c5345f19353447cf1ac5a1",
+        "peak_group": [
+          "gauge"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 0,
+        "cache_build": 0,
+        "cell_stack_stream": 0,
+        "export": 0,
+        "gauge": 0
+      }
+    },
+    {
+      "b_ram": 1149999928,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 1149999928,
+        "aggregate_raw_bytes": 999999937,
+        "decision_hash": "sha256:a6f5c85b7ba76cebb71d1fb4b93ae1143247729ff070bcf0d1cf325c9e53152c",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999928,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 1149999928,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 999999937
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999928,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999928,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999928,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999928,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 1
+          }
+        ],
+        "legacy_plan_hash": "sha256:a6f5c85b7ba76cebb71d1fb4b93ae1143247729ff070bcf0d1cf325c9e53152c",
+        "peak_group": [
+          "gauge"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 1,
+        "cache_build": 1,
+        "cell_stack_stream": 1,
+        "export": 1,
+        "gauge": 999999937
+      }
+    },
+    {
+      "b_ram": 1149999927,
+      "decision": {
+        "admitted": false,
+        "aggregate_margined_bytes": 1149999928,
+        "aggregate_raw_bytes": 999999937,
+        "decision_hash": "sha256:a6f5c85b7ba76cebb71d1fb4b93ae1143247729ff070bcf0d1cf325c9e53152c",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": false,
+            "ceiling_bytes": 1149999927,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 1149999928,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 999999937
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999927,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999927,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999927,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1149999927,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 2,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 1
+          }
+        ],
+        "legacy_plan_hash": "sha256:a6f5c85b7ba76cebb71d1fb4b93ae1143247729ff070bcf0d1cf325c9e53152c",
+        "peak_group": [
+          "gauge"
+        ],
+        "reason_code": "R55_REFUSE_HOST_RAM"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 1,
+        "cache_build": 1,
+        "cell_stack_stream": 1,
+        "export": 1,
+        "gauge": 999999937
+      }
+    },
+    {
+      "b_ram": 17,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 6,
+        "aggregate_raw_bytes": 5,
+        "decision_hash": "sha256:59ea5998bde06ca4c4ee6eea024dc37e146dcee98d518bf858648158c8f5b1f2",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 17,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 4,
+            "phases": [
+              "gauge",
+              "cache_build"
+            ],
+            "raw_bytes": 3
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 17,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 4,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 3
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 17,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 5,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 4
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 17,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 6,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 5
+          }
+        ],
+        "legacy_plan_hash": "sha256:59ea5998bde06ca4c4ee6eea024dc37e146dcee98d518bf858648158c8f5b1f2",
+        "peak_group": [
+          "export"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [
+        [
+          "gauge",
+          "cache_build"
+        ]
+      ],
+      "peaks": {
+        "assembly": 4,
+        "cache_build": 2,
+        "cell_stack_stream": 3,
+        "export": 5,
+        "gauge": 1
+      }
+    },
+    {
+      "b_ram": 100,
+      "decision": {
+        "admitted": true,
+        "aggregate_margined_bytes": 6,
+        "aggregate_raw_bytes": 5,
+        "decision_hash": "sha256:1144d80640fb77a47999ee3755f43b86eb7932ab1d2e84cca22272ac600ce9c9",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": true,
+            "ceiling_bytes": 100,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 2,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 1
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 100,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 3,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 2
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 100,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 4,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 3
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 100,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 5,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 4
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 100,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 6,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 5
+          }
+        ],
+        "legacy_plan_hash": "sha256:1144d80640fb77a47999ee3755f43b86eb7932ab1d2e84cca22272ac600ce9c9",
+        "peak_group": [
+          "export"
+        ],
+        "reason_code": "R55_OK"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 4,
+        "cache_build": 2,
+        "cell_stack_stream": 3,
+        "export": 5,
+        "gauge": 1
+      }
+    },
+    {
+      "b_ram": 1099511627776,
+      "decision": {
+        "admitted": false,
+        "aggregate_margined_bytes": 1264438371943,
+        "aggregate_raw_bytes": 1099511627776,
+        "decision_hash": "sha256:0502493ce8aceafbb51b45d1e743fc4069d06318f1da4c2380498c62bb337757",
+        "execution_digest": null,
+        "groups": [
+          {
+            "admitted": false,
+            "ceiling_bytes": 1099511627776,
+            "contains_gauge": true,
+            "credit_applied": false,
+            "is_gauge": true,
+            "margined_bytes": 1264438371943,
+            "phases": [
+              "gauge"
+            ],
+            "raw_bytes": 1099511627776
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1099511627776,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 632219185972,
+            "phases": [
+              "cache_build"
+            ],
+            "raw_bytes": 549755813888
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1099511627776,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 316109592986,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 274877906944
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1099511627776,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 158054796493,
+            "phases": [
+              "assembly"
+            ],
+            "raw_bytes": 137438953472
+          },
+          {
+            "admitted": true,
+            "ceiling_bytes": 1099511627776,
+            "contains_gauge": false,
+            "credit_applied": false,
+            "is_gauge": false,
+            "margined_bytes": 79027398247,
+            "phases": [
+              "export"
+            ],
+            "raw_bytes": 68719476736
+          }
+        ],
+        "legacy_plan_hash": "sha256:0502493ce8aceafbb51b45d1e743fc4069d06318f1da4c2380498c62bb337757",
+        "peak_group": [
+          "gauge"
+        ],
+        "reason_code": "R55_REFUSE_HOST_RAM"
+      },
+      "overlaps": [],
+      "peaks": {
+        "assembly": 137438953472,
+        "cache_build": 549755813888,
+        "cell_stack_stream": 274877906944,
+        "export": 68719476736,
+        "gauge": 1099511627776
+      }
+    }
+  ],
+  "contract": "docs/refactor/ZEGRID_GAUGE_SWAP_G0_CONTRACT_20261115.md",
+  "fields": [
+    "aggregate_raw_bytes",
+    "aggregate_margined_bytes",
+    "admitted",
+    "reason_code",
+    "peak_group",
+    "legacy_plan_hash",
+    "decision_hash",
+    "execution_digest",
+    "groups"
+  ],
+  "kind": "a_posteriori",
+  "note": "G0-ORACLE-3 was NOT captured before G1b as \u00a712 required. This is a post-hoc capture from the deterministic G1b fixtures; it is a reproducible golden, not a pre-registered oracle.",
+  "oracle": "G0-ORACLE-3 (decision OFF)",
+  "policy": "absent (== ram_only)",
+  "schema": "g0-oracle3-capture-a-posteriori-v1"
+}

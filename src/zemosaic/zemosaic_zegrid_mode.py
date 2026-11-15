@@ -10092,15 +10092,36 @@ def _build_execution_bundle_infeasible_message(exc) -> str:
     )
 
 
-def _ram_contract_diagnostics(outcome, bundle, initial_bundle) -> dict:
+def _ram_contract_diagnostics(
+    outcome,
+    bundle,
+    initial_bundle,
+    *,
+    gauge_workers_effective=None,
+    gauge_credit_applied=False,
+    gauge_memory_policy=None,
+    a_raw_bytes=None,
+    b_ram_bytes=None,
+    s_credit_bytes=None,
+    credit_needed_bytes=None,
+    capacity_sources=None,
+) -> dict:
     """JSON-safe R41-B manifest/log trail of the 80 %-plan / 90 %-admit contract.
 
     Records BOTH raw observations and their OWN factors/budgets (never a
     serialized float factor, never ``0.9 * B_plan``), the initial and final
     layouts, the admitted envelope, the replan count and the tolerance flag.
+
+    M1: ``gauge_workers`` is the bundle's own value. R2 (G2b): for a credited
+    plan ``_r55_active_apply`` already rebuilt that bundle with
+    ``facts["gauge_workers"] = 1``, so this field is the EFFECTIVE value too;
+    the additive ``gauge_workers_effective``/``gauge_credit_applied`` pair (plus
+    the O1 credit fields) makes the fact explicit instead of implied. Every
+    one of those keys is absent for a non-credited run, so OFF manifests stay
+    byte-identical.
     """
     plan_env = bundle.envelope
-    return {
+    block = {
         "schema": R41_RAM_CONTRACT_SCHEMA,
         "plan_factor": {
             "num": int(rcontract.PLAN_FACTOR_NUM),
@@ -10154,6 +10175,28 @@ def _ram_contract_diagnostics(outcome, bundle, initial_bundle) -> dict:
             "the VRAM reserve policy is unchanged."
         ),
     }
+    if gauge_workers_effective is not None:
+        block["gauge_workers_effective"] = int(gauge_workers_effective)
+        block["gauge_credit_applied"] = bool(gauge_credit_applied)
+    # G3 fix: the O1 credit observation produced by
+    # ``_r55_gauge_credit_diagnostics_fields`` is published HERE (it was already
+    # passed by the call site but the signature rejected it, so every CREDITED
+    # run raised TypeError while building its manifest). Keys stay absent for a
+    # non-credited run, so OFF manifests are unchanged.
+    if bool(gauge_credit_applied):
+        if gauge_memory_policy is not None:
+            block["gauge_memory_policy"] = str(gauge_memory_policy)
+        for _name, _value in (
+            ("a_raw_bytes", a_raw_bytes),
+            ("b_ram_bytes", b_ram_bytes),
+            ("s_credit_bytes", s_credit_bytes),
+            ("credit_needed_bytes", credit_needed_bytes),
+        ):
+            if _value is not None:
+                block[_name] = int(_value)
+        if isinstance(capacity_sources, dict) and capacity_sources:
+            block["capacity_sources"] = dict(capacity_sources)
+    return block
 
 
 def _r55_observe_error_block(exc, *, gpu_readiness=None) -> dict:
@@ -11207,6 +11250,7 @@ def _r55_active_context(
     disk_fraction_num=1,
     disk_fraction_den=2,
     shared_bytes=None,
+    gauge_credit=None,
 ) -> object:
     env = bundle.envelope
     workers_ladder = tuple(int(w) for w in zsched.WORKERS_LADDER)
@@ -11265,10 +11309,11 @@ def _r55_active_context(
         run_id=str(facts["run_id"]),
         pinned=bool(facts["pinned"]),
         storage_profile=str(facts.get("storage_profile", _STACK_STORAGE_PROFILE)),
+        gauge_credit=gauge_credit,
     )
 
 
-def _r55_active_cpu_contexts(facts, bundle, cache_workers_cap):
+def _r55_active_cpu_contexts(facts, bundle, cache_workers_cap, *, gauge_credit=None):
     """Build the CPU inmem+stream contexts for ONE cache-worker ceiling.
 
     R55-E8: the stream context carries the EXACT per-tile host map so every
@@ -11276,6 +11321,10 @@ def _r55_active_cpu_contexts(facts, bundle, cache_workers_cap):
     1 909 342 208 B vs the old static t32 4 012 813 312 B). The cache-worker
     ceiling keeps the stack's per-cell cache workers within the cache phase
     value that was globally validated.
+
+    ZM-GAUGE-SWAP-G2A: ``gauge_credit`` is the per-group admission input
+    (``gauge_admission.GaugeCredit``) for the gauge group only. ``None`` —
+    every historical caller — keeps the strict RAM-only evaluator.
     """
     inmem_context = _r55_active_context(
         facts,
@@ -11284,6 +11333,7 @@ def _r55_active_cpu_contexts(facts, bundle, cache_workers_cap):
         per_unit_cache=0,
         per_unit_prefetch=0,
         bundle=bundle,
+        gauge_credit=gauge_credit,
     )
     stream_context = _r55_active_context(
         facts,
@@ -11294,6 +11344,7 @@ def _r55_active_cpu_contexts(facts, bundle, cache_workers_cap):
         bundle=bundle,
         per_tile_stack_bytes=dict(facts["stream_added_by_tile"]),
         cache_workers_cap=int(cache_workers_cap),
+        gauge_credit=gauge_credit,
     )
     return inmem_context, stream_context
 
@@ -11464,7 +11515,9 @@ def _gauge_phase_refusal_components(facts, bundle, canvas_px: int) -> str:
     )
 
 
-def _r55_active_external_context(facts, bundle, cache_workers_cap):
+def _r55_active_external_context(
+    facts, bundle, cache_workers_cap, *, gauge_credit=None
+):
     """Build the SINGLE external working-set context for ACTIVE admission.
 
     The context prices exactly the real external execution:
@@ -11508,12 +11561,18 @@ def _r55_active_external_context(facts, bundle, cache_workers_cap):
         # excluded and must not be charged again here (the selector and this
         # ACTIVE envelope share the same phase-local reduction budget).
         shared_bytes=0,
+        # ZM-GAUGE-SWAP-G3 REWORK-1: the SINGLETON pre-stack gauge group is
+        # eligible for the credit whatever the stack class; the external stack
+        # envelope keeps its own ``B_ram`` ceiling because the evaluator only
+        # widens the ``("gauge",)`` group.
+        gauge_credit=gauge_credit,
     )
 
 
 def _r55_active_external_decide(
     *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids,
     gauge_restored=False, restored_gauge_resident_bytes=None,
+    gauge_credit=None,
 ) -> _R55ActiveDecision:
     """ACTIVE decision for the external working-set class (single-owner).
 
@@ -11522,6 +11581,12 @@ def _r55_active_external_decide(
     context differs: the external class prices the real reduction workspace and
     the real spool envelope. Selection is deterministic (largest coherent
     gauge/cache pair that fits B_plan under the one margin).
+
+    ZM-GAUGE-SWAP-G3 REWORK-1: the pre-stack GLOBAL gauge is a singleton group
+    whatever the stack class, so it is eligible for the bounded-swap credit
+    here too (contract §4.7/§2). The credit can only widen the ``("gauge",)``
+    group: the external stack envelope keeps its own ``B_ram`` ceiling, the
+    single-owner K=1 mapping and the CPU-only class are unchanged.
     """
     _r55_external_contract(bundle)
     facts = _r55_active_facts(
@@ -11542,6 +11607,18 @@ def _r55_active_external_decide(
     # host peak; the worker count is retained for identity/mapping only.
     facts["cache_footprint_bytes"] = 0
     facts["cache_phase_ram_bytes"] = 0
+    # The credit is a PLAN input only (same rule as the RAM path): computed on
+    # the bundle's OWN observation, applied only when actually needed, and it
+    # can only shrink the gauge ladder to the frozen ONE worker.
+    _credit_session = gauge_credit
+    _credit_decision = None
+    if _credit_session is not None and not bool(facts.get("gauge_restored")):
+        _credit_decision, _ignored_credit = _credit_session.decision_for_bundle(
+            bundle, p_gauge_raw=int(facts["gauge_footprint_bytes"])
+        )
+        if _credit_session.grants_credit(_credit_decision):
+            facts["gauge_workers"] = 1
+            facts["gauge_credit_applied"] = True
     trail: list[dict] = []
     last_exc = None
     plan_set = None
@@ -11552,8 +11629,13 @@ def _r55_active_external_decide(
             trial["gauge_workers"] = int(gauge)
             trial["cache_workers"] = int(cache)
             requests = _r55_active_phase_requests(trial)
+            _trial_credit = None
+            if _credit_session is not None:
+                _trial_credit = _credit_session.plan_credit(
+                    _credit_decision, workers=int(gauge)
+                )
             external_context = _r55_active_external_context(
-                trial, bundle, int(cache)
+                trial, bundle, int(cache), gauge_credit=_trial_credit
             )
             joint = zsched.JointPlanInput(contexts=(external_context,))
             try:
@@ -11661,9 +11743,233 @@ def _r55_active_external_decide(
     )
 
 
+def _r55_gauge_workers_effective(*, credit_applied, proposed):
+    """M1: the gauge worker count that ACTUALLY executes.
+
+    A plan admitted with the bounded-swap credit is priced at exactly ONE gauge
+    worker (§4.7). Once `gauge_credit_applied` is true, that one worker is the
+    ONLY coherent execution value — independently of what
+    ``open_for_compute`` returns at the last moment (a credit that became
+    unnecessary proves the fit at 1 worker, not at the initial ladder value).
+    """
+    if bool(credit_applied):
+        return 1
+    return int(proposed)
+
+
+def _r55_gauge_credit_diagnostics_fields(
+    *,
+    credit_applied,
+    policy=None,
+    a_raw_bytes=None,
+    b_ram_bytes=None,
+    s_credit_bytes=None,
+    credit_needed_bytes=None,
+    sources=None,
+) -> dict:
+    """M1/O1: additive diagnostics for a credited run (empty otherwise).
+
+    R2 (G2b) — the two worker fields COINCIDE on purpose, they are not an
+    "old vs new" pair: ``_r55_active_apply`` rebuilds the returned bundle with
+    ``facts["gauge_workers"] = 1``, so ``ram_contract["gauge_workers"]`` already
+    carries the effective value for a credited plan. ``gauge_workers_effective``
+    is published anyway as the EXPLICIT execution value that
+    ``_r55_gauge_workers_effective`` enforces before ``open_for_compute``, so a
+    reader never has to infer it from the bundle.
+
+    O1 (G2b): when the caller passes the credit observation, the policy, ``A``,
+    ``B_ram``, ``S_credit``, ``credit_needed`` and the source facts are published
+    too. Every key is absent for a non-credited run, so OFF manifests stay
+    byte-identical.
+    """
+    if not bool(credit_applied):
+        return {}
+    fields = {
+        "gauge_workers_effective": 1,
+        "gauge_credit_applied": True,
+    }
+    if policy is not None:
+        fields["gauge_memory_policy"] = str(policy)
+    for name, value in (
+        ("a_raw_bytes", a_raw_bytes),
+        ("b_ram_bytes", b_ram_bytes),
+        ("s_credit_bytes", s_credit_bytes),
+        ("credit_needed_bytes", credit_needed_bytes),
+    ):
+        if value is not None:
+            fields[name] = int(value)
+    if isinstance(sources, dict) and sources:
+        fields["capacity_sources"] = dict(sources)
+    return fields
+
+
+def _gauge_credit_ram_contract_fields(
+    *,
+    credit_applied,
+    policy=None,
+    admission_decision=None,
+    block=None,
+):
+    """G4/O1: the ONE credit observation published inside ``ram_contract``.
+
+    EVERY ``_ram_contract_diagnostics`` call site in ``_run_single`` goes
+    through this helper, so the later per-cell overrides (R41/active mode and
+    both GPU runtime-fallback blocks) publish the same O1 fields as the first
+    complete block: ``gauge_memory_policy``, ``a_raw_bytes``, ``b_ram_bytes``,
+    ``s_credit_bytes``, ``credit_needed_bytes`` and ``capacity_sources``.
+    Before G4 those overrides rebuilt ``ram_contract`` with the worker pair
+    only, silently dropping the O1 fields from the manifest surface.
+
+    ``{}`` when no credit was applied, so OFF/absent manifests keep their exact
+    pre-G2b shape byte for byte.
+    """
+    if not bool(credit_applied):
+        return {}
+
+    def _decision_field(name):
+        if admission_decision is None:
+            return None
+        return getattr(admission_decision, name, None)
+
+    return _r55_gauge_credit_diagnostics_fields(
+        credit_applied=True,
+        policy=policy,
+        a_raw_bytes=_decision_field("a_raw"),
+        b_ram_bytes=_decision_field("b_ram"),
+        s_credit_bytes=_decision_field("s_credit"),
+        credit_needed_bytes=_decision_field("credit_needed_bytes"),
+        sources=(block or {}).get("sources") if isinstance(block, dict) else None,
+    )
+
+
+def _gauge_swap_diagnostics_block(
+    *,
+    policy,
+    session=None,
+    admission_decision=None,
+    open_event=None,
+    closed_event=None,
+    credit_applied=False,
+    gauge_workers_effective=None,
+    not_applicable_reason=None,
+    execution_digest=None,
+) -> dict | None:
+    """O2 (G2b): ONE structured manifest/log block for the gauge memory policy.
+
+    ``None`` for every ``ram_only`` run, so a disabled/absent policy keeps the
+    exact pre-G2b manifest shape. For a ``bounded_swap`` run it records the
+    policy, whether it was APPLICABLE here and why not when it was not, the
+    credit observation (``A``, ``B_ram``, ``S_credit``, ``credit_needed``), the
+    source facts, and the ``gauge_credit_open`` / ``gauge_credit_closed`` events
+    as data — the run log alone is not a durable record.
+
+    The block is diagnostic only: it never feeds a decision, and the credit is
+    a PERMIT (``swap_used_bytes`` is always null, never an observed usage).
+    """
+    if str(policy or "").strip().lower() != "bounded_swap":
+        return None
+    decision = admission_decision
+    session_dict = session.to_dict() if session is not None else None
+    # ``applicable`` is evaluated from the session's OWN frozen fields, never
+    # from ``session.eligible`` (which is False once the credit is closed: the
+    # block is built AFTER the gauge, so the closed flag must not be mistaken
+    # for "this run could not use the policy").
+    session_platform = (
+        str(getattr(session, "platform", "") or "").strip().lower()
+        if session is not None else ""
+    )
+    session_gauge_mode = (
+        str(getattr(session, "cell_gauge_mode", "") or "").strip().lower()
+        if session is not None else ""
+    )
+    applicable = bool(
+        session is not None
+        and session_platform == "linux"
+        and not bool(getattr(session, "restored", False))
+        and not bool(getattr(session, "imported", False))
+        and session_gauge_mode != "per_cell"
+    )
+    reason_code = None
+    reason = None
+    if not applicable:
+        reason_code = "GAUGE_CREDIT_NOT_APPLICABLE"
+        if session is None:
+            reason = not_applicable_reason or (
+                "the bounded gauge-swap credit cannot apply to this run"
+            )
+        elif session_platform != "linux":
+            reason = (
+                "the host platform is not Linux: the bounded gauge-swap "
+                "credit does not exist here"
+            )
+        elif bool(getattr(session, "restored", False)):
+            reason = "the gauge is restored from a previous run"
+        elif bool(getattr(session, "imported", False)):
+            reason = "the gauge is imported from a verified artifact"
+        else:
+            reason = (
+                "the effective cell gauge mode is per_cell: a per-cell gauge "
+                "is never financed by the credit"
+            )
+    elif not bool(credit_applied):
+        reason = (
+            "policy enabled but no credit was spent: the gauge fitted host RAM "
+            "(or the evaluator refused the credit); the stack stayed RAM-only"
+        )
+    block = {
+        "schema": "zemosaic-zegrid-gauge-swap-v1",
+        "policy": "bounded_swap",
+        "platform": session_platform or None,
+        "applicable": applicable,
+        "reason_code": reason_code,
+        "reason": reason,
+        "credit_applied": bool(credit_applied),
+        "gauge_workers_effective": (
+            None
+            if gauge_workers_effective is None
+            else int(gauge_workers_effective)
+        ),
+        "admission": (
+            None if decision is None else decision.to_dict()
+        ),
+        "sources": (
+            dict(session.capacity.facts)
+            if session is not None and isinstance(session.capacity.facts, dict)
+            else None
+        ),
+        "events": [
+            dict(event)
+            for event in (
+                [open_event] if open_event is not None else []
+            ) + (
+                [closed_event] if closed_event is not None else []
+            )
+        ],
+        "session": session_dict,
+        "swap_used_bytes": None,
+        "durable_persistence": (
+            "none: the credit is a PERMIT, never written to a store, a durable "
+            "snapshot or a cell identity"
+        ),
+        "note": (
+            "execution-only policy: the SINGLETON fresh global gauge may be "
+            "financed by bounded disk swap; the stack/cache/assembly/export are "
+            "never credited and the science is unchanged"
+        ),
+    }
+    # ZM-GAUGE-SWAP-G3 REWORK-1 (§10.3 R2 / M2): the VERSIONED execution digest
+    # is published only when a credit is actually applied. It is the admission
+    # decision's own digest (never recomputed here), and it is absent for a
+    # non-credited / ram_only run so those manifests stay unchanged.
+    if bool(credit_applied) and execution_digest:
+        block["execution_digest"] = str(execution_digest)
+    return block
+
+
 def _r55_active_decide(
     *, bundle, cell_ctxs, canvas, halo_px, cache_root, output_dir, frame_ids,
     gauge_restored=False, restored_gauge_resident_bytes=None,
+    gauge_credit=None,
 ) -> _R55ActiveDecision:
     """Build the deterministic CPU inmem+stream decision BEFORE gauge/stack.
 
@@ -11688,6 +11994,7 @@ def _r55_active_decide(
             frame_ids=frame_ids,
             gauge_restored=gauge_restored,
             restored_gauge_resident_bytes=restored_gauge_resident_bytes,
+            gauge_credit=gauge_credit,
         )
     facts = _r55_active_facts(
         bundle=bundle,
@@ -11700,6 +12007,23 @@ def _r55_active_decide(
         gauge_restored=gauge_restored,
         restored_gauge_resident_bytes=restored_gauge_resident_bytes,
     )
+    # ZM-GAUGE-SWAP-G2A: the gauge credit is a PLAN input only. It is computed
+    # on the bundle's OWN observation (same A ⇒ same B_ram as the scheduler
+    # context) and can only ever raise the SINGLETON gauge group's ceiling.
+    # A credit that is not actually needed (gauge fits B_ram at 1 worker) is
+    # never applied, so policy ON + comfortable RAM stays byte-identical.
+    _credit_session = gauge_credit
+    _credit_decision = None
+    if _credit_session is not None and not bool(facts.get("gauge_restored")):
+        _credit_decision, _ignored_credit = _credit_session.decision_for_bundle(
+            bundle, p_gauge_raw=int(facts["gauge_footprint_bytes"])
+        )
+        if _credit_session.grants_credit(_credit_decision):
+            # §4.7 eligibility requires exactly one gauge worker. This is a
+            # SHRINK of the admissible ladder, only taken when the credit is
+            # actually granted (never on comfortable RAM).
+            facts["gauge_workers"] = 1
+            facts["gauge_credit_applied"] = True
     trail: list[dict] = []
     last_exc = None
     plan_set = None
@@ -11711,8 +12035,13 @@ def _r55_active_decide(
             trial["gauge_workers"] = int(gauge)
             trial["cache_workers"] = int(cache)
             requests = _r55_active_phase_requests(trial)
+            _trial_credit = None
+            if _credit_session is not None:
+                _trial_credit = _credit_session.plan_credit(
+                    _credit_decision, workers=int(gauge)
+                )
             inmem_context, stream_context = _r55_active_cpu_contexts(
-                trial, bundle, int(cache)
+                trial, bundle, int(cache), gauge_credit=_trial_credit
             )
             joint = zsched.JointPlanInput(
                 contexts=(inmem_context, stream_context)
@@ -13952,14 +14281,57 @@ def _r55_active_revalidate_launch(
         history.append(bundle.envelope)
 
 
-def _r55_admission_dict(outcome) -> dict:
-    """JSON-safe admission record for the active manifest."""
-    return {
+def _r55_admission_dict(outcome, *, gauge_credit=None) -> dict:
+    """JSON-safe admission record for the active manifest.
+
+    G2b (O1): ``gauge_credit`` (when supplied) publishes the policy, ``A``,
+    ``B_ram``, ``S_credit``, ``credit_needed``, the evaluator status and the
+    source facts next to the RAM observations. It is omitted entirely for a
+    RAM-only run, so the historical admission record is unchanged.
+    """
+    record = {
         "observations": [o.to_dict() for o in outcome.observations],
         "launch_observation": outcome.final_observation.to_dict(),
         "replans": int(outcome.replans),
         "tolerance": bool(outcome.tolerance),
         "history": [env.to_dict() for env in outcome.history],
+    }
+    if gauge_credit is not None:
+        record["gauge_credit"] = dict(gauge_credit)
+    return record
+
+
+def _r55_gauge_credit_admission_record(*, policy, decision) -> dict | None:
+    """O1 (G2b): compact credit record for the admission diagnostics.
+
+    ``None`` when no credit decision exists, so a RAM-only admission never grows
+    a new key. The values are the evaluator's OWN integers (already frozen
+    ``B_ram``/``S_credit``); nothing is recomputed here.
+    """
+    if decision is None:
+        return None
+    return {
+        "schema": "zemosaic-zegrid-gauge-credit-admission-v1",
+        "policy": str(policy),
+        "a_raw_bytes": (
+            None if getattr(decision, "a_raw", None) is None
+            else int(decision.a_raw)
+        ),
+        "b_ram_bytes": (
+            None if getattr(decision, "b_ram", None) is None
+            else int(decision.b_ram)
+        ),
+        "s_credit_bytes": int(decision.s_credit),
+        "credit_needed_bytes": (
+            None if decision.credit_needed_bytes is None
+            else int(decision.credit_needed_bytes)
+        ),
+        "status": str(decision.status),
+        "covered": bool(decision.covered),
+        "sources": (
+            dict(decision.facts)
+            if isinstance(getattr(decision, "facts", None), dict) else None
+        ),
     }
 
 
@@ -15591,6 +15963,7 @@ def _r55_build_active_block(
     run=None,
     worker_adaptation=None,
     tile_ladder=None,
+    gauge_credit=None,
 ) -> dict:
     """Deterministic active manifest block (no fabricated observed metric).
 
@@ -15618,10 +15991,12 @@ def _r55_build_active_block(
         entry = dict(item)
         entry.setdefault("stage", "launch")
         combined_trail.append(entry)
-    preflight_dict = _r55_admission_dict(preflight_admission)
+    preflight_dict = _r55_admission_dict(
+        preflight_admission, gauge_credit=gauge_credit
+    )
     launch_dict = (
         None if launch_admission is None
-        else _r55_admission_dict(launch_admission)
+        else _r55_admission_dict(launch_admission, gauge_credit=gauge_credit)
     )
     block = zsched.active_manifest_dict(
         plan_set,
@@ -16520,6 +16895,26 @@ def _run_single(
     stop_channel=None,
 ):
     _gauge_import_option = gauge_import
+    # ZM-GAUGE-SWAP-G2A: the execution policy is read from the EXISTING worker
+    # config namespace (G2b owns the key/default and the GUI). An absent key is
+    # the historical ``ram_only`` behaviour; an unknown value is refused here,
+    # in the engine, not only in the GUI. The capacity/admission modules are
+    # imported LOCALLY so every non-gauge path keeps its historical dependency
+    # graph (G2a: no capacity import outside the gauge path).
+    from .core.zegrid import gauge_credit as zgcredit
+
+    _gauge_memory_policy = zgcredit.resolve_gauge_memory_policy(zconfig)
+    _gauge_credit_session = None
+    _gauge_credit_plan_applied = False
+    # G2b: run-scoped observability of the policy. Never a decision input; it is
+    # only serialized into the manifest block and the admission diagnostics.
+    _gauge_swap_state: dict = {
+        "policy": _gauge_memory_policy,
+        "not_applicable_reason": None,
+        "effective_decision": None,
+        "open_event": None,
+        "closed_event": None,
+    }
     # M4: external working-set lifecycle accounting (strict JSON, additive).
     _ext_lifecycle = {
         "schema": "zemosaic-zegrid-external-lifecycle-v1",
@@ -17958,6 +18353,51 @@ def _run_single(
                 _r55_record_gpu_cpu_fallback(_r55_gpu_exc)
 
         if _r55_active_gpu_decision is None:
+            # ZM-GAUGE-SWAP-G2A: the credit session exists ONLY for an ACTIVE
+            # CPU run, with an explicit `bounded_swap` policy, a FRESH compute
+            # gauge (never restored/imported) and a non-per-cell gauge mode.
+            # Every other case keeps `None` -> strict RAM-only, byte-identical.
+            if (
+                _gauge_memory_policy == zgcredit.cap.POLICY_BOUNDED_SWAP
+                and _effective_scheduler_mode == zsched.MODE_ACTIVE
+                and _resume_gauge is None
+                and _gauge_import_provenance is None
+                and not bool(_resume_gauge_restored)
+            ):
+                _gauge_credit_session = zgcredit.GaugeCreditSession(
+                    policy=_gauge_memory_policy,
+                    capacity=zgcredit.collect_live_capacity(),
+                    platform=zgcredit.current_platform(),
+                    restored=False,
+                    imported=False,
+                    workers=1,
+                    cell_gauge_mode=str(
+                        getattr(science_config, "cell_gauge_mode", "global") or ""
+                    ),
+                )
+            else:
+                # Q2: say WHY the policy has no effect, instead of letting a
+                # reader believe a bounded-swap run is running.
+                if _gauge_memory_policy != zgcredit.cap.POLICY_BOUNDED_SWAP:
+                    _gauge_swap_state["not_applicable_reason"] = (
+                        "policy is ram_only"
+                    )
+                elif _effective_scheduler_mode != zsched.MODE_ACTIVE:
+                    _gauge_swap_state["not_applicable_reason"] = (
+                        "the effective scheduler is "
+                        f"{_effective_scheduler_mode!r}, not 'active'"
+                    )
+                elif _resume_gauge is not None or _gauge_import_provenance is not None or bool(_resume_gauge_restored):
+                    _gauge_swap_state["not_applicable_reason"] = (
+                        "the gauge is restored/imported: it is recomputed by "
+                        "nobody this run, so there is no compute to finance"
+                    )
+                else:
+                    _gauge_swap_state["not_applicable_reason"] = (
+                        "the bounded gauge-swap credit is not applicable to "
+                        "this run"
+                    )
+
             def _r55_cpu_preflight(bundle):
                 decision = _r55_active_decide(
                     bundle=bundle,
@@ -17971,11 +18411,46 @@ def _run_single(
                     restored_gauge_resident_bytes=(
                         _resume_gauge_resident_bytes
                     ),
+                    gauge_credit=_gauge_credit_session,
                 )
-                return (decision, _r55_active_admit(
+                outcome = _r55_active_admit(
                     initial_bundle=bundle,
                     decision=decision,
-                ))
+                )
+                # L3: the diagnostic is computed on the bundle that the plan
+                # ACTUALLY admitted (after any shrink/grow rebind), never on
+                # the pre-admission initial bundle.
+                if _gauge_credit_session is not None:
+                    try:
+                        _eval_bundle = outcome[0]
+                        _effective_decision = (
+                            _gauge_credit_session.decision_for_bundle(
+                                _eval_bundle,
+                                p_gauge_raw=_bundle_gauge_footprint_bytes(
+                                    _eval_bundle, canvas_px
+                                ),
+                            )[0]
+                        )
+                        _emit(
+                            "ZeGrid: bounded gauge-swap policy — effective gauge "
+                            f"eligibility {_gauge_credit_session.eligible}, "
+                            f"credit {(0 if _effective_decision is None else int(_effective_decision.s_credit))} B, "
+                            f"needed {None if _effective_decision is None else _effective_decision.credit_needed_bytes} B, "
+                            f"status {None if _effective_decision is None else _effective_decision.status}, "
+                            f"gauge_workers_effective {_r55_gauge_workers_effective(credit_applied=bool(decision.facts.get('gauge_credit_applied')), proposed=bundle.gauge_workers)}",
+                            callback=progress_callback,
+                        )
+                        _gauge_swap_state["effective_decision"] = (
+                            _effective_decision
+                        )
+                    except (zgcredit.GaugeCreditError, ValueError) as _diag_exc:
+                        _emit(
+                            "ZeGrid: bounded gauge-swap policy — effective "
+                            f"diagnostic unavailable: {_diag_exc}",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+                return decision, outcome
 
             try:
                 (
@@ -18274,19 +18749,110 @@ def _run_single(
                 callback=progress_callback,
             )
     else:
-        with timings.timed("gauge"):
-            try:
-                global_gauge, global_frame_ids = zphot.compute_global_gauge(
-                    descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
-                    progress_callback=_gauge_progress,
-                    emit=_emit_live,
-                    diagnostics=gauge_diagnostics,
+        # ZM-GAUGE-SWAP-G2A: the credit permit is OPENED immediately before the
+        # gauge compute and is CLOSED in ``finally`` — before the cache/stack,
+        # whatever happened during the gauge. The gauge runs with exactly ONE
+        # worker when the credit is granted (frozen §4.7 eligibility).
+        _gauge_credit_bundle = (
+            _r55_active_bundle
+            if (
+                scheduler_mode == zsched.MODE_ACTIVE
+                and _r55_active_bundle is not None
+            )
+            else _initial_bundle
+        )
+        _gauge_credit_plan_applied = bool(
+            getattr(_r55_active_decision, "facts", {}).get(
+                "gauge_credit_applied"
+            )
+        )
+        if _gauge_credit_plan_applied:
+            # M1: the plan was admitted at ONE gauge worker. Enforce it here,
+            # INDEPENDENTLY of what ``open_for_compute`` returns below (a
+            # "not_needed" credit proves the fit at 1 worker, never at the
+            # initial ladder value).
+            workers = _r55_gauge_workers_effective(
+                credit_applied=True, proposed=workers
+            )
+        # G2b observability: defined for EVERY path (a session that never opens
+        # or a non-credited run keeps them ``None``) so the manifest block can be
+        # built unconditionally after the gauge.
+        _gauge_credit_open_event = None
+        _gauge_credit_closed_event = None
+        try:
+            if _gauge_credit_session is not None:
+                _gauge_credit_open_event = _gauge_credit_session.open_for_compute(
+                    _gauge_credit_bundle,
+                    p_gauge_raw=_bundle_gauge_footprint_bytes(
+                        _gauge_credit_bundle, canvas_px
+                    ),
                 )
-            except Exception as _gauge_exc:
-                _quarantine_payload_failure(
-                    _gauge_exc, input_folder, progress_callback, phase="gauge"
+                if (
+                    _gauge_credit_open_event is None
+                    and _gauge_credit_plan_applied
+                ):
+                    _last_credit_event = (
+                        _gauge_credit_session.events[-1]
+                        if _gauge_credit_session.events
+                        else {}
+                    )
+                    if _last_credit_event.get("reason") != "not_needed":
+                        # L1: a typed refusal (GaugeCreditError is a
+                        # RuntimeError) with the closed §10.7 code, so G2b can
+                        # classify it without parsing prose.
+                        raise zgcredit.GaugeCreditError(
+                            "GAUGE_CREDIT_INSUFFICIENT: the admitted gauge plan "
+                            "relied on a swap credit that the current observation "
+                            "no longer proves; refusing before the gauge compute"
+                        )
+                if _gauge_credit_open_event is not None:
+                    workers = _r55_gauge_workers_effective(
+                        credit_applied=True, proposed=workers
+                    )
+                    _gauge_swap_state["open_event"] = dict(
+                        _gauge_credit_open_event
+                    )
+                    _emit(
+                        "ZeGrid: gauge credit OPEN (bounded swap, jauge 1 worker) — "
+                        f"credit={int(_gauge_credit_open_event['credit_bytes'])} B, "
+                        f"needed={int(_gauge_credit_open_event['credit_needed_bytes'])} B, "
+                        f"A={int(_gauge_credit_open_event['a_raw_bytes'])} B, "
+                        f"B_ram={int(_gauge_credit_open_event['b_ram_bytes'])} B, "
+                        f"S_effectif={_gauge_credit_open_event['s_effectif_bytes']}",
+                        callback=progress_callback,
+                    )
+                    _log_line(
+                        "ZeGrid gauge credit: "
+                        + json.dumps(_gauge_credit_open_event, sort_keys=True)
+                    )
+            with timings.timed("gauge"):
+                try:
+                    global_gauge, global_frame_ids = zphot.compute_global_gauge(
+                        descs, canvas, _gauge_decode, science_config, gauge_cache_dir, workers=workers,
+                        progress_callback=_gauge_progress,
+                        emit=_emit_live,
+                        diagnostics=gauge_diagnostics,
+                    )
+                except Exception as _gauge_exc:
+                    _quarantine_payload_failure(
+                        _gauge_exc, input_folder, progress_callback, phase="gauge"
+                    )
+                    raise
+        finally:
+            if _gauge_credit_session is not None:
+                _gauge_credit_closed_event = _gauge_credit_session.close()
+                _gauge_swap_state["closed_event"] = dict(
+                    _gauge_credit_closed_event
                 )
-                raise
+                _emit(
+                    "ZeGrid: gauge credit CLOSED — no credit is available to the "
+                    "cache/stack/admission (RAM-only from here)",
+                    callback=progress_callback,
+                )
+                _log_line(
+                    "ZeGrid gauge credit: "
+                    + json.dumps(_gauge_credit_closed_event, sort_keys=True)
+                )
         _gauge_rep.end(
             throughput=_fmt_throughput(len(descs), timings.get("gauge"), "frames/s")
         )
@@ -18549,6 +19115,17 @@ def _run_single(
     if gauge_cache_dir.exists():
         if not _safe_rmtree(gauge_cache_dir, progress_callback):
             cleanup_failures.append(str(gauge_cache_dir))
+
+    # ZM-GAUGE-SWAP-G2A: the credit MUST be closed before any cache/stack
+    # admission. This is a fail-loud assertion, not a decision: the revalidation
+    # below is strictly RAM-only and never receives a credit object.
+    if _gauge_credit_session is not None:
+        _gauge_credit_session.require_closed_for_stack()
+        _emit(
+            "ZeGrid: post-gauge re-admission is RAM-only — the gauge credit is "
+            "closed (no credit can reach the cache, stack, assembly or export)",
+            callback=progress_callback,
+        )
 
     # ------------------------------------------------------------------
     # ZM-ZEGRID-R55-D2 rework-1 — FRESH 90 % LAUNCH REVALIDATION.
@@ -18904,6 +19481,37 @@ def _run_single(
     )
 
     task_cids = [t[0].cell_id for t in cell_tasks]
+    # ZM-GAUGE-SWAP-G2b (O2): ONE structured, JSON-safe manifest block for the
+    # gauge memory policy. ``None`` for every ram_only run, so the pre-G2b
+    # manifest is preserved byte for byte. Diagnostic only: never an input.
+    _gauge_swap_decision = _gauge_swap_state.get("effective_decision")
+    _gauge_swap_execution_digest = None
+    if _gauge_credit_plan_applied:
+        _gauge_swap_plan_set = getattr(_r55_active_decision, "plan_set", None)
+        _gauge_swap_admission_decision = getattr(
+            _gauge_swap_plan_set, "admission", None
+        )
+        _gauge_swap_execution_digest = getattr(
+            _gauge_swap_admission_decision, "execution_digest", None
+        )
+    _gauge_swap_block = _gauge_swap_diagnostics_block(
+        policy=_gauge_memory_policy,
+        session=_gauge_credit_session,
+        admission_decision=_gauge_swap_decision,
+        open_event=_gauge_swap_state.get("open_event"),
+        closed_event=_gauge_swap_state.get("closed_event"),
+        credit_applied=_gauge_credit_plan_applied,
+        gauge_workers_effective=(1 if _gauge_credit_plan_applied else None),
+        not_applicable_reason=_gauge_swap_state.get("not_applicable_reason"),
+        execution_digest=_gauge_swap_execution_digest,
+    )
+
+    # O1: the SAME credit observation is published in the active admission
+    # diagnostics (``r55_scheduler.admission.gauge_credit``). None -> absent.
+    _gauge_swap_admission_record = _r55_gauge_credit_admission_record(
+        policy=_gauge_memory_policy, decision=_gauge_swap_decision
+    )
+
     per_cell_diagnostics = {
         "cells_in_flight": int(cells_in_flight),
         "cpu": int(os.cpu_count() or 1),
@@ -18927,7 +19535,28 @@ def _run_single(
         "cpu_fallback_used": False,
         "cpu_fallback_plan": dict(cpu_fallback_info),
         # ZM-ZEGRID-R41-B: the full 80 %-plan / 90 %-admit contract trail.
-        "ram_contract": _ram_contract_diagnostics(_adm, _final, _initial_bundle),
+        "ram_contract": _ram_contract_diagnostics(
+            _adm,
+            _final,
+            _initial_bundle,
+            **_gauge_credit_ram_contract_fields(
+                credit_applied=_gauge_credit_plan_applied,
+                # O1 (G2b/G4): policy/A/B_ram/S_credit/needed/sources. The
+                # SAME helper feeds every ram_contract site, so the per-cell
+                # overrides cannot drop these fields again.
+                policy=(
+                    _gauge_memory_policy
+                    if _gauge_swap_block is not None else None
+                ),
+                admission_decision=_gauge_swap_decision,
+                block=_gauge_swap_block,
+            ),
+        ),
+        # ZM-GAUGE-SWAP-G2b: additive policy/credit block (absent for ram_only).
+        **(
+            {"gauge_swap": _gauge_swap_block}
+            if _gauge_swap_block is not None else {}
+        ),
         # ZM-ZEGRID-FD-EXHAUSTION (A): additive, observed descriptor limits so a
         # future EMFILE is diagnosable from the run record alone (the raise itself
         # already ran once at ZeGrid entry and is cached per process).
@@ -23700,7 +24329,21 @@ def _run_single(
         per_cell_diagnostics["cpu_streaming"] = dict(cpu_streaming)
         per_cell_diagnostics["cpu_fallback_plan"] = dict(cpu_fallback_info)
         per_cell_diagnostics["ram_contract"] = _ram_contract_diagnostics(
-            _adm, _final, _initial_bundle
+            _adm,
+            _final,
+            _initial_bundle,
+            **_gauge_credit_ram_contract_fields(
+                credit_applied=_gauge_credit_plan_applied,
+                # O1 (G2b/G4): policy/A/B_ram/S_credit/needed/sources. The
+                # SAME helper feeds every ram_contract site, so the per-cell
+                # overrides cannot drop these fields again.
+                policy=(
+                    _gauge_memory_policy
+                    if _gauge_swap_block is not None else None
+                ),
+                admission_decision=_gauge_swap_decision,
+                block=_gauge_swap_block,
+            ),
         )
         per_cell_diagnostics["r55_run_waves"] = int(_r55_run_wave_count)
         per_cell_diagnostics["r55_run_shrink_steps"] = int(
@@ -23763,7 +24406,21 @@ def _run_single(
         per_cell_diagnostics["cpu_streaming"] = dict(cpu_streaming)
         per_cell_diagnostics["cpu_fallback_plan"] = dict(cpu_fallback_info)
         per_cell_diagnostics["ram_contract"] = _ram_contract_diagnostics(
-            _adm, _final, _initial_bundle
+            _adm,
+            _final,
+            _initial_bundle,
+            **_gauge_credit_ram_contract_fields(
+                credit_applied=_gauge_credit_plan_applied,
+                # O1 (G2b/G4): policy/A/B_ram/S_credit/needed/sources. The
+                # SAME helper feeds every ram_contract site, so the per-cell
+                # overrides cannot drop these fields again.
+                policy=(
+                    _gauge_memory_policy
+                    if _gauge_swap_block is not None else None
+                ),
+                admission_decision=_gauge_swap_decision,
+                block=_gauge_swap_block,
+            ),
         )
         per_cell_diagnostics["r55_run_waves"] = int(_r55_run_wave_count)
         per_cell_diagnostics["r55_run_shrink_steps"] = int(
@@ -23877,7 +24534,21 @@ def _run_single(
                     ) from exc
                 # Adopt the freshly admitted CPU bundle as the ONLY source of truth.
                 _gpu_attempt_contract = dict(_ram_contract_diagnostics(
-                    _adm, _final, _initial_bundle
+                    _adm,
+                    _final,
+                    _initial_bundle,
+                    **_gauge_credit_ram_contract_fields(
+                        credit_applied=_gauge_credit_plan_applied,
+                        # O1 (G2b/G4): policy/A/B_ram/S_credit/needed/sources. The
+                        # SAME helper feeds every ram_contract site, so the per-cell
+                        # overrides cannot drop these fields again.
+                        policy=(
+                            _gauge_memory_policy
+                            if _gauge_swap_block is not None else None
+                        ),
+                        admission_decision=_gauge_swap_decision,
+                        block=_gauge_swap_block,
+                    ),
                 ))
                 _final = _fb_final
                 _adm = _fb_adm
@@ -23905,13 +24576,43 @@ def _run_single(
                 per_cell_diagnostics["cpu_fallback_plan"] = dict(cpu_fallback_info)
                 per_cell_diagnostics["cpu_streaming"] = dict(cpu_streaming)
                 per_cell_diagnostics["ram_contract"] = _ram_contract_diagnostics(
-                    _adm, _final, _initial_bundle
+                    _adm,
+                    _final,
+                    _initial_bundle,
+                    **_gauge_credit_ram_contract_fields(
+                        credit_applied=_gauge_credit_plan_applied,
+                        # O1 (G2b/G4): policy/A/B_ram/S_credit/needed/sources. The
+                        # SAME helper feeds every ram_contract site, so the per-cell
+                        # overrides cannot drop these fields again.
+                        policy=(
+                            _gauge_memory_policy
+                            if _gauge_swap_block is not None else None
+                        ),
+                        admission_decision=_gauge_swap_decision,
+                        block=_gauge_swap_block,
+                    ),
                 )
                 # The GPU attempt's own contract history is retained SEPARATELY so a
                 # runtime fallback never overwrites the only recorded evidence.
                 per_cell_diagnostics["gpu_attempt_ram_contract"] = _gpu_attempt_contract
                 per_cell_diagnostics["runtime_cpu_fallback_contract"] = (
-                    _ram_contract_diagnostics(_adm, _final, _fb_seed)
+                    _ram_contract_diagnostics(
+                        _adm,
+                        _final,
+                        _fb_seed,
+                        **_gauge_credit_ram_contract_fields(
+                            credit_applied=_gauge_credit_plan_applied,
+                            # O1 (G2b/G4): policy/A/B_ram/S_credit/needed/sources. The
+                            # SAME helper feeds every ram_contract site, so the per-cell
+                            # overrides cannot drop these fields again.
+                            policy=(
+                                _gauge_memory_policy
+                                if _gauge_swap_block is not None else None
+                            ),
+                            admission_decision=_gauge_swap_decision,
+                            block=_gauge_swap_block,
+                        ),
+                    )
                 )
                 _emit(
                     f"ZeGrid: exact-CPU fallback ADMITTED on the same geometry — "
@@ -24845,6 +25546,9 @@ def _run_single(
                         else None
                     )
                 ),
+                # G2b (O1): policy/A/B_ram/S_credit/sources in the admission
+                # diagnostics. ``None`` (RAM-only) leaves the block unchanged.
+                gauge_credit=_gauge_swap_admission_record,
             )
             if _r55_active_gpu_decision is not None:
                 _r55_scheduler_block["gpu_execution"] = dict(
@@ -26428,6 +27132,16 @@ def _write_outputs(
         "ram_contract": (
             (per_cell_diagnostics or {}).get("ram_contract")
             if isinstance(per_cell_diagnostics, dict) else None
+        ),
+        # ZM-GAUGE-SWAP-G2b (O2): the bounded gauge-swap policy/credit record is a
+        # FIRST-CLASS manifest block (not only a run-log line). Omitted entirely
+        # for ram_only runs, so a disabled/absent policy keeps the exact previous
+        # manifest shape.
+        **(
+            {"gauge_swap": (per_cell_diagnostics or {}).get("gauge_swap")}
+            if isinstance(per_cell_diagnostics, dict)
+            and (per_cell_diagnostics.get("gauge_swap") is not None)
+            else {}
         ),
         # ZM-ZEGRID-R36: the RAM-adaptive CPU streaming-tile decision (clear,
         # auditable block; on a comfortable machine selected_tile_size=128 with an

@@ -472,6 +472,14 @@ class PlanContext:
     # at a time, one reduction workspace); ``None`` keeps the historical CPU
     # concurrency search unchanged.
     max_units_in_flight: int | None = None
+    # ZM-GAUGE-SWAP-G2A: the per-group admission input for THIS context
+    # (``gauge_admission.GaugeCredit`` or ``None``). ``None`` — the default and
+    # every non-gauge caller — makes the final validator evaluate the frozen
+    # overlap topology under ``ram_only``, byte-identically to the historical
+    # single-budget comparison. It is NEVER a licence to skip validation: the
+    # validator always runs and the gauge group is the only ceiling that may be
+    # raised, by the credit itself.
+    gauge_credit: object | None = None
 
     @property
     def prefetch_disk_bytes(self) -> int:
@@ -621,6 +629,11 @@ class PlanSet:
     identity: FrozenIdentity
     run_id: str = ""
     scheduler_version: str = SCHEDULER_VERSION
+    # ZM-GAUGE-SWAP-G3 REWORK-1: the ONE admission decision that admitted this
+    # exact plan set (a ``gauge_admission.GroupDecision``), kept so the engine
+    # can publish its versioned ``execution_digest`` without re-deriving it.
+    # ``None`` for callers that do not build their plan through this module.
+    admission: object | None = None
 
     def phase_map(self) -> dict[str, ResourceEnvelope]:
         return {e.phase: e for e in self.phases}
@@ -2088,6 +2101,63 @@ def select_joint_candidate(
 # PlanSet assembly
 # ---------------------------------------------------------------------------
 
+def _admission_decision(
+    envelopes: Sequence[ResourceEnvelope],
+    budget_bytes: int,
+    gauge_credit: object | None,
+):
+    """The ONE admission authority for a validated envelope set (G2a).
+
+    Every validated plan candidate — gauge-eligible or not — is admitted by
+    :func:`gauge_admission.admit_validated`, which is the G1b per-group
+    evaluator over the frozen overlap topology. With ``gauge_credit=None`` the
+    evaluator runs under ``ram_only`` and its numbers/verdict are byte-identical
+    to the historical ``aggregate_host_peak_bytes(...) > budget`` comparison.
+
+    The import is deliberately LOCAL: non-gauge engine paths that import this
+    scheduler module never pull the capacity/admission modules into their
+    dependency graph.
+    """
+    from .gauge_admission import admit_validated
+
+    return admit_validated(
+        envelopes, int(budget_bytes), gauge_credit  # type: ignore[arg-type]
+    )
+
+
+def _admission_refusal(
+    decision,
+    context: PlanContext,
+    *,
+    where: str,
+) -> PlanRefused:
+    """Build the typed refusal for a refused validated envelope set."""
+    raw_peak = int(decision.aggregate_raw_bytes)
+    peak = int(decision.aggregate_margined_bytes)
+    margin = f"{int(context.margin_num)}/{int(context.margin_den)}"
+    legacy_detail = (
+        f"aggregate host peak {peak} B (raw {raw_peak} B + margin "
+        f"{margin}) > budget {context.budget_bytes} B"
+    )
+    policy = str(getattr(decision, "policy", "ram_only"))
+    code = str(getattr(decision, "reason_code", REASON_REFUSE_HOST_RAM))
+    if policy == "ram_only" or code == REASON_REFUSE_HOST_RAM:
+        # Historical refusal, byte for byte (policy OFF / RAM-only groups).
+        return PlanRefused(REASON_REFUSE_HOST_RAM, legacy_detail)
+    first = None
+    refusals = tuple(getattr(decision, "refusals", ()) or ())
+    if refusals:
+        first = refusals[0]
+    detail = legacy_detail + f"; typed refusal {code} at {where}"
+    if first is not None:
+        detail += (
+            f" (actor={first.actor}, phases={list(first.phases)}, "
+            f"margined={int(first.margined_bytes)} B, "
+            f"ceiling={int(first.ceiling_bytes)} B, detail={first.detail})"
+        )
+    return PlanRefused(code, detail)
+
+
 def _host_envelope(context: PlanContext) -> HostEnvelope:
     return HostEnvelope(
         observation_source=context.observation_source,
@@ -2280,13 +2350,18 @@ def build_plan_set(
     envelopes = [_request_envelope(context, r) for r in requests]
     envelopes.append(_stack_envelope(context, candidate))
     validated = validate_envelope_set(envelopes, headless=True)
-    raw_peak, peak = aggregate_host_peak_bytes(validated)
-    if peak > int(context.budget_bytes):
+    admission = _admission_decision(
+        validated,
+        int(context.budget_bytes),
+        getattr(context, "gauge_credit", None),
+    )
+    raw_peak = int(admission.aggregate_raw_bytes)
+    peak = int(admission.aggregate_margined_bytes)
+    if not admission.admitted:
+        refusal = _admission_refusal(admission, context, where="plan_set")
         raise PlanRefused(
-            REASON_REFUSE_HOST_RAM,
-            f"aggregate host peak {peak} B (raw {raw_peak} B + margin "
-            f"{context.margin_num}/{context.margin_den}) > budget "
-            f"{context.budget_bytes} B",
+            refusal.reason_code,
+            refusal.detail,
             candidates=[candidate],
         )
 
@@ -2355,6 +2430,7 @@ def build_plan_set(
         plan_hash=plan_hash,
         identity=context.identity,
         run_id=context.run_id,
+        admission=admission,
     )
 
 
@@ -2669,14 +2745,20 @@ def build_joint_plan_set(
     ]
     envelopes.append(_gpu_stack_envelope(joint, match))
     validated = validate_envelope_set(envelopes, headless=True)
-    raw_peak, peak = aggregate_host_peak_bytes(validated)
-    if peak > int(host_context.budget_bytes):
+    admission = _admission_decision(
+        validated,
+        int(host_context.budget_bytes),
+        getattr(host_context, "gauge_credit", None),
+    )
+    raw_peak = int(admission.aggregate_raw_bytes)
+    peak = int(admission.aggregate_margined_bytes)
+    if not admission.admitted:
+        refusal = _admission_refusal(
+            admission, host_context, where="joint_plan_set"
+        )
         raise PlanRefused(
-            REASON_REFUSE_HOST_RAM,
-            f"aggregate host peak {peak} B (raw {raw_peak} B + margin "
-            f"{host_context.margin_num}/"
-            f"{host_context.margin_den}) > budget "
-            f"{host_context.budget_bytes} B",
+            refusal.reason_code,
+            refusal.detail,
             candidates=[match],
         )
     device_raw, _device_margin_applied = aggregate_device_peak_bytes(
@@ -2760,6 +2842,7 @@ def build_joint_plan_set(
         identity=host_context.identity,
         run_id=host_context.run_id,
         scheduler_version=JOINT_SCHEDULER_VERSION,
+        admission=admission,
     )
 
 

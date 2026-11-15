@@ -118,6 +118,7 @@ except Exception:  # pragma: no cover - defensive
         "zegrid_cell_gauge_mode",
         "zegrid_layout",
         "zegrid_sip_mode",
+        "zegrid_gauge_memory_policy",
     )
 
 _ZEGRID_POLICY_VALID_DEFAULTS = {
@@ -127,7 +128,24 @@ _ZEGRID_POLICY_VALID_DEFAULTS = {
     "zegrid_cell_gauge_mode": None,
     "zegrid_layout": None,
     "zegrid_sip_mode": "keep",
+    # ZM-GAUGE-SWAP-G2b: closed enum, default RAM-only.
+    "zegrid_gauge_memory_policy": "ram_only",
 }
+
+# ZM-GAUGE-SWAP-G2b: the two policy tokens the checkbox maps to. The engine
+# re-validates the closed enum, so the GUI never invents a third value.
+_GAUGE_SWAP_POLICY_RAM_ONLY = "ram_only"
+_GAUGE_SWAP_POLICY_BOUNDED_SWAP = "bounded_swap"
+
+
+def _zegrid_gauge_swap_platform_supported() -> bool:
+    """True only where the bounded gauge-swap credit exists (Linux).
+
+    The engine's own §4.7 eligibility also requires Linux; this helper exists so
+    the GUI can show the SAME rule as a visible, testable control state instead
+    of letting a user tick a checkbox that can never take effect.
+    """
+    return sys.platform.startswith("linux")
 
 logger = logging.getLogger(__name__)
 
@@ -2401,6 +2419,65 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
         self._apply_zegrid_gauge_import_control_state()
 
+        # ZM-GAUGE-SWAP-G2b: opt-in bounded gauge-swap credit. EXECUTION-ONLY:
+        # it can never finance the stack/cache/assembly/export and never changes
+        # the science, the identity or the durable stores. Linux-only; on any
+        # other platform the control stays visible but DISABLED with the reason
+        # spelled out on the same row (never a silently ignored checkbox).
+        gauge_swap_check = QCheckBox(
+            self._tr(
+                "qt_field_zegrid_gauge_memory_policy_label",
+                "Autoriser un secours swap limité pour la jauge ; peut ralentir ; "
+                "aucun crédit pour le stack",
+            )
+        )
+        gauge_swap_tip = self._tr(
+            "qt_field_zegrid_gauge_memory_policy_tip",
+            "Off (default): the gauge must fit host RAM, exactly as before. On: "
+            "a bounded share of the effective disk swap (never more than 90 % "
+            "of it) may finance the ONE gauge worker, so a fresh gauge that "
+            "does not fit RAM can still run — slower. No credit is ever given "
+            "to the stack, the cache, the assembly or the export. No effect "
+            "outside an ACTIVE-CPU run that computes a FRESH global gauge: the "
+            "GPU backend, a restored or imported gauge and a per-cell gauge "
+            "stay strictly RAM-only. Turning it off again is strictly RAM-only "
+            "and never touches the durable stores.",
+        )
+        gauge_swap_check.setToolTip(gauge_swap_tip)
+        layout.addRow(gauge_swap_check)
+        self._zegrid_gauge_swap_checkbox = gauge_swap_check
+        self._zegrid_gauge_swap_tip = gauge_swap_tip
+
+        gauge_swap_note = QLabel("")
+        gauge_swap_note.setWordWrap(True)
+        gauge_swap_note.setStyleSheet("color: #555555; font-size: 11px;")
+        layout.addRow(QLabel(""), gauge_swap_note)
+        self._zegrid_gauge_swap_note = gauge_swap_note
+
+        self._config_fields["zegrid_gauge_memory_policy"] = {
+            "kind": "checkbox",
+            "widget": gauge_swap_check,
+            "type": str,
+            # The checkbox maps to the CLOSED enum, never to a boolean: the
+            # persisted config keeps an explicit, re-validated token.
+            "value_getter": lambda: (
+                _GAUGE_SWAP_POLICY_BOUNDED_SWAP
+                if gauge_swap_check.isChecked()
+                else _GAUGE_SWAP_POLICY_RAM_ONLY
+            ),
+        }
+        _cfg_gauge_swap = str(
+            self.config.get("zegrid_gauge_memory_policy", _GAUGE_SWAP_POLICY_RAM_ONLY)
+            or _GAUGE_SWAP_POLICY_RAM_ONLY
+        ).strip().lower()
+        gauge_swap_check.setChecked(
+            _cfg_gauge_swap == _GAUGE_SWAP_POLICY_BOUNDED_SWAP
+        )
+        gauge_swap_check.toggled.connect(  # type: ignore[arg-type]
+            lambda _checked=None: self._on_zegrid_gauge_memory_policy_toggled()
+        )
+        self._apply_zegrid_gauge_swap_control_state()
+
         gauge_label = QLabel(
             self._tr("qt_field_zegrid_cell_gauge_label", "Cell gauge mode")
         )
@@ -3452,6 +3529,93 @@ class ZeMosaicQtMainWindow(QMainWindow):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(enabled)
+
+    def _on_zegrid_gauge_memory_policy_toggled(self) -> None:
+        """Persist the checkbox as the closed enum token (never a bool)."""
+        try:
+            self._sync_config_key_from_widget("zegrid_gauge_memory_policy")
+        except Exception:
+            pass
+
+    def _apply_zegrid_gauge_swap_control_state(self) -> None:
+        """Enable the bounded gauge-swap opt-in only where it can take effect.
+
+        Requirement (contract §10.4 U2): the control is disabled/masked on an
+        unqualified platform WITH the reason visible, and its explanation also
+        states why the policy has no effect outside an ACTIVE-CPU run with a
+        fresh computed gauge (Q2). Unchecking it is strictly RAM-only and never
+        touches the durable stores.
+        """
+        checkbox = getattr(self, "_zegrid_gauge_swap_checkbox", None)
+        if checkbox is None:
+            return
+        supported = _zegrid_gauge_swap_platform_supported()
+        tip = str(getattr(self, "_zegrid_gauge_swap_tip", "") or "")
+        note = getattr(self, "_zegrid_gauge_swap_note", None)
+        try:
+            checkbox.setEnabled(bool(supported))
+        except Exception:
+            pass
+        if supported:
+            help_text = self._tr(
+                "qt_field_zegrid_gauge_memory_policy_help",
+                "Applies only to an ACTIVE ZeGrid CPU run that computes a fresh "
+                "global gauge. A GPU backend, a restored or imported gauge and "
+                "a per-cell gauge stay strictly RAM-only, and the stack, cache, "
+                "assembly and export are never credited. Off = the historical "
+                "RAM-only behaviour.",
+            )
+            if tip:
+                try:
+                    checkbox.setToolTip(tip)
+                except Exception:
+                    pass
+        else:
+            help_text = self._tr(
+                "qt_field_zegrid_gauge_memory_policy_unsupported",
+                "Not available on this platform ({platform}): the bounded "
+                "gauge-swap credit is Linux-only. This run stays strictly "
+                "RAM-only and nothing in the durable stores is changed.",
+            ).format(platform=SYSTEM_NAME)
+            try:
+                checkbox.setToolTip(help_text)
+            except Exception:
+                pass
+        if note is not None:
+            try:
+                note.setText(help_text)
+            except Exception:
+                pass
+
+    def _effective_gauge_memory_policy(self) -> str:
+        """The gauge memory policy THIS launch actually uses.
+
+        The persisted value is the user's choice; the engine re-validates the
+        closed enum. On a platform where the credit does not exist the
+        EFFECTIVE value is ``ram_only`` (the control is disabled and the reason
+        is shown), so the worker/snapshot can never announce a policy this host
+        cannot honour. No durable store is read or written here.
+        """
+        raw_value: Any = _GAUGE_SWAP_POLICY_RAM_ONLY
+        try:
+            raw_value = self.config.get(
+                "zegrid_gauge_memory_policy", _GAUGE_SWAP_POLICY_RAM_ONLY
+            )
+        except Exception:
+            raw_value = _GAUGE_SWAP_POLICY_RAM_ONLY
+        if raw_value is None:
+            raw = _GAUGE_SWAP_POLICY_RAM_ONLY
+        elif isinstance(raw_value, str):
+            raw = raw_value.strip().lower() or _GAUGE_SWAP_POLICY_RAM_ONLY
+        else:
+            # Unsupported type: hand the raw value to the engine, whose single
+            # validator is the authority (it refuses instead of guessing).
+            return raw_value  # type: ignore[return-value]
+        if raw == _GAUGE_SWAP_POLICY_BOUNDED_SWAP and not (
+            _zegrid_gauge_swap_platform_supported()
+        ):
+            return _GAUGE_SWAP_POLICY_RAM_ONLY
+        return raw
 
     def _gauge_import_transport(self):
         """The opt-in gauge-import mapping, or None when disabled/incomplete."""
@@ -10173,6 +10337,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 )
             except Exception:
                 pass
+        # ZM-GAUGE-SWAP-G2b: the EFFECTIVE gauge memory policy crosses the
+        # boundary explicitly (SEAM_ONLY_KWARGS lesson) and is the SAME value
+        # the run snapshot publishes. The engine's strict validator stays the
+        # single authority; this is transport, not validation.
+        worker_kwargs["zegrid_gauge_memory_policy"] = (
+            self._effective_gauge_memory_policy()
+        )
 
         return (), worker_kwargs
 
@@ -10214,6 +10385,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         snapshot["zegrid_resume_run_id"] = transport[
             "zegrid_resume_run_id"
         ]
+        # ZM-GAUGE-SWAP-G2b: snapshot == transport for the gauge memory policy
+        # too. The value is the EFFECTIVE one (platform-gated), so a snapshot
+        # can never advertise a bounded-swap run this host cannot honour.
+        snapshot["zegrid_gauge_memory_policy"] = (
+            self._effective_gauge_memory_policy()
+        )
         # The effective generic resume intent is part of the same promise. For
         # ZeGrid it is normalised to auto/off; other modes keep the historical
         # raw value (force/off semantics are theirs, not ZeGrid's).
@@ -10234,6 +10411,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
         """
         snapshot = self._serialize_config_for_save()
         self._apply_effective_zegrid_resume_to_snapshot(snapshot)
+        # ZM-GAUGE-SWAP-G2b: the EFFECTIVE gauge memory policy is part of the
+        # snapshot of the run that is actually about to start (platform-gated,
+        # engine re-validated). Written unconditionally so the early-return path
+        # of the resume helper can never publish a stale persisted value.
+        snapshot["zegrid_gauge_memory_policy"] = (
+            self._effective_gauge_memory_policy()
+        )
         gauge_import = self._gauge_import_transport()
         if gauge_import is not None:
             # Additive, only when the feature is used: a later reader of the
@@ -11472,6 +11656,23 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
         widget = binding.get("widget")
         kind = binding.get("kind")
+        if key == "zegrid_gauge_memory_policy":
+            # ZM-GAUGE-SWAP-G2b: the widget is a CHECKBOX but the stored value is
+            # a closed-enum token; a plain ``bool(value)`` would tick "ram_only".
+            checked = (
+                str(value or "").strip().lower()
+                == _GAUGE_SWAP_POLICY_BOUNDED_SWAP
+            )
+            self.config[key] = (
+                _GAUGE_SWAP_POLICY_BOUNDED_SWAP
+                if checked
+                else _GAUGE_SWAP_POLICY_RAM_ONLY
+            )
+            try:
+                widget.setChecked(checked)
+            except Exception:
+                pass
+            return
         try:
             if kind == "checkbox":
                 widget.setChecked(bool(value))

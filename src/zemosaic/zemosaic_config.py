@@ -188,6 +188,14 @@ DEFAULT_CONFIG = {
     # Diagnostic only; never a science/coverage/identity input. When False no
     # profiler, CUDA event, extra synchronization or per-tile record is created.
     "zegrid_stack_phase_profiling": False,
+    # ZM-GAUGE-SWAP-G2b: execution-only memory policy of the FRESH compute
+    # gauge. ``ram_only`` (default) is the historical RAM-only behaviour, byte
+    # for byte. ``bounded_swap`` may finance the SINGLETON gauge group with a
+    # bounded fraction of the effective disk swap (Linux, active CPU scheduler,
+    # fresh/in-memory gauge only). It never credits the stack/cache/assembly and
+    # never enters the scientific identity. Strict enum: an unknown value is
+    # refused by the engine (``validate_zegrid_run_policy``), never coerced.
+    "zegrid_gauge_memory_policy": "ram_only",
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
@@ -522,10 +530,17 @@ ZEGRID_RUN_POLICY_KEYS = (
     "zegrid_layout",
     "zegrid_sip_mode",
     "zegrid_stack_phase_profiling",
+    # ZM-GAUGE-SWAP-G2b: execution-only gauge memory policy (closed enum).
+    "zegrid_gauge_memory_policy",
 )
 
 _ZEGRID_GAUGE_MODES = ("auto", "global", "per_cell")
 _ZEGRID_SIP_MODES = ("keep", "strip")
+# Kept in sync with ``core.zegrid.gauge_swap_capacity.POLICY_*`` without
+# importing the engine core from the config module (config stays dependency-free
+# and importable by the GUI/CLI): the closed enum is duplicated ON PURPOSE and
+# the engine re-validates it in ``gauge_credit.resolve_gauge_memory_policy``.
+_ZEGRID_GAUGE_MEMORY_POLICIES = ("ram_only", "bounded_swap")
 
 
 def _policy_value(config: Any, key: str) -> Any:
@@ -631,6 +646,30 @@ def validate_zegrid_run_policy(config: Any) -> dict:
             f"{type(profiling_raw).__name__}={profiling_raw!r}"
         )
 
+    # ZM-GAUGE-SWAP-G2b: STRICT enum, default ``ram_only``. An absent key, None
+    # or a blank string is the historical default; any other value must already
+    # be one of the closed tokens (no guessing, no fuzzy match).
+    gauge_memory_raw = _policy_value(config, "zegrid_gauge_memory_policy")
+    if gauge_memory_raw is None:
+        gauge_memory_policy = "ram_only"
+    elif isinstance(gauge_memory_raw, str):
+        normalized_memory = gauge_memory_raw.strip().lower()
+        if not normalized_memory:
+            gauge_memory_policy = "ram_only"
+        elif normalized_memory in _ZEGRID_GAUGE_MEMORY_POLICIES:
+            gauge_memory_policy = normalized_memory
+        else:
+            raise ValueError(
+                "zegrid_gauge_memory_policy must be one of "
+                f"{_ZEGRID_GAUGE_MEMORY_POLICIES}, got {gauge_memory_raw!r}"
+            )
+    else:
+        raise ValueError(
+            "zegrid_gauge_memory_policy must be one of "
+            f"{_ZEGRID_GAUGE_MEMORY_POLICIES}, got "
+            f"{type(gauge_memory_raw).__name__}={gauge_memory_raw!r}"
+        )
+
     return {
         "zegrid_resource_recovery_enabled": enabled,
         "zegrid_resource_recovery_deadline_s": deadline,
@@ -639,6 +678,7 @@ def validate_zegrid_run_policy(config: Any) -> dict:
         "zegrid_layout": layout,
         "zegrid_sip_mode": sip_mode,
         "zegrid_stack_phase_profiling": profiling_raw,
+        "zegrid_gauge_memory_policy": gauge_memory_policy,
     }
 
 

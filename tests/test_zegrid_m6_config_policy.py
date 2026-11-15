@@ -25,6 +25,8 @@ EXPECTED_DEFAULTS = {
     "zegrid_sip_mode": "keep",
     # ZM-STACK-INSTRUMENTATION: additive default-OFF diagnostic key.
     "zegrid_stack_phase_profiling": False,
+    # ZM-GAUGE-SWAP-G2b: additive execution-only memory policy (closed enum).
+    "zegrid_gauge_memory_policy": "ram_only",
 }
 
 
@@ -74,6 +76,12 @@ def test_validate_accepts_defaults_and_none():
         ("zegrid_stack_phase_profiling", 0),
         ("zegrid_stack_phase_profiling", 1),
         ("zegrid_stack_phase_profiling", None),
+        # ZM-GAUGE-SWAP-G2b: the gauge memory policy is a STRICT closed enum.
+        ("zegrid_gauge_memory_policy", "swapped"),
+        ("zegrid_gauge_memory_policy", "bounded"),
+        ("zegrid_gauge_memory_policy", True),
+        ("zegrid_gauge_memory_policy", 1),
+        ("zegrid_gauge_memory_policy", ["ram_only"]),
     ],
 )
 def test_invalid_values_are_rejected_never_coerced(key, value):

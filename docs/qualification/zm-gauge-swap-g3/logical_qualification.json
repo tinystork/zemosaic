@@ -1,0 +1,972 @@
+{
+  "all_ok": true,
+  "base_head": "e25fb5133768adf4eb26950c63f86b970909b370",
+  "boundaries": {
+    "ceiling_exact_raw": {
+      "admitted": true,
+      "margined": 14388140441,
+      "raw": 12511426470,
+      "reason": "R55_OK"
+    },
+    "ceiling_minus_1_raw": {
+      "admitted": true,
+      "margined": 14388140440,
+      "raw": 12511426469,
+      "reason": "R55_OK"
+    },
+    "ceiling_plus_1_margined": {
+      "admitted": false,
+      "margined": 14388140442,
+      "raw": 12511426471,
+      "reason": "GAUGE_CREDIT_INSUFFICIENT"
+    },
+    "gauge_ceiling": 14388140441,
+    "raw_at_ceiling": 12511426470,
+    "stack_first_refused_raw": {
+      "admitted": false,
+      "ceiling": 8589934592,
+      "margined": 8589934593,
+      "raw": 7469508341
+    },
+    "stack_last_admitted_raw": {
+      "admitted": true,
+      "ceiling": 8589934592,
+      "margined": 8589934591,
+      "raw": 7469508340
+    }
+  },
+  "checks": [
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 500,
+        "peaks": {
+          "assembly": 400,
+          "cache_build": 200,
+          "cell_stack_stream": 300,
+          "export": 50,
+          "gauge": 100
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 1,
+        "peaks": {
+          "assembly": 1,
+          "cache_build": 1,
+          "cell_stack_stream": 1,
+          "export": 1,
+          "gauge": 1
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 100000,
+        "peaks": {
+          "assembly": 40000,
+          "cache_build": 20000,
+          "cell_stack_stream": 30000,
+          "export": 5000,
+          "gauge": 10000
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 57,
+        "peaks": {
+          "assembly": 17,
+          "cache_build": 11,
+          "cell_stack_stream": 13,
+          "export": 19,
+          "gauge": 7
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 56,
+        "peaks": {
+          "assembly": 17,
+          "cache_build": 11,
+          "cell_stack_stream": 13,
+          "export": 19,
+          "gauge": 7
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 500000000,
+        "peaks": {
+          "assembly": 222222222,
+          "cache_build": 98765432,
+          "cell_stack_stream": 111111111,
+          "export": 33333333,
+          "gauge": 123456789
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 460,
+        "peaks": {
+          "assembly": 100,
+          "cache_build": 100,
+          "cell_stack_stream": 100,
+          "export": 100,
+          "gauge": 100
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 459,
+        "peaks": {
+          "assembly": 100,
+          "cache_build": 100,
+          "cell_stack_stream": 100,
+          "export": 100,
+          "gauge": 100
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 322,
+        "peaks": {
+          "assembly": 80,
+          "cache_build": 60,
+          "cell_stack_stream": 70,
+          "export": 90,
+          "gauge": 50
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 44,
+        "peaks": {
+          "assembly": 11,
+          "cache_build": 5,
+          "cell_stack_stream": 7,
+          "export": 13,
+          "gauge": 3
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 0,
+        "peaks": {
+          "assembly": 0,
+          "cache_build": 0,
+          "cell_stack_stream": 0,
+          "export": 0,
+          "gauge": 0
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 1149999928,
+        "peaks": {
+          "assembly": 1,
+          "cache_build": 1,
+          "cell_stack_stream": 1,
+          "export": 1,
+          "gauge": 999999937
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 1149999927,
+        "peaks": {
+          "assembly": 1,
+          "cache_build": 1,
+          "cell_stack_stream": 1,
+          "export": 1,
+          "gauge": 999999937
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 17,
+        "peaks": {
+          "assembly": 4,
+          "cache_build": 2,
+          "cell_stack_stream": 3,
+          "export": 5,
+          "gauge": 1
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 100,
+        "peaks": {
+          "assembly": 4,
+          "cache_build": 2,
+          "cell_stack_stream": 3,
+          "export": 5,
+          "gauge": 1
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_fixture",
+      "detail": {
+        "b_ram": 1099511627776,
+        "peaks": {
+          "assembly": 137438953472,
+          "cache_build": 549755813888,
+          "cell_stack_stream": 274877906944,
+          "export": 68719476736,
+          "gauge": 1099511627776
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L1_off_sweep",
+      "detail": {
+        "fixtures": 16,
+        "status": "byte-identical",
+        "sweep_cases": 2000
+      },
+      "ok": true
+    },
+    {
+      "check": "L2_on_comfortable",
+      "detail": {
+        "compared": 3
+      },
+      "ok": true
+    },
+    {
+      "check": "L3_constrained_credit_sufficient",
+      "detail": {
+        "b_ram": 8589934592,
+        "credit_needed": 3758096384,
+        "p_gauge_margined": 12348030976,
+        "p_gauge_raw": 10737418240,
+        "s_credit": 5798205849,
+        "s_effectif": 6442450944,
+        "status": "credit_sufficient"
+      },
+      "ok": true
+    },
+    {
+      "check": "L3_gauge_admitted_with_credit",
+      "detail": {
+        "admitted": true,
+        "ceiling_bytes": 14388140441,
+        "contains_gauge": true,
+        "credit_applied": true,
+        "is_gauge": true,
+        "margined_bytes": 12348030976,
+        "phases": [
+          "gauge"
+        ],
+        "raw_bytes": 10737418240
+      },
+      "ok": true
+    },
+    {
+      "check": "L3_stack_refused_ram_only",
+      "detail": {
+        "reason": "R55_REFUSE_HOST_RAM",
+        "refusals": [
+          {
+            "actor": "cell_stack_stream",
+            "ceiling_bytes": 8589934592,
+            "code": "R55_REFUSE_HOST_RAM",
+            "detail": "margined_peak_exceeds_ram_ceiling",
+            "margined_bytes": 11113227879,
+            "phases": [
+              "cell_stack_stream"
+            ],
+            "raw_bytes": 9663676416
+          }
+        ],
+        "stack": {
+          "admitted": false,
+          "ceiling_bytes": 8589934592,
+          "contains_gauge": false,
+          "credit_applied": false,
+          "is_gauge": false,
+          "margined_bytes": 11113227879,
+          "phases": [
+            "cell_stack_stream"
+          ],
+          "raw_bytes": 9663676416
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L3_credit_never_subtracted_from_peak",
+      "detail": {
+        "aggregate_margined_bytes": 12348030976,
+        "aggregate_raw_bytes": 10737418240,
+        "b_ram_bytes": 8589934592,
+        "credit_bytes": 5798205849,
+        "credit_granted": true,
+        "credit_never_subtracted_from_peak": true,
+        "credit_refusal_code": null,
+        "group_count": 5,
+        "policy": "bounded_swap"
+      },
+      "ok": true
+    },
+    {
+      "check": "L8_external_gauge_credited_stack_ram_only",
+      "detail": {
+        "class": "external_spool",
+        "digest": "sha256:1e53a2d21073c5fef5d212abdb5fcc6d0470c6e8478fcc257faede93222548f0",
+        "gauge": {
+          "admitted": true,
+          "ceiling_bytes": 14388140441,
+          "contains_gauge": true,
+          "credit_applied": true,
+          "is_gauge": true,
+          "margined_bytes": 12348030976,
+          "phases": [
+            "gauge"
+          ],
+          "raw_bytes": 10737418240
+        },
+        "stack": {
+          "admitted": true,
+          "ceiling_bytes": 8589934592,
+          "contains_gauge": false,
+          "credit_applied": false,
+          "is_gauge": false,
+          "margined_bytes": 602931200,
+          "phases": [
+            "cell_stack_stream"
+          ],
+          "raw_bytes": 524288000
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L8_external_stack_over_b_ram_refused",
+      "detail": {
+        "class": "external_spool",
+        "reason": "R55_REFUSE_HOST_RAM",
+        "stack": {
+          "admitted": false,
+          "ceiling_bytes": 8589934592,
+          "contains_gauge": false,
+          "credit_applied": false,
+          "is_gauge": false,
+          "margined_bytes": 11113227879,
+          "phases": [
+            "cell_stack_stream"
+          ],
+          "raw_bytes": 9663676416
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L4_disabled_keeps_legacy_refusal",
+      "detail": {
+        "actor": "gauge",
+        "ceiling_bytes": 8589934592,
+        "code": "R55_REFUSE_HOST_RAM",
+        "detail": "margined_peak_exceeds_ram_ceiling",
+        "margined_bytes": 12348030976,
+        "phases": [
+          "gauge"
+        ],
+        "raw_bytes": 10737418240
+      },
+      "ok": true
+    },
+    {
+      "check": "L4_not_applicable_restored",
+      "detail": {},
+      "ok": true
+    },
+    {
+      "check": "L4_not_applicable_imported",
+      "detail": {},
+      "ok": true
+    },
+    {
+      "check": "L4_not_applicable_platform",
+      "detail": {},
+      "ok": true
+    },
+    {
+      "check": "L4_not_applicable_gpu",
+      "detail": {},
+      "ok": true
+    },
+    {
+      "check": "L4_requires_one_worker",
+      "detail": {},
+      "ok": true
+    },
+    {
+      "check": "L4_group_not_singleton",
+      "detail": {},
+      "ok": true
+    },
+    {
+      "check": "L4_unknown_no_decision",
+      "detail": {},
+      "ok": true
+    },
+    {
+      "check": "L4_unknown_cgroup_swap",
+      "detail": {},
+      "ok": true
+    },
+    {
+      "check": "L4_swap_below_minimum",
+      "detail": {
+        "a_raw_bytes": 10737418240,
+        "b_admit_bytes": 9663676416,
+        "b_ram_bytes": 8589934592,
+        "b_ram_eff_bytes": 8589934592,
+        "cgroup_levels": [
+          {
+            "detail": "root_cgroup_is_unbounded",
+            "is_root": true,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          }
+        ],
+        "cgroup_ram": {
+          "headroom_bytes": null,
+          "status": "unlimited"
+        },
+        "cgroup_swap": {
+          "headroom_bytes": null,
+          "status": "unlimited"
+        },
+        "commit": {
+          "allowed": true,
+          "headroom_bytes": null,
+          "new_commit_bytes": 10737418240,
+          "overcommit_mode": 0,
+          "reason": "overcommit_mode_0_no_hard_gate",
+          "sources": {
+            "commit_limit": null,
+            "committed_as": null
+          },
+          "status": "not_applicable"
+        },
+        "covered": false,
+        "credit_needed_bytes": 3758096384,
+        "facts": {},
+        "limits": [
+          "credit is a PERMIT, never a reservation: the OS may keep pages in RAM, evict other processes or refuse an allocation",
+          "a synthetic fact or a fake MemAvailable proves the logic, never physical swap",
+          "zram free is RAM-backed and is excluded from S_disk_free",
+          "SwapCached is neither added to A nor to swap free",
+          "no OOM guarantee is made by this contract",
+          "integer arithmetic only: no float and no infinity enters a decision"
+        ],
+        "p_gauge_margined_bytes": 12348030976,
+        "p_gauge_raw_bytes": 10737418240,
+        "policy": "bounded_swap",
+        "ram_guard": {
+          "b_ram_covers_non_pageable": true,
+          "non_pageable_new_bytes": 356515840
+        },
+        "reasons": [
+          "effective_swap_below_minimum"
+        ],
+        "s_credit_bytes": 0,
+        "s_disk_free_bytes": 67108864,
+        "s_effectif_bytes": 67108864,
+        "schema": "gauge-swap-capacity-v1",
+        "status": "credit_insufficient",
+        "swap_devices": [
+          {
+            "eligible_for_disk_credit": true,
+            "free_bytes": 67108864,
+            "name": "/swapfile",
+            "reason": "backed_file",
+            "size_bytes": 68157440,
+            "type": "file",
+            "used_bytes": 1048576,
+            "zram": false
+          }
+        ]
+      },
+      "ok": true
+    },
+    {
+      "check": "L4_insufficient",
+      "detail": {
+        "a_raw_bytes": 10737418240,
+        "b_admit_bytes": 9663676416,
+        "b_ram_bytes": 8589934592,
+        "b_ram_eff_bytes": 8589934592,
+        "cgroup_levels": [
+          {
+            "detail": "root_cgroup_is_unbounded",
+            "is_root": true,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          }
+        ],
+        "cgroup_ram": {
+          "headroom_bytes": null,
+          "status": "unlimited"
+        },
+        "cgroup_swap": {
+          "headroom_bytes": null,
+          "status": "unlimited"
+        },
+        "commit": {
+          "allowed": true,
+          "headroom_bytes": null,
+          "new_commit_bytes": 10737418240,
+          "overcommit_mode": 0,
+          "reason": "overcommit_mode_0_no_hard_gate",
+          "sources": {
+            "commit_limit": null,
+            "committed_as": null
+          },
+          "status": "not_applicable"
+        },
+        "covered": false,
+        "credit_needed_bytes": 3758096384,
+        "facts": {},
+        "limits": [
+          "credit is a PERMIT, never a reservation: the OS may keep pages in RAM, evict other processes or refuse an allocation",
+          "a synthetic fact or a fake MemAvailable proves the logic, never physical swap",
+          "zram free is RAM-backed and is excluded from S_disk_free",
+          "SwapCached is neither added to A nor to swap free",
+          "no OOM guarantee is made by this contract",
+          "integer arithmetic only: no float and no infinity enters a decision"
+        ],
+        "p_gauge_margined_bytes": 12348030976,
+        "p_gauge_raw_bytes": 10737418240,
+        "policy": "bounded_swap",
+        "ram_guard": {
+          "b_ram_covers_non_pageable": true,
+          "non_pageable_new_bytes": 356515840
+        },
+        "reasons": [],
+        "s_credit_bytes": 1932735283,
+        "s_disk_free_bytes": 2147483648,
+        "s_effectif_bytes": 2147483648,
+        "schema": "gauge-swap-capacity-v1",
+        "status": "credit_insufficient",
+        "swap_devices": [
+          {
+            "eligible_for_disk_credit": true,
+            "free_bytes": 2147483648,
+            "name": "/swapfile",
+            "reason": "backed_file",
+            "size_bytes": 2148532224,
+            "type": "file",
+            "used_bytes": 1048576,
+            "zram": false
+          }
+        ]
+      },
+      "ok": true
+    },
+    {
+      "check": "L4_commit_insufficient",
+      "detail": {
+        "a_raw_bytes": 10737418240,
+        "b_admit_bytes": 9663676416,
+        "b_ram_bytes": 8589934592,
+        "b_ram_eff_bytes": 8589934592,
+        "cgroup_levels": [
+          {
+            "detail": "root_cgroup_is_unbounded",
+            "is_root": true,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          }
+        ],
+        "cgroup_ram": {
+          "headroom_bytes": null,
+          "status": "unlimited"
+        },
+        "cgroup_swap": {
+          "headroom_bytes": null,
+          "status": "unlimited"
+        },
+        "commit": {
+          "allowed": false,
+          "headroom_bytes": 1073741824,
+          "new_commit_bytes": 10737418240,
+          "overcommit_mode": 2,
+          "reason": "commit_headroom_insufficient",
+          "sources": {
+            "commit_limit": 1073741824,
+            "committed_as": 0
+          },
+          "status": "limited"
+        },
+        "covered": false,
+        "credit_needed_bytes": 3758096384,
+        "facts": {},
+        "limits": [
+          "credit is a PERMIT, never a reservation: the OS may keep pages in RAM, evict other processes or refuse an allocation",
+          "a synthetic fact or a fake MemAvailable proves the logic, never physical swap",
+          "zram free is RAM-backed and is excluded from S_disk_free",
+          "SwapCached is neither added to A nor to swap free",
+          "no OOM guarantee is made by this contract",
+          "integer arithmetic only: no float and no infinity enters a decision"
+        ],
+        "p_gauge_margined_bytes": 12348030976,
+        "p_gauge_raw_bytes": 10737418240,
+        "policy": "bounded_swap",
+        "ram_guard": {
+          "b_ram_covers_non_pageable": true,
+          "non_pageable_new_bytes": 356515840
+        },
+        "reasons": [
+          "commit_headroom_insufficient"
+        ],
+        "s_credit_bytes": 5798205849,
+        "s_disk_free_bytes": 6442450944,
+        "s_effectif_bytes": 6442450944,
+        "schema": "gauge-swap-capacity-v1",
+        "status": "credit_insufficient",
+        "swap_devices": [
+          {
+            "eligible_for_disk_credit": true,
+            "free_bytes": 6442450944,
+            "name": "/swapfile",
+            "reason": "backed_file",
+            "size_bytes": 6443499520,
+            "type": "file",
+            "used_bytes": 1048576,
+            "zram": false
+          }
+        ]
+      },
+      "ok": true
+    },
+    {
+      "check": "L4_nonpageable",
+      "detail": {
+        "a_raw_bytes": 1048576,
+        "b_admit_bytes": 943718,
+        "b_ram_bytes": 838860,
+        "b_ram_eff_bytes": 838860,
+        "cgroup_levels": [
+          {
+            "detail": "root_cgroup_is_unbounded",
+            "is_root": true,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          }
+        ],
+        "cgroup_ram": {
+          "headroom_bytes": null,
+          "status": "unlimited"
+        },
+        "cgroup_swap": {
+          "headroom_bytes": null,
+          "status": "unlimited"
+        },
+        "commit": {
+          "allowed": true,
+          "headroom_bytes": null,
+          "new_commit_bytes": 10737418240,
+          "overcommit_mode": 0,
+          "reason": "overcommit_mode_0_no_hard_gate",
+          "sources": {
+            "commit_limit": null,
+            "committed_as": null
+          },
+          "status": "not_applicable"
+        },
+        "covered": false,
+        "credit_needed_bytes": 12347192116,
+        "facts": {},
+        "limits": [
+          "credit is a PERMIT, never a reservation: the OS may keep pages in RAM, evict other processes or refuse an allocation",
+          "a synthetic fact or a fake MemAvailable proves the logic, never physical swap",
+          "zram free is RAM-backed and is excluded from S_disk_free",
+          "SwapCached is neither added to A nor to swap free",
+          "no OOM guarantee is made by this contract",
+          "integer arithmetic only: no float and no infinity enters a decision"
+        ],
+        "p_gauge_margined_bytes": 12348030976,
+        "p_gauge_raw_bytes": 10737418240,
+        "policy": "bounded_swap",
+        "ram_guard": {
+          "b_ram_covers_non_pageable": false,
+          "non_pageable_new_bytes": 356515840
+        },
+        "reasons": [
+          "b_ram_below_non_pageable_new"
+        ],
+        "s_credit_bytes": 5798205849,
+        "s_disk_free_bytes": 6442450944,
+        "s_effectif_bytes": 6442450944,
+        "schema": "gauge-swap-capacity-v1",
+        "status": "credit_insufficient",
+        "swap_devices": [
+          {
+            "eligible_for_disk_credit": true,
+            "free_bytes": 6442450944,
+            "name": "/swapfile",
+            "reason": "backed_file",
+            "size_bytes": 6443499520,
+            "type": "file",
+            "used_bytes": 1048576,
+            "zram": false
+          }
+        ]
+      },
+      "ok": true
+    },
+    {
+      "check": "L4_closed_table",
+      "detail": {
+        "emitted": {
+          "COMMIT_INSUFFICIENT": "GAUGE_CREDIT_COMMIT_INSUFFICIENT",
+          "DISABLED_legacy_refusal": "R55_REFUSE_HOST_RAM",
+          "GROUP_NOT_SINGLETON": "GAUGE_CREDIT_GROUP_NOT_SINGLETON",
+          "INSUFFICIENT": "GAUGE_CREDIT_INSUFFICIENT",
+          "NONPAGEABLE": "GAUGE_CREDIT_NONPAGEABLE_RAM_INSUFFICIENT",
+          "NOT_APPLICABLE_gpu": "GAUGE_CREDIT_NOT_APPLICABLE",
+          "NOT_APPLICABLE_imported": "GAUGE_CREDIT_NOT_APPLICABLE",
+          "NOT_APPLICABLE_platform": "GAUGE_CREDIT_NOT_APPLICABLE",
+          "NOT_APPLICABLE_restored": "GAUGE_CREDIT_NOT_APPLICABLE",
+          "REQUIRES_ONE_WORKER": "GAUGE_CREDIT_REQUIRES_ONE_WORKER",
+          "SWAP_BELOW_MINIMUM": "GAUGE_CREDIT_SWAP_BELOW_MINIMUM",
+          "UNKNOWN_CGROUP_SWAP": "GAUGE_CREDIT_UNKNOWN_CAPACITY",
+          "UNKNOWN_NO_DECISION": "GAUGE_CREDIT_UNKNOWN_CAPACITY"
+        },
+        "table": [
+          "R55_REFUSE_HOST_RAM",
+          "GAUGE_CREDIT_REQUIRES_ONE_WORKER",
+          "GAUGE_CREDIT_NONPAGEABLE_RAM_INSUFFICIENT",
+          "GAUGE_CREDIT_NOT_APPLICABLE",
+          "GAUGE_CREDIT_UNKNOWN_CAPACITY",
+          "GAUGE_CREDIT_DISABLED",
+          "GAUGE_CREDIT_SWAP_BELOW_MINIMUM",
+          "GAUGE_CREDIT_COMMIT_INSUFFICIENT",
+          "GAUGE_CREDIT_INSUFFICIENT",
+          "GAUGE_CREDIT_GROUP_NOT_SINGLETON"
+        ]
+      },
+      "ok": true
+    },
+    {
+      "check": "L5_ceiling_minus_1_raw",
+      "detail": {
+        "admitted": true,
+        "margined": 14388140440,
+        "raw": 12511426469,
+        "reason": "R55_OK"
+      },
+      "ok": true
+    },
+    {
+      "check": "L5_ceiling_exact_raw",
+      "detail": {
+        "admitted": true,
+        "margined": 14388140441,
+        "raw": 12511426470,
+        "reason": "R55_OK"
+      },
+      "ok": true
+    },
+    {
+      "check": "L5_ceiling_plus_1_margined",
+      "detail": {
+        "admitted": false,
+        "margined": 14388140442,
+        "raw": 12511426471,
+        "reason": "GAUGE_CREDIT_INSUFFICIENT"
+      },
+      "ok": true
+    },
+    {
+      "check": "L5_stack_last_admitted_raw",
+      "detail": {
+        "admitted": true,
+        "ceiling": 8589934592,
+        "margined": 8589934591,
+        "raw": 7469508340
+      },
+      "ok": true
+    },
+    {
+      "check": "L5_stack_first_refused_raw",
+      "detail": {
+        "admitted": false,
+        "ceiling": 8589934592,
+        "margined": 8589934593,
+        "raw": 7469508341
+      },
+      "ok": true
+    },
+    {
+      "check": "L6_group_margin",
+      "detail": {
+        "margined": 115,
+        "phases": [
+          "gauge"
+        ],
+        "raw": 100
+      },
+      "ok": true
+    },
+    {
+      "check": "L6_group_margin",
+      "detail": {
+        "margined": 690,
+        "phases": [
+          "cache_build",
+          "assembly"
+        ],
+        "raw": 600
+      },
+      "ok": true
+    },
+    {
+      "check": "L6_group_margin",
+      "detail": {
+        "margined": 345,
+        "phases": [
+          "cell_stack_stream"
+        ],
+        "raw": 300
+      },
+      "ok": true
+    },
+    {
+      "check": "L6_group_margin",
+      "detail": {
+        "margined": 58,
+        "phases": [
+          "export"
+        ],
+        "raw": 50
+      },
+      "ok": true
+    },
+    {
+      "check": "L6_aggregate_margin_parity",
+      "detail": {
+        "peak": 690,
+        "raw": 600
+      },
+      "ok": true
+    },
+    {
+      "check": "L6_no_double_margin",
+      "detail": {
+        "composite": {
+          "admitted": true,
+          "ceiling_bytes": 10000,
+          "contains_gauge": false,
+          "credit_applied": false,
+          "is_gauge": false,
+          "margined_bytes": 690,
+          "phases": [
+            "cache_build",
+            "assembly"
+          ],
+          "raw_bytes": 600
+        }
+      },
+      "ok": true
+    },
+    {
+      "check": "L7_oracle3_recompute",
+      "detail": {
+        "cases": 16,
+        "mismatches": []
+      },
+      "ok": true
+    }
+  ],
+  "contract": "docs/refactor/ZEGRID_GAUGE_SWAP_G0_CONTRACT_20261115.md \u00a74/\u00a712/\u00a713",
+  "counts": {
+    "checks": 50,
+    "failed": 0
+  },
+  "elapsed_s": 0.762,
+  "kind": "INJECTED FACTS ONLY (no /proc, no engine, no pressure)",
+  "limits": [
+    "A synthetic/injected MemAvailable proves the LOGIC only, never physical swap.",
+    "No engine, no scope, no OOM, no real allocation is exercised by this tool."
+  ],
+  "mission": "ZM-GAUGE-SWAP-G3-20261115",
+  "schema": "g3-logical-qualification-v1",
+  "typed_refusal_codes": {
+    "COMMIT_INSUFFICIENT": "GAUGE_CREDIT_COMMIT_INSUFFICIENT",
+    "DISABLED_legacy_refusal": "R55_REFUSE_HOST_RAM",
+    "GROUP_NOT_SINGLETON": "GAUGE_CREDIT_GROUP_NOT_SINGLETON",
+    "INSUFFICIENT": "GAUGE_CREDIT_INSUFFICIENT",
+    "NONPAGEABLE": "GAUGE_CREDIT_NONPAGEABLE_RAM_INSUFFICIENT",
+    "NOT_APPLICABLE_gpu": "GAUGE_CREDIT_NOT_APPLICABLE",
+    "NOT_APPLICABLE_imported": "GAUGE_CREDIT_NOT_APPLICABLE",
+    "NOT_APPLICABLE_platform": "GAUGE_CREDIT_NOT_APPLICABLE",
+    "NOT_APPLICABLE_restored": "GAUGE_CREDIT_NOT_APPLICABLE",
+    "REQUIRES_ONE_WORKER": "GAUGE_CREDIT_REQUIRES_ONE_WORKER",
+    "SWAP_BELOW_MINIMUM": "GAUGE_CREDIT_SWAP_BELOW_MINIMUM",
+    "UNKNOWN_CGROUP_SWAP": "GAUGE_CREDIT_UNKNOWN_CAPACITY",
+    "UNKNOWN_NO_DECISION": "GAUGE_CREDIT_UNKNOWN_CAPACITY"
+  }
+}

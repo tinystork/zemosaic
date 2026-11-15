@@ -30985,7 +30985,25 @@ _ZEGRID_POLICY_TRANSPORT_KEYS = (
     "zegrid_cell_gauge_mode",
     "zegrid_layout",
     "zegrid_sip_mode",
+    # ZM-GAUGE-SWAP-G2b: execution-only gauge memory policy (closed enum).
+    "zegrid_gauge_memory_policy",
 )
+
+
+def _zegrid_explicit_policy_transport(**kwargs: Any) -> dict[str, Any]:
+    """The GUI -> worker run-policy values that were EXPLICITLY transported.
+
+    SEAM_ONLY_KWARGS lesson (ZM-GAUGE-SWAP-G2b): the transport is derived from
+    ONE declared mapping, so a test can prove the exact payload the engine
+    receives instead of re-implementing the ``setattr`` loop. The ``UNSET``
+    sentinel means "caller did not pass it" and keeps the persisted-config
+    value (``None`` is a MEANINGFUL explicit null for several keys).
+    """
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if value is not _ZEGRID_POLICY_UNSET
+    }
 
 
 @_close_zesolver_on_run_exit
@@ -31116,6 +31134,9 @@ def run_hierarchical_mosaic(
     zegrid_cell_gauge_mode: Any = _ZEGRID_POLICY_UNSET,
     zegrid_layout: Any = _ZEGRID_POLICY_UNSET,
     zegrid_sip_mode: Any = _ZEGRID_POLICY_UNSET,
+    # ZM-GAUGE-SWAP-G2b: execution-only gauge memory policy (closed enum,
+    # default ``ram_only``). Same absence semantics as the six policy keys.
+    zegrid_gauge_memory_policy: Any = _ZEGRID_POLICY_UNSET,
     # ZM-ZEGRID-M6-QT-STOP-RESUME: explicit GUI -> worker transport of the
     # durable resume settings. Same absence semantics as the six policy keys:
     # absent keeps the persisted config, an explicit value wins. The engine
@@ -31209,6 +31230,7 @@ def run_hierarchical_mosaic(
         "zegrid_cell_gauge_mode": zegrid_cell_gauge_mode,
         "zegrid_layout": zegrid_layout,
         "zegrid_sip_mode": zegrid_sip_mode,
+        "zegrid_gauge_memory_policy": zegrid_gauge_memory_policy,
     }
     _zegrid_durable_transport = {
         "zegrid_durable_store_dir": zegrid_durable_store_dir,
@@ -31216,9 +31238,10 @@ def run_hierarchical_mosaic(
         "zegrid_resume_run_id": zegrid_resume_run_id,
     }
     _zegrid_policy_transport.update(_zegrid_durable_transport)
-    for _policy_key, _policy_value in _zegrid_policy_transport.items():
-        if _policy_value is _ZEGRID_POLICY_UNSET:
-            continue
+    _explicit_policy_values = _zegrid_explicit_policy_transport(
+        **_zegrid_policy_transport
+    )
+    for _policy_key, _policy_value in _explicit_policy_values.items():
         worker_config_cache[_policy_key] = _policy_value
         try:
             setattr(zconfig, _policy_key, _policy_value)

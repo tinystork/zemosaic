@@ -1,0 +1,767 @@
+{
+  "artifacts_root": "/var/tmp/openclaw-tristan/zm-gauge-g3",
+  "base_head": "e25fb5133768adf4eb26950c63f86b970909b370",
+  "canvas_case": {
+    "fallback": {
+      "coverage_pixels": 9961522,
+      "credit_admission": {
+        "a_raw_bytes": 1600000000,
+        "b_admit_bytes": 1440000000,
+        "b_ram_bytes": 1280000000,
+        "b_ram_eff_bytes": 928739328,
+        "cgroup_levels": [
+          {
+            "detail": "root_cgroup_is_unbounded",
+            "is_root": true,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup",
+            "ram_headroom_bytes": null,
+            "ram_status": "not_applicable",
+            "swap_headroom_bytes": null,
+            "swap_status": "not_applicable"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice/user-1000.slice",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/g3-fallback-canvas2-230064.scope",
+            "ram_headroom_bytes": 928739328,
+            "ram_status": "limited",
+            "swap_headroom_bytes": 1610612736,
+            "swap_status": "limited"
+          }
+        ],
+        "cgroup_ram": {
+          "headroom_bytes": 928739328,
+          "status": "limited"
+        },
+        "cgroup_swap": {
+          "headroom_bytes": 1610612736,
+          "status": "limited"
+        },
+        "commit": {
+          "allowed": true,
+          "headroom_bytes": null,
+          "new_commit_bytes": 1251970480,
+          "overcommit_mode": 0,
+          "reason": "overcommit_mode_0_no_hard_gate",
+          "sources": {
+            "commit_limit": 37876273152,
+            "committed_as": 16359198720
+          },
+          "status": "not_applicable"
+        },
+        "covered": true,
+        "credit_needed_bytes": 159766052,
+        "facts": {
+          "cgroup_error": null,
+          "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/g3-fallback-canvas2-230064.scope",
+          "meminfo_available": true,
+          "platform": "linux",
+          "schema": "gauge-credit-live-sources-v1",
+          "swaps_available": true
+        },
+        "limits": [
+          "credit is a PERMIT, never a reservation: the OS may keep pages in RAM, evict other processes or refuse an allocation",
+          "a synthetic fact or a fake MemAvailable proves the logic, never physical swap",
+          "zram free is RAM-backed and is excluded from S_disk_free",
+          "SwapCached is neither added to A nor to swap free",
+          "no OOM guarantee is made by this contract",
+          "integer arithmetic only: no float and no infinity enters a decision"
+        ],
+        "p_gauge_margined_bytes": 1439766052,
+        "p_gauge_raw_bytes": 1251970480,
+        "policy": "bounded_swap",
+        "ram_guard": {
+          "b_ram_covers_non_pageable": true,
+          "non_pageable_new_bytes": 356515840
+        },
+        "reasons": [
+          "cgroup_swap_caps_effective_swap",
+          "cgroup_ram_tighter_than_host"
+        ],
+        "s_credit_bytes": 1449551462,
+        "s_disk_free_bytes": 24491171840,
+        "s_effectif_bytes": 1610612736,
+        "schema": "gauge-swap-capacity-v1",
+        "status": "credit_sufficient",
+        "swap_devices": [
+          {
+            "eligible_for_disk_credit": true,
+            "free_bytes": 24491171840,
+            "name": "/swapfile",
+            "reason": "disk_backed",
+            "size_bytes": 25769799680,
+            "type": "file",
+            "used_bytes": 1278627840,
+            "zram": false
+          },
+          {
+            "eligible_for_disk_credit": false,
+            "free_bytes": 2345201664,
+            "name": "/dev/zram0",
+            "reason": "zram_is_ram_backed",
+            "size_bytes": 8070885376,
+            "type": "partition",
+            "used_bytes": 5725683712,
+            "zram": true
+          }
+        ]
+      },
+      "credit_applied": true,
+      "credit_events": [
+        {
+          "a_raw_bytes": 1600000000,
+          "b_ram_bytes": 1280000000,
+          "credit_bytes": 1449551462,
+          "credit_needed_bytes": 159766052,
+          "event": "gauge_credit_open",
+          "opened": true,
+          "p_gauge_raw_bytes": 1251970480,
+          "platform": "linux",
+          "policy": "bounded_swap",
+          "s_effectif_bytes": 1610612736,
+          "workers": 1
+        },
+        {
+          "closed": true,
+          "credit_bytes_released": 1449551462,
+          "credit_granted_during_gauge": true,
+          "event": "gauge_credit_closed",
+          "note": "the credit is a PERMIT, never an observed swap usage; it is closed before any cache/stack/admission step",
+          "policy": "bounded_swap",
+          "swap_used_bytes": null,
+          "was_open": true
+        }
+      ],
+      "duration_s": 231.54195671998605,
+      "gauge_artifact": {
+        "coefficients_sha256": "85ab3604ad04d91927cfe329e41b8669089350aeb8171fe015e6e9a539f86bd0",
+        "exclusions": 0,
+        "frame_count": 8,
+        "gauge_sha256": "06a39c50df3e53ea2f41febbfeacbcee9000006fd4a417cd712036bf5d457cca",
+        "norm_active": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "reference_frame_id": "frame_0002.fits",
+        "reference_index": 2,
+        "weights": [
+          0.9847778195312067,
+          0.9943700295177158,
+          0.9973944517273674,
+          0.9493935167663426,
+          0.9880398188444949,
+          0.9933829669318301,
+          0.998778749887627,
+          1.0
+        ]
+      },
+      "gauge_workers_effective": 1,
+      "hole_pixels": 1043948,
+      "inject_a_raw": 1600000000,
+      "peak_memory_current": 1181339648,
+      "peak_swap_current": 623493120,
+      "policy": "bounded_swap",
+      "pswpin_pages": 21245,
+      "pswpout_bytes": 620077056,
+      "science": {
+        "dtype": "float32",
+        "file": "mosaic_grid.fits",
+        "nonfinite_fill": 0.0,
+        "nonfinite_replaced": 3131844,
+        "role": "SCI",
+        "sha256": "a125029fa7ec7400b99ce55070bdad30b7ed638258fba074b681ea929b3073f3"
+      },
+      "scope": {
+        "memory_max": 1181114368,
+        "memory_swap_max": 1610612736
+      },
+      "timings": {
+        "assembly": 6.296635,
+        "cache_build": 0.0,
+        "gauge": 57.745036,
+        "layout": 0.155917,
+        "layout:chosen_cells": 0.028599,
+        "layout:footprints": 0.018905,
+        "per_cell_stack": 159.544838,
+        "setup": 0.059465
+      }
+    },
+    "fallback_record": "/var/tmp/openclaw-tristan/zm-gauge-g3/evidence/fallback_canvas2.json",
+    "witness": {
+      "coverage_pixels": 9961522,
+      "duration_s": 185.25186583900359,
+      "gauge_artifact": {
+        "coefficients_sha256": "85ab3604ad04d91927cfe329e41b8669089350aeb8171fe015e6e9a539f86bd0",
+        "exclusions": 0,
+        "frame_count": 8,
+        "gauge_sha256": "06a39c50df3e53ea2f41febbfeacbcee9000006fd4a417cd712036bf5d457cca",
+        "norm_active": [
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ],
+        "reference_frame_id": "frame_0002.fits",
+        "reference_index": 2,
+        "weights": [
+          0.9847778195312067,
+          0.9943700295177158,
+          0.9973944517273674,
+          0.9493935167663426,
+          0.9880398188444949,
+          0.9933829669318301,
+          0.998778749887627,
+          1.0
+        ]
+      },
+      "hole_pixels": 1043948,
+      "inject_a_raw": 1800000000,
+      "peak_memory_current": 2349559808,
+      "peak_swap_current": 0,
+      "policy": "ram_only",
+      "science": {
+        "dtype": "float32",
+        "file": "mosaic_grid.fits",
+        "nonfinite_fill": 0.0,
+        "nonfinite_replaced": 3131844,
+        "role": "SCI",
+        "sha256": "a125029fa7ec7400b99ce55070bdad30b7ed638258fba074b681ea929b3073f3"
+      },
+      "scope": {
+        "memory_max": 3758096384,
+        "memory_swap_max": 0
+      },
+      "timings": {
+        "assembly": 5.667694,
+        "cache_build": 0.0,
+        "gauge": 79.445021,
+        "layout": 0.080602,
+        "layout:chosen_cells": 0.029237,
+        "layout:footprints": 0.019601,
+        "per_cell_stack": 91.026301,
+        "setup": 0.059124
+      }
+    },
+    "witness_record": "/var/tmp/openclaw-tristan/zm-gauge-g3/evidence/witness_canvas2.json"
+  },
+  "corpus": {
+    "frames": [
+      {
+        "name": "frame_0000.fits",
+        "sha256": "7057baebade2657bc389b23decec02ad578f5d6c724053ec2a1a0f312a6d60a4"
+      },
+      {
+        "name": "frame_0001.fits",
+        "sha256": "9c411a62c5caa5957e127be4648b97147dfb8205fa9e3781c8acad10d8564568"
+      },
+      {
+        "name": "frame_0002.fits",
+        "sha256": "7914371389ff9215984ba4c0772e8d46f6dda058fc95f279e6b3a08a05a6a211"
+      },
+      {
+        "name": "frame_0003.fits",
+        "sha256": "82e07925e1f2871f5ef7bd21804b824fb231461606b388e56766efd7db9a39a5"
+      },
+      {
+        "name": "frame_0004.fits",
+        "sha256": "52d23ab3a1174caca5f60e02deef0f7e780e3dc405a96912bbf14aaf9e1b4395"
+      },
+      {
+        "name": "frame_0005.fits",
+        "sha256": "cb6e76c73fd6f90ca263f0d37ccb748aca801bb2f87144b0ba2401e289e643c0"
+      },
+      {
+        "name": "frame_0006.fits",
+        "sha256": "9a68d84e6fe737ef0cc7c70579abfcb60fce3b81fea95978b302256f63f028b3"
+      },
+      {
+        "name": "frame_0007.fits",
+        "sha256": "95d0776d89c47948531b096db530afeca5e6da8f3cddd3bde26819df34411fac"
+      }
+    ],
+    "kind": "SYNTHETIC deterministic 8 frames x 2048 px / 8 x 512 px",
+    "note": "NOT the user's real NGC7023; no user data was read"
+  },
+  "external_case": {
+    "digest_present": true,
+    "fallback": {
+      "admission": {
+        "a_raw_bytes": 550000000,
+        "b_admit_bytes": 495000000,
+        "b_ram_bytes": 440000000,
+        "b_ram_eff_bytes": 440000000,
+        "cgroup_levels": [
+          {
+            "detail": "root_cgroup_is_unbounded",
+            "is_root": true,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup",
+            "ram_headroom_bytes": null,
+            "ram_status": "not_applicable",
+            "swap_headroom_bytes": null,
+            "swap_status": "not_applicable"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice/user-1000.slice",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice",
+            "ram_headroom_bytes": null,
+            "ram_status": "unlimited",
+            "swap_headroom_bytes": null,
+            "swap_status": "unlimited"
+          },
+          {
+            "detail": "memory_controller_active",
+            "is_root": false,
+            "memory_controller": true,
+            "path": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/g3-fallback-ext3-235972.scope",
+            "ram_headroom_bytes": 824168448,
+            "ram_status": "limited",
+            "swap_headroom_bytes": 1610612736,
+            "swap_status": "limited"
+          }
+        ],
+        "cgroup_ram": {
+          "headroom_bytes": 824168448,
+          "status": "limited"
+        },
+        "cgroup_swap": {
+          "headroom_bytes": 1610612736,
+          "status": "limited"
+        },
+        "commit": {
+          "allowed": true,
+          "headroom_bytes": null,
+          "new_commit_bytes": 427770400,
+          "overcommit_mode": 0,
+          "reason": "overcommit_mode_0_no_hard_gate",
+          "sources": {
+            "commit_limit": 37876273152,
+            "committed_as": 16739553280
+          },
+          "status": "not_applicable"
+        },
+        "covered": true,
+        "credit_needed_bytes": 51935960,
+        "facts": {
+          "cgroup_error": null,
+          "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/g3-fallback-ext3-235972.scope",
+          "meminfo_available": true,
+          "platform": "linux",
+          "schema": "gauge-credit-live-sources-v1",
+          "swaps_available": true
+        },
+        "limits": [
+          "credit is a PERMIT, never a reservation: the OS may keep pages in RAM, evict other processes or refuse an allocation",
+          "a synthetic fact or a fake MemAvailable proves the logic, never physical swap",
+          "zram free is RAM-backed and is excluded from S_disk_free",
+          "SwapCached is neither added to A nor to swap free",
+          "no OOM guarantee is made by this contract",
+          "integer arithmetic only: no float and no infinity enters a decision"
+        ],
+        "p_gauge_margined_bytes": 491935960,
+        "p_gauge_raw_bytes": 427770400,
+        "policy": "bounded_swap",
+        "ram_guard": {
+          "b_ram_covers_non_pageable": true,
+          "non_pageable_new_bytes": 356515840
+        },
+        "reasons": [
+          "cgroup_swap_caps_effective_swap"
+        ],
+        "s_credit_bytes": 1449551462,
+        "s_disk_free_bytes": 24494534656,
+        "s_effectif_bytes": 1610612736,
+        "schema": "gauge-swap-capacity-v1",
+        "status": "credit_sufficient",
+        "swap_devices": [
+          {
+            "eligible_for_disk_credit": true,
+            "free_bytes": 24494534656,
+            "name": "/swapfile",
+            "reason": "disk_backed",
+            "size_bytes": 25769799680,
+            "type": "file",
+            "used_bytes": 1275265024,
+            "zram": false
+          },
+          {
+            "eligible_for_disk_credit": false,
+            "free_bytes": 2739978240,
+            "name": "/dev/zram0",
+            "reason": "zram_is_ram_backed",
+            "size_bytes": 8070885376,
+            "type": "partition",
+            "used_bytes": 5330907136,
+            "zram": true
+          }
+        ]
+      },
+      "cell_task_mode": "external",
+      "class": "external_spool",
+      "coverage_pixels": 608820,
+      "credit_applied": true,
+      "credit_closed_before_stack": true,
+      "duration_s": 15.501194897995447,
+      "events": [
+        {
+          "a_raw_bytes": 550000000,
+          "b_ram_bytes": 440000000,
+          "credit_bytes": 1449551462,
+          "credit_needed_bytes": 51935960,
+          "event": "gauge_credit_open",
+          "opened": true,
+          "p_gauge_raw_bytes": 427770400,
+          "platform": "linux",
+          "policy": "bounded_swap",
+          "s_effectif_bytes": 1610612736,
+          "workers": 1
+        },
+        {
+          "closed": true,
+          "credit_bytes_released": 1449551462,
+          "credit_granted_during_gauge": true,
+          "event": "gauge_credit_closed",
+          "note": "the credit is a PERMIT, never an observed swap usage; it is closed before any cache/stack/admission step",
+          "policy": "bounded_swap",
+          "swap_used_bytes": null,
+          "was_open": true
+        }
+      ],
+      "execution_digest": "sha256:6798f2690e4f72fff88842311626e272ae59012ea29fb6934472bbd75c3ad47a",
+      "gauge_workers_effective": 1,
+      "hole_pixels": 2343,
+      "peak_memory_current": 598523904,
+      "peak_swap_current": 0,
+      "science_sha256": "52e396e3a2af007c5df3fcaab66bbfda0c12b8a74d1702c524e7f8b6e92c1064",
+      "stack_budget_bytes": 440000000,
+      "stack_ceiling_bytes": 440000000,
+      "stack_credit_applied": false,
+      "stack_credit_note": "group-scoped evaluator: only the ('gauge',) group can be widened (L8 checks); the external stack ceiling stays B_ram",
+      "stack_envelope_bytes": 77084362,
+      "stack_within_b_ram": true
+    },
+    "fallback_record": "/var/tmp/openclaw-tristan/zm-gauge-g3/evidence/fallback_ext3.json",
+    "science_bit_identical": true,
+    "scope": {
+      "cgroup": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/g3-fallback-ext3-235972.scope",
+      "memory_max": 1073741824,
+      "memory_swap_max": 1610612736
+    },
+    "scope_meta": {
+      "exit_code": 0,
+      "finished_unix": 1794712970.6668203,
+      "memory_max": 1073741824,
+      "memory_swap_max": 1610612736,
+      "name": "fallback-ext3",
+      "oom_markers": [],
+      "schema": "g3-scope-meta-v1",
+      "scope_oom": false,
+      "signal": null,
+      "stderr_log": "/var/tmp/openclaw-tristan/zm-gauge-g3/logs/fallback-ext3.scope.err",
+      "stdout_log": "/var/tmp/openclaw-tristan/zm-gauge-g3/logs/fallback-ext3.scope.log",
+      "unit": "g3-fallback-ext3-235972"
+    },
+    "witness": {
+      "cell_task_mode": "external",
+      "class": "external_spool",
+      "coverage_pixels": 608820,
+      "credit": null,
+      "duration_s": 14.91640773099789,
+      "hole_pixels": 2343,
+      "science_sha256": "52e396e3a2af007c5df3fcaab66bbfda0c12b8a74d1702c524e7f8b6e92c1064"
+    },
+    "witness_record": "/var/tmp/openclaw-tristan/zm-gauge-g3/evidence/witness_ext2.json"
+  },
+  "limits": [
+    "The A observation (MemAvailable) is INJECTED by the harness (monkeypatch), never a product flag; that proves the LOGIC, not a real host RAM shortage.",
+    "Swap enforcement is REAL in the canvas case: transient systemd scope, peak memory.swap.current 623 Mo, pswpout 620 Mo. The external case did not need swap (peak 599 Mo < 1 GiB cap) but is isolated and OOM-free.",
+    "Disk-backed swap is NOT proven: zram (priority 100) absorbs first; proving disk swap would require changing swap priorities (forbidden).",
+    "overcommit mode 2 is unit-tested by injection only (sysctl change forbidden).",
+    "GPU is not qualified: CuPy is absent from the official interpreter.",
+    "The corpus is synthetic, not the user's NGC7023 dataset.",
+    "Q10 is INCONCLUSIVE (no PSI, no kernel dmesg).",
+    "Q4 is NOT_EXERCISED: the bounded run (< 10 min) cannot trigger a 10-min thrash window.",
+    "Q1/Q2 are INDICATIVE (n=1, witness ran first, page cache not controlled); no gain is claimed.",
+    "The EXTERNAL physical evidence (M1/M2) was produced AFTER rework-1; the earlier canvas/Stop runs (r0) predate it and had no external credit / no credit-open Stop. Rework-2 closes both gaps.",
+    "The Stop under credit was initially NOT covered (r0 Q6 had no open credit); it is covered by the rework-2 run.",
+    "Q7 committed-cell reuse is NOT_EXERCISED (all cells were pending at the Stop).",
+    "External resume requires replaying the SAME injected A: with the real A the frozen tile differs (128 vs 112) and the engine correctly refuses the resume."
+  ],
+  "mission": "ZM-GAUGE-SWAP-G3-20261115",
+  "q6_credit": {
+    "ack_latency_s": 2.1046374370052945,
+    "ack_state": "STOPPED_RESUMABLE",
+    "closed_after_request": true,
+    "commits_after_resume": 4,
+    "commits_at_stop": 0,
+    "credit_closed_t_s": 3.5361796869983664,
+    "credit_open_t_s": 0.1242836610035738,
+    "credit_strings_in_store_at_stop": [],
+    "finalized_after_resume": true,
+    "note_first_resume_attempt": "a FIRST resume with the REAL A was refused (ResumeIncompatible: stored tile_px=128 vs recomputed 112) because the injected A changes the admission tile. The accepted resume replays the SAME A=550000000; this is the identity conservatism, not a defect.",
+    "open_before_request": true,
+    "process_exit_s": 3.611508147994755,
+    "resume_complete_cells": [
+      "r0000c0000",
+      "r0000c0001",
+      "r0001c0000",
+      "r0001c0001"
+    ],
+    "resume_credit_applied": false,
+    "resume_gauge_applicable": false,
+    "resume_incomplete_cells": [],
+    "resume_record": "/var/tmp/openclaw-tristan/zm-gauge-g3/evidence/q6c_resume.json",
+    "resume_science_sha256": "52e396e3a2af007c5df3fcaab66bbfda0c12b8a74d1702c524e7f8b6e92c1064",
+    "scope": {
+      "memory_max": 805306368,
+      "memory_swap_max": 1610612736
+    },
+    "state_finalized_at_stop": false,
+    "stop_record": "/var/tmp/openclaw-tristan/zm-gauge-g3/evidence/q6c_stop.json",
+    "stop_request_t_s": 1.500585465997574,
+    "swap_used_bytes_null_in_closed_event": true,
+    "witness_science_sha256": "52e396e3a2af007c5df3fcaab66bbfda0c12b8a74d1702c524e7f8b6e92c1064"
+  },
+  "schema": "g3-physical-qualification-v2",
+  "thresholds": {
+    "Q10_telemetry": {
+      "missing": [
+        "/proc/pressure/memory",
+        "/proc/pressure/io",
+        "kernel dmesg"
+      ],
+      "present": [
+        "memory.max",
+        "memory.swap.max",
+        "memory.current",
+        "memory.swap.current",
+        "/proc/swaps per device (manifest)",
+        "/proc/vmstat pswpin/pswpout",
+        "RSS",
+        "phase timings",
+        "gauge_credit_open/closed phase timestamps",
+        "scope exit code / signal / stderr"
+      ],
+      "threshold": "all required fields present; otherwise INCONCLUSIVE",
+      "verdict": "INCONCLUSIVE (PSI memory/IO not sampled; dmesg restricted)"
+    },
+    "Q1_gauge_time_ratio": {
+      "fallback_gauge_s": 57.745036,
+      "note": "the 0.73x ratio is NOT a gain claim: the fallback ran second on a warm cache",
+      "observed": 0.7269,
+      "quality": "INDICATIVE (n=1, order not randomised, page cache not controlled)",
+      "threshold": "<= 4.0 x witness",
+      "verdict": "PASS_INDICATIVE",
+      "witness_gauge_s": 79.445021
+    },
+    "Q2_total_time_ratio": {
+      "fallback_total_s": 231.54195671998605,
+      "observed": 1.2499,
+      "quality": "INDICATIVE (n=1, order not randomised)",
+      "threshold": "<= 3.0 x witness",
+      "verdict": "PASS_INDICATIVE",
+      "witness_total_s": 185.25186583900359
+    },
+    "Q3_swap_traffic": {
+      "modeled_4x_bytes": 3581818560,
+      "modeled_paginable_bytes": 895454640,
+      "note": "whole-run pswpout is an UPPER bound for the gauge phase",
+      "observed_peak_scope_swap_bytes": 623493120,
+      "observed_pswpout_bytes_whole_run": 620077056,
+      "threshold": "<= 4 x modeled paginable (P_gauge_raw - G_np_new)",
+      "verdict": "PASS"
+    },
+    "Q4_thrash_signature": {
+      "note": "the bounded run lasts < 10 min, so the criterion cannot trigger; a real thrash signature belongs to a long 20k run",
+      "run_duration_s": 231.54195671998605,
+      "swap_out_average_Bps": 2678033.2,
+      "threshold": "no interval > 10 min with zero frame progress AND swap-out > 50 MiB/s",
+      "verdict": "NOT_EXERCISED"
+    },
+    "Q5_peak_memory_gauge": {
+      "ceiling_bytes": 1708201508,
+      "note": "gauge window delimited from the manifest phase durations",
+      "observed_bytes": 1311150080,
+      "observed_gauge_window": {
+        "peak_memory_current": 1180430336,
+        "peak_rss": 1303588864,
+        "peak_swap_current": 130719744,
+        "samples": 104,
+        "swap_first": 0,
+        "swap_last": 130719744
+      },
+      "p_gauge_raw_bytes": 1251970480,
+      "threshold": "RSS tree + delta swap.current <= P_gauge_raw + 15% + 256 MiB",
+      "verdict": "PASS"
+    },
+    "Q6_stop": {
+      "ack_latency_s": 2.1046374370052945,
+      "ack_state": "STOPPED_RESUMABLE",
+      "commits_at_stop": 0,
+      "credit_closed_after_request": true,
+      "credit_open_before_request": true,
+      "process_exit_s": 3.611508147994755,
+      "state_finalized_at_stop": false,
+      "swap_used_bytes_null": true,
+      "threshold": "ack <= 30 s; process exit <= 120 s; no lost commit",
+      "verdict": "PASS"
+    },
+    "Q7_resume": {
+      "commits_after_resume": 4,
+      "committed_cell_reuse": "NOT_EXERCISED (all cells were pending at the stop)",
+      "complete_cells": [
+        "r0000c0000",
+        "r0000c0001",
+        "r0001c0000",
+        "r0001c0001"
+      ],
+      "expected_cells": 4,
+      "finalized": true,
+      "incomplete_cells": [],
+      "note": "zero-loss/zero-duplicate proven; reusing an already-committed cell is not",
+      "threshold": "zero loss, zero duplicate, only pending cells executed",
+      "verdict": "PASS_PARTIAL"
+    },
+    "Q8_science": {
+      "canvas": {
+        "coverage_pixels": [
+          9961522,
+          9961522
+        ],
+        "fallback_science_sha256": "a125029fa7ec7400b99ce55070bdad30b7ed638258fba074b681ea929b3073f3",
+        "hole_pixels": [
+          1043948,
+          1043948
+        ],
+        "witness_science_sha256": "a125029fa7ec7400b99ce55070bdad30b7ed638258fba074b681ea929b3073f3"
+      },
+      "external": {
+        "coverage_pixels": [
+          608820,
+          608820
+        ],
+        "digest_present": true,
+        "fallback_science_sha256": "52e396e3a2af007c5df3fcaab66bbfda0c12b8a74d1702c524e7f8b6e92c1064",
+        "hole_pixels": [
+          2343,
+          2343
+        ],
+        "witness_science_sha256": "52e396e3a2af007c5df3fcaab66bbfda0c12b8a74d1702c524e7f8b6e92c1064"
+      },
+      "threshold": "G0-ORACLE-4 bit-identical at identical workers",
+      "verdict": "PASS",
+      "workers": 1
+    },
+    "Q9_host_safety": {
+      "canvas_case_meta": "NOT_CAPTURED (the r0 harness predates meta capture); the canvas run exited with exception_type=null and no OOM marker in its scope log",
+      "derivation": "scope_oom = exit_code in (137) or signal == 9 or any OOM marker in the scope stderr; FAIL if true, else PASS_WITH_LIMIT",
+      "host_dmesg_readable": false,
+      "host_kernel_journal_readable": false,
+      "host_oom_evidence": "derived from the scope meta: exit code/signal and stderr OOM markers; kernel dmesg/journal are unreadable for this user, so HOST OOM absence is still not independently proven",
+      "oom_markers": [],
+      "scope_exit_code": 0,
+      "scope_meta": {
+        "exit_code": 0,
+        "finished_unix": 1794712970.6668203,
+        "memory_max": 1073741824,
+        "memory_swap_max": 1610612736,
+        "name": "fallback-ext3",
+        "oom_markers": [],
+        "schema": "g3-scope-meta-v1",
+        "scope_oom": false,
+        "signal": null,
+        "stderr_log": "/var/tmp/openclaw-tristan/zm-gauge-g3/logs/fallback-ext3.scope.err",
+        "stdout_log": "/var/tmp/openclaw-tristan/zm-gauge-g3/logs/fallback-ext3.scope.log",
+        "unit": "g3-fallback-ext3-235972"
+      },
+      "scope_oom_derived": false,
+      "scope_signal": null,
+      "threshold": "zero host OOM; OOM inside the scope invalidates the run",
+      "verdict": "PASS_WITH_LIMIT"
+    }
+  }
+}
