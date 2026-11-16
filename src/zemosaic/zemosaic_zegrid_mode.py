@@ -14024,6 +14024,156 @@ def _r55_active_gpu_apply(
     )
 
 
+def _r55_pipeline_host_capacity(
+    *, budget_bytes, unit_host, queue_max, percell_reserves=()
+):
+    """Host-ledger capacity for the ACTIVE GPU pipeline (per-Cell aware).
+
+    The capacity is the explicit PLAN credit (``unit_host * queue_max``) capped
+    by the ALREADY ADMITTED plan budget. It must additionally be able to hold
+    ONE real per-Cell reservation: a per-Cell plan prices every Cell from its
+    OWN facts, so a Cell deeper than the scheduler REFERENCE Cell can
+    legitimately exceed the reference credit. Reserving it against a
+    reference-only capacity was a FALSE refusal (fail-closed, but wrong).
+
+    The capacity is still NEVER raised above ``budget_bytes``: this changes the
+    accounting ceiling inside the admitted envelope, never the budget itself.
+    For a homogeneous run (no per-Cell plan) the historical value is returned
+    byte for byte.
+    """
+    reserve = max((int(value) for value in percell_reserves), default=0)
+    per_slot = max(int(unit_host), int(reserve))
+    return int(
+        min(int(budget_bytes), int(per_slot) * max(1, int(queue_max)))
+    )
+
+
+class _R55PerCellTileEvidenceError(RuntimeError):
+    """A COMPLETE per-Cell run lacks durable executed-tile evidence.
+
+    Raised BEFORE any publication work: the completed run is left exactly as it
+    is (commits, admission, caps untouched) and no manifest/CURRENT is written
+    with a planned tile labelled as measured.
+    """
+
+
+def _r55_run_percell_effective_tiles(run_block):
+    """The MEASURED per-Cell effective tiles published by the GPU runner.
+
+    Returns ``None`` (never an empty/partial dict) unless EVERY entry carries a
+    plain ``cell_id``/``effective_tile_px`` pair. The finalization path treats
+    ``None`` as a hard error instead of publishing an unverifiable plan hash.
+    """
+    if not isinstance(run_block, dict):
+        return None
+    block = run_block.get("percell_tiles")
+    if not isinstance(block, dict):
+        return None
+    entries = block.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    tiles = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            return None
+        cid = item.get("cell_id")
+        tile = item.get("effective_tile_px")
+        if (
+            not isinstance(cid, str)
+            or not cid
+            or isinstance(tile, bool)
+            or not isinstance(tile, int)
+        ):
+            return None
+        tiles[cid] = int(tile)
+    return tiles
+
+
+def _r55_freeze_complete_replay_decision(
+    *, decision, candidate, mapping, bundle, store
+):
+    """Freeze the FINAL executable record of a COMPLETE durable replay.
+
+    WHY: a run whose every expected Cell is already committed publishes from the
+    immutable commits and executes NOTHING -- so the control-flow GPU decision is
+    legitimately cleared. That must not erase the evidence of the plan that
+    actually governed those commits. This helper captures, WITHOUT any cell,
+    cache, gauge or kernel work:
+
+    * the frozen scheduler REFERENCE decision (candidate + its exact mapping);
+    * the frozen per-Cell plan;
+    * each Cell's EFFECTIVE tile, read from its OWN durable commit (the executed
+      tile is recorded on the commit; no re-derivation, no growth);
+    * the product envelope re-projected by pure arithmetic from those tiles.
+
+    Returns ``None`` for a homogeneous (v1) frozen admission: there the admitted
+    mapping IS the final decision and the ordinary strict hash applies unchanged.
+    """
+    if decision is None or candidate is None or mapping is None or bundle is None:
+        return None
+    plan = getattr(decision, "percell_plan", None)
+    if plan is None:
+        return None
+    if dict(mapping).get("backend") != renv.BACKEND_GPU:
+        return None
+    committed = {}
+    if store is not None:
+        committed = dict(zres.percell_committed_tiles(store) or {})
+    # REWORK-1 (M2): a COMPLETE run must publish what each Cell ACTUALLY
+    # executed. A planned/admitted tile is NEVER relabelled as measured: a
+    # missing or invalid durable tile is an explicit refusal, not a fallback.
+    missing = []
+    invalid = []
+    effective = {}
+    for entry in plan.entries:
+        cid = str(entry.cell_id)
+        raw = committed.get(cid)
+        if raw is None:
+            missing.append(cid)
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, int) or int(raw) <= 0:
+            invalid.append(cid)
+            continue
+        tile = int(raw)
+        if tile not in entry.declared_ladder:
+            invalid.append(f"{cid}={tile}:not-a-declared-rung")
+            continue
+        if tile > int(entry.tile_px):
+            invalid.append(f"{cid}={tile}:above-admitted-{int(entry.tile_px)}")
+            continue
+        effective[cid] = tile
+    if missing or invalid:
+        raise _R55PerCellTileEvidenceError(
+            "COMPLETE per-Cell replay REFUSED: refusing to publish a per-Cell "
+            "v2 completion without durable EXECUTED-tile evidence for every "
+            f"Cell (missing={sorted(missing)}, invalid={sorted(invalid)}). A "
+            "planned tile is never relabelled as measured. Nothing was "
+            "published: no CURRENT.json/products were written and every "
+            "commit, admission and shrink cap is unchanged. Remedy: restore "
+            "the missing/valid commit metadata (never rewrite old commits) or "
+            "resume with the build that recorded it; a hand-made publication "
+            "is out of scope."
+        )
+    effective_mapping = dict(mapping)
+    effective_mapping["gpu_streaming_tile"] = max(effective.values())
+    effective_bundle = _r55_active_gpu_apply(
+        bundle,
+        mapping=effective_mapping,
+        decision=decision,
+        stage="complete_replay_effective",
+        percell_tiles=effective,
+    )
+    return {
+        "plan_set": decision.plan_set,
+        "decision": decision,
+        "candidate": candidate,
+        "mapping": effective_mapping,
+        "bundle": effective_bundle,
+        "plan": plan,
+        "effective_tiles": effective,
+    }
+
+
 def _r55_active_gpu_admit(
     *,
     initial_bundle,
@@ -16880,24 +17030,50 @@ def _r55_build_active_block(
     worker_adaptation=None,
     tile_ladder=None,
     gauge_credit=None,
+    percell_plan=None,
+    percell_effective_tiles=None,
 ) -> dict:
     """Deterministic active manifest block (no fabricated observed metric).
 
-    The PRIMARY ``plan_hash`` identifies the FINAL executable decision
-    (``zsched.active_final_plan_hash``): final candidate + exact mapping +
-    frozen identity + final validated PlanEnvelope. The D1 scheduler PlanSet
-    hash is preserved separately as ``initial_plan_hash``.
+    The PRIMARY ``plan_hash`` identifies the FINAL executable decision. A
+    HOMOGENEOUS run keeps ``zsched.active_final_plan_hash`` exactly as before:
+    final candidate + its exact mapping + frozen identity + final validated
+    PlanEnvelope. A frozen per-Cell run has TWO final facts (the scheduler
+    REFERENCE candidate and the heterogeneous per-Cell EFFECTIVE tiles), so it
+    uses ``zpercell.final_plan_hash``, which validates the reference half with
+    that same strict scheduler function and then binds the per-Cell plan. The
+    D1 scheduler PlanSet hash is preserved separately as
+    ``initial_plan_hash``.
     """
     hash_kwargs = {}
     if tile_ladder is not None:
         hash_kwargs["tile_ladder"] = tuple(int(t) for t in tile_ladder)
-    final_hash = zsched.active_final_plan_hash(
-        candidate=final_candidate,
-        mapping=mapping,
-        identity=plan_set.identity,
-        envelope=bundle.envelope,
-        **hash_kwargs,
-    )
+    if percell_plan is not None:
+        # The scheduler reference mapping is the executable mapping of the
+        # REFERENCE candidate; it is derived here (never guessed) and validated
+        # by the strict scheduler hash inside final_plan_hash.
+        reference_mapping = dict(mapping)
+        reference_mapping["gpu_streaming_tile"] = int(final_candidate.tile_px)
+        final_hash = zpercell.final_plan_hash(
+            reference_candidate=final_candidate,
+            reference_mapping=reference_mapping,
+            mapping=mapping,
+            plan=percell_plan,
+            effective_tiles=percell_effective_tiles,
+            identity=plan_set.identity,
+            envelope=bundle.envelope,
+            **hash_kwargs,
+        )
+        plan_hash_schema = zpercell.FINAL_PLAN_SCHEMA
+    else:
+        final_hash = zsched.active_final_plan_hash(
+            candidate=final_candidate,
+            mapping=mapping,
+            identity=plan_set.identity,
+            envelope=bundle.envelope,
+            **hash_kwargs,
+        )
+        plan_hash_schema = zsched.ACTIVE_FINAL_PLAN_SCHEMA
     combined_trail = []
     for item in preflight_trail:
         entry = dict(item)
@@ -16930,7 +17106,7 @@ def _r55_build_active_block(
         initial_plan_hash=plan_set.plan_hash,
         final_envelope=bundle.envelope,
         plan_hash=final_hash,
-        plan_hash_schema=zsched.ACTIVE_FINAL_PLAN_SCHEMA,
+        plan_hash_schema=plan_hash_schema,
         note=(
             (
                 "R55-E2 active GPU: a single-owner (K=1) GPU plan was "
@@ -22785,13 +22961,27 @@ def _run_single(
         # state PER CELL. A deep Cell can never cap a later Cell, and a Cell can
         # never grow on memory recovery or retry (its ladder is frozen).
         _percell_states = {}
+        _percell_pending_set = (
+            None
+            if pending_cell_ids is None
+            else {str(cid) for cid in pending_cell_ids}
+        )
         if tuple(getattr(gpu_decision, "percell_entries", ()) or ()):
             for _entry in gpu_decision.percell_entries:
-                _percell_states[str(_entry.cell_id)] = {
+                _cid_token = str(_entry.cell_id)
+                _percell_states[_cid_token] = {
                     "entry": _entry,
                     "tile": int(_entry.tile_px),
                     "shrink_history": [],
                     "units": [],
+                    # REWORK-1 (M2 provenance): a PARTIAL resume restores the
+                    # already-committed Cells. Their tile is the frozen plan
+                    # AFTER the durable caps/commit evidence, not something this
+                    # attempt executed -- never report it as measured.
+                    "restored": bool(
+                        _percell_pending_set is not None
+                        and _cid_token not in _percell_pending_set
+                    ),
                 }
 
         def _percell_context(state):
@@ -22880,13 +23070,66 @@ def _run_single(
                 prepared["_empty_unit"] = True
             return prepared
 
+        _percell_host_by_cell: dict[str, int] = {}
+        _percell_disk_by_cell: dict[str, int] = {}
+
+        def _percell_host_reserve(cell_id):
+            """The Cell's OWN predicted resident staging bound (PLAN bound only).
+
+            ZM-GPU-PERCELL-FINALIZE (heterogeneous credit): a per-Cell plan
+            executes DIFFERENT tiles and different contributor counts per Cell,
+            so the run-wide REFERENCE credit is not an upper bound for every
+            Cell. A resumed reference may legitimately be a different real Cell
+            than the fresh one; reserving its smaller bound for a deeper Cell
+            failed the pipeline's fail-closed accounting. The reservation is
+            therefore this Cell's own derived bound, from its frozen facts.
+            OFF (no per-Cell plan) keeps the historical run-wide value.
+            """
+            if not _percell_states:
+                return None
+            cid = "" if cell_id is None else str(cell_id)
+            cached = _percell_host_by_cell.get(cid)
+            if cached is not None:
+                return int(cached)
+            state = _percell_states.get(cid)
+            if state is None:
+                return None
+            entry = state["entry"]
+            value = max(
+                1,
+                int(
+                    _r55_prefetch_resident_bytes(
+                        storage_profile=str(
+                            getattr(
+                                gpu_bundle,
+                                "storage_profile",
+                                _STACK_STORAGE_PROFILE,
+                            )
+                        ),
+                        per_unit_cache_bytes=int(
+                            _r55_cache_unit_bytes(
+                                int(entry.patch_area_px),
+                                int(entry.n_contributors),
+                            )
+                        ),
+                        worst_patch_px=int(entry.patch_area_px),
+                        channels=3,
+                    )
+                ),
+            )
+            _percell_host_by_cell[cid] = int(value)
+            return int(value)
+
         def _host_bytes(payload):
             if payload.get("_empty_unit"):
                 return 0
             if bounded_storage:
                 # No mapping outlives an access: a queued slot reserves only its
                 # derived resident staging bound, never the on-disk payload.
-                return int(unit_host)
+                _pc_bound = _percell_host_reserve(
+                    getattr(payload.get("cell"), "cell_id", None)
+                )
+                return int(unit_host) if _pc_bound is None else int(_pc_bound)
             # dense: the historical contract, byte for byte (2N live memmaps).
             return int(payload["manifest"].get("total_bytes", 0))
 
@@ -23607,19 +23850,69 @@ def _run_single(
                 if str(task[0].cell_id) in _pending_set
             ]
         indexed = list(enumerate(tasks))
+        def _pipeline_task_cell_id(task):
+            """The Cell id of ONE pipeline task.
+
+            The GPU pipeline receives ``(index, canonical_task)`` pairs while a
+            direct/batch caller passes the canonical task itself; both shapes are
+            accepted here so the per-Cell credit can never silently fall back to
+            the run-wide reference bound.
+            """
+            item = task
+            if (
+                isinstance(item, (tuple, list))
+                and len(item) == 2
+                and isinstance(item[0], int)
+            ):
+                item = item[1]
+            if isinstance(item, (tuple, list)) and item:
+                return getattr(item[0], "cell_id", None)
+            return getattr(item, "cell_id", None)
+
         def _host_reserve(task):
             """F1: PREDICTED resident staging bytes, from the PLAN bound only.
 
             Reserved BEFORE ``_prepare_stack_cell`` allocates or writes anything.
             Dense keeps the worst-shape cache bound (conservative); bounded uses
             the derived one-access resident bound. The actual payload is then
-            reconciled DOWN, never up.
+            reconciled DOWN, never up. A per-Cell plan reserves THIS Cell's own
+            bound (see :func:`_percell_host_reserve`).
             """
-            return int(unit_host)
+            _pc_bound = _percell_host_reserve(_pipeline_task_cell_id(task))
+            return int(unit_host) if _pc_bound is None else int(_pc_bound)
+
+        def _percell_disk_reserve(cell_id):
+            """The Cell's OWN on-disk aligned-cache upper bound (PLAN bound).
+
+            Same heterogeneous rule as :func:`_percell_host_reserve`: the
+            run-wide REFERENCE cache bound is not an upper bound for a deeper
+            Cell, so the disk credit is this Cell's own exact upper bound.
+            """
+            if not _percell_states:
+                return None
+            cid = "" if cell_id is None else str(cell_id)
+            cached = _percell_disk_by_cell.get(cid)
+            if cached is not None:
+                return int(cached)
+            state = _percell_states.get(cid)
+            if state is None:
+                return None
+            entry = state["entry"]
+            value = max(
+                1,
+                int(
+                    _r55_cache_unit_bytes(
+                        int(entry.patch_area_px), int(entry.n_contributors)
+                    )
+                ),
+            )
+            _percell_disk_by_cell[cid] = int(value)
+            return int(value)
 
         def _disk_reserve(task):
             """F1: PREDICTED on-disk bytes, the worst-shape cache upper bound."""
-            return int(unit_disk)
+            _pc_bound = _percell_disk_reserve(_pipeline_task_cell_id(task))
+            return int(unit_disk) if _pc_bound is None else int(_pc_bound)
 
         disk_fresh_refusal: dict = {}
 
@@ -23715,7 +24008,25 @@ def _run_single(
                     f"{cache_dir!s}"
                 )
 
-        host_budget_val = int(host_budget)
+        # REWORK-1 (L3): the ledger ceiling must cover the LARGEST real per-Cell
+        # reservation (still capped by the admitted plan budget). OFF keeps the
+        # historical run-wide value byte for byte.
+        _percell_reserves = (
+            [
+                int(_percell_host_reserve(cid))
+                for cid in _percell_states
+                if _percell_host_reserve(cid) is not None
+            ]
+            if _percell_states
+            else ()
+        )
+        host_capacity = _r55_pipeline_host_capacity(
+            budget_bytes=int(gpu_bundle.envelope.budget_bytes),
+            unit_host=int(unit_host),
+            queue_max=int(queue_max),
+            percell_reserves=_percell_reserves,
+        )
+        host_budget_val = int(host_capacity)
         pipeline = zpar.BoundedPipeline(
             tasks=indexed,
             produce=lambda item: dict(
@@ -24121,6 +24432,11 @@ def _run_single(
                             for item in _state["shrink_history"]
                         ],
                         "executed_units": int(len(_state["units"])),
+                        "effective_source": (
+                            "frozen_plan_after_durable_caps"
+                            if _state.get("restored")
+                            else "executed_this_attempt"
+                        ),
                         "final_action": (
                             "shrink"
                             if _state["shrink_history"] else "planned"
@@ -24166,7 +24482,18 @@ def _run_single(
                 "growth": "forbidden",
                 "labels": {
                     "bounds": "MODEL (product arithmetic)",
-                    "tiles_and_shrinks": "MEASURED_RUN",
+                    "tiles_and_shrinks": (
+                        "MEASURED_RUN"
+                        if not any(
+                            state.get("restored")
+                            for state in _percell_states.values()
+                        )
+                        else (
+                            "MEASURED_RUN for Cells executed in THIS attempt; "
+                            "frozen durable caps for restored Cells "
+                            "(per-entry effective_source)"
+                        )
+                    ),
                     "device_execution": "NOT_RUN on this host",
                 },
                 "performance_guarantee": False,
@@ -24250,6 +24577,22 @@ def _run_single(
                     "host_budget_bytes": int(host_budget),
                     "disk_budget_bytes": int(disk_budget),
                     "queue_max": int(queue_max),
+                    # REWORK-1 (L3): published ONLY for a per-Cell plan, where
+                    # the ledger ceiling also covers the largest real per-Cell
+                    # reservation (still capped by the admitted plan budget).
+                    # OFF payloads stay byte-identical.
+                    **(
+                        {}
+                        if not _percell_states
+                        else {
+                            "host_ledger_capacity_bytes": int(host_capacity),
+                            "percell_reservation_basis": (
+                                "max(reference_unit_host, worst_per_cell_"
+                                "reservation) x queue_max, capped by the "
+                                "admitted plan budget"
+                            ),
+                        }
+                    ),
                     "note": (
                         "A prefetch slot reserves RESIDENT host staging bytes "
                         "(profile-aware) and EXACT on-disk cache bytes in "
@@ -25198,10 +25541,25 @@ def _run_single(
     # The control-flow variable is cleared (the CPU path owns execution), but the
     # decision, its effective mapping and its runtime adaptation are retained so
     # the manifest can report what the GPU actually attempted.
+    _r55_complete_replay_active = None
     if _resume_boot is not None and _resume_pending_ids is not None:
         if not _resume_pending_ids:
             # A COMPLETE run must resume ASSEMBLY without any GPU stack
             # admission. No cell is admitted, so no GPU decision is needed.
+            #
+            # ZM-GPU-PERCELL-FINALIZE: clearing the decision must NOT erase the
+            # evidence of the plan that governed the committed Cells. Freeze an
+            # explicit, truthful record (frozen admission + the tile each Cell
+            # ACTUALLY committed) so finalization can still publish the active
+            # scheduler block -- including the heterogeneous per-Cell tiles --
+            # without re-planning, re-admitting or re-running any Cell.
+            _r55_complete_replay_active = _r55_freeze_complete_replay_decision(
+                decision=_r55_active_gpu_decision,
+                candidate=_r55_active_candidate,
+                mapping=_r55_active_mapping,
+                bundle=_r55_active_bundle,
+                store=_store_state.get("store"),
+            )
             _r55_active_gpu_decision = None
         else:
             # ZM-ZEGRID-GPU-PARTIAL-RESUME-20261111: a PARTIAL resume may run
@@ -26854,23 +27212,68 @@ def _run_single(
         # R55-D2: build the active block AFTER execution so its status and final
         # values are the ones that actually ran. It is deterministic (no timing or
         # observed metric) and is the ONLY scheduler block in active mode.
-        if scheduler_mode == zsched.MODE_ACTIVE and (
-            _r55_active_decision is not None
-            or _r55_active_gpu_decision is not None
-        ):
+        #
+        # ZM-GPU-PERCELL-FINALIZE: a COMPLETE durable replay legitimately clears
+        # the GPU decision (nothing is admitted for execution), but its manifest
+        # must still publish the FROZEN decision that governed the committed
+        # run. ``_r55_complete_replay_active`` carries that record (built from
+        # the immutable admission + the executed tiles recorded on each durable
+        # commit); its absence used to publish NO scheduler block at all.
+        _r55_final_record = _r55_complete_replay_active
+        _r55_final_decision = (
+            _r55_active_gpu_decision
+            if _r55_active_gpu_decision is not None
+            else (
+                _r55_active_decision
+                if _r55_active_decision is not None
+                else (
+                    None
+                    if _r55_final_record is None
+                    else _r55_final_record["decision"]
+                )
+            )
+        )
+        _r55_final_plan_set = (
+            _r55_final_decision.plan_set
+            if _r55_final_decision is not None
+            else (None if _r55_final_record is None
+                  else _r55_final_record["plan_set"])
+        )
+        if scheduler_mode == zsched.MODE_ACTIVE and _r55_final_plan_set is not None:
             _r55_active_ok = all(
                 r.get("status") in ("complete", "empty") for r in results
             )
-            _r55_active_plan_set = (
-                _r55_active_decision.plan_set
-                if _r55_active_decision is not None
-                else _r55_active_gpu_decision.plan_set
-            )
+            _r55_block_bundle = _final
+            _r55_block_candidate = _r55_active_candidate
+            _r55_block_mapping = _r55_active_mapping
+            _r55_block_pc_plan = None
+            _r55_block_pc_tiles = None
+            if _r55_final_record is not None:
+                _r55_block_bundle = _r55_final_record["bundle"]
+                _r55_block_candidate = _r55_final_record["candidate"]
+                _r55_block_mapping = _r55_final_record["mapping"]
+                _r55_block_pc_plan = _r55_final_record["plan"]
+                _r55_block_pc_tiles = _r55_final_record["effective_tiles"]
+            elif getattr(
+                _r55_active_gpu_decision, "percell_plan", None
+            ) is not None:
+                _r55_block_pc_plan = _r55_active_gpu_decision.percell_plan
+                _r55_block_pc_tiles = _r55_run_percell_effective_tiles(
+                    _r55_run_block
+                )
+                if _r55_block_pc_tiles is None:
+                    # NEVER publish a per-Cell block without its MEASURED tiles:
+                    # a missing evidence set is a hard error, not a guess.
+                    raise RuntimeError(
+                        "R55-E2 per-Cell finalization: the GPU run block carries "
+                        "no measured per-Cell effective tiles; refusing to "
+                        "publish an unverifiable per-Cell plan hash"
+                    )
             _r55_scheduler_block = _r55_build_active_block(
-                plan_set=_r55_active_plan_set,
-                final_candidate=_r55_active_candidate,
-                mapping=_r55_active_mapping,
-                bundle=_final,
+                plan_set=_r55_final_plan_set,
+                final_candidate=_r55_block_candidate,
+                mapping=_r55_block_mapping,
+                bundle=_r55_block_bundle,
                 initial_bundle=_initial_bundle,
                 preflight_admission=_r55_active_preflight_adm,
                 launch_admission=_r55_active_launch_adm,
@@ -26879,16 +27282,8 @@ def _run_single(
                 status=("executed" if _r55_active_ok else "partial"),
                 run=_r55_run_block,
                 worker_adaptation=_r55_worker_adaptation_detail(
-                    (
-                        _r55_active_gpu_decision
-                        if _r55_active_gpu_decision is not None
-                        else _r55_active_decision
-                    ).facts,
-                    (
-                        _r55_active_gpu_decision
-                        if _r55_active_gpu_decision is not None
-                        else _r55_active_decision
-                    ).worker_trail,
+                    _r55_final_decision.facts,
+                    _r55_final_decision.worker_trail,
                 ),
                 tile_ladder=(
                     _r55_active_gpu_decision.gpu_tile_ladder
@@ -26896,22 +27291,60 @@ def _run_single(
                     else (
                         _r55_gpu_retained["decision"].gpu_tile_ladder
                         if _r55_gpu_retained is not None
-                        else None
+                        else (
+                            _r55_final_record["decision"].gpu_tile_ladder
+                            if _r55_final_record is not None
+                            else None
+                        )
                     )
                 ),
                 # G2b (O1): policy/A/B_ram/S_credit/sources in the admission
                 # diagnostics. ``None`` (RAM-only) leaves the block unchanged.
                 gauge_credit=_gauge_swap_admission_record,
+                # ZM-GPU-PERCELL-FINALIZE: a frozen per-Cell plan binds its
+                # heterogeneous effective tiles into the final audit hash.
+                percell_plan=_r55_block_pc_plan,
+                percell_effective_tiles=_r55_block_pc_tiles,
             )
+            if _r55_final_record is not None:
+                # REWORK-1 (L2): a COMPLETE replay re-derives the reference
+                # decision and the envelope AT REPLAY TIME. The hash is exact
+                # and reproducible, but it is NOT the historical hash of the
+                # crashed attempt (which never published one): say so.
+                _r55_scheduler_block["plan_hash_origin"] = (
+                    "recomputed_at_replay"
+                )
+                _r55_scheduler_block["plan_hash_origin_note"] = (
+                    "The reference decision and the product envelope were "
+                    "re-derived at replay time from the FROZEN admission and "
+                    "the durable executed tiles. No historical device/RAM "
+                    "telemetry is reconstructed or invented."
+                )
+                _r55_scheduler_block = zsched._stamp_active_hash(
+                    _r55_scheduler_block
+                )
             if _r55_active_gpu_decision is not None:
                 _r55_scheduler_block["gpu_execution"] = dict(
                     _r55_active_gpu_decision.qualification
                 )
+                # ZM-GPU-PERCELL-FINALIZE: the tile-ladder diagnostic is priced
+                # from the REFERENCE decision's OWN per-tile tables. A per-Cell
+                # run's run-level maximum tile belongs to a DIFFERENT Cell and
+                # is deliberately absent from those tables (looking it up was a
+                # second, independent KeyError at finalization). The block keeps
+                # its homogeneous scope and the per-Cell block carries the
+                # heterogeneous truth beside it.
+                _r55_tile_decision_mapping = _r55_active_mapping
+                if _r55_block_pc_plan is not None:
+                    _r55_tile_decision_mapping = dict(_r55_active_mapping)
+                    _r55_tile_decision_mapping["gpu_streaming_tile"] = int(
+                        _r55_block_candidate.tile_px
+                    )
                 _r55_scheduler_block["gpu_tile_decision"] = (
                     _r55_gpu_tile_decision_dict(
                         _r55_active_gpu_decision,
-                        _r55_active_mapping,
-                        _final,
+                        _r55_tile_decision_mapping,
+                        _r55_block_bundle,
                         runtime=(_r55_run_telemetry or {}).get(
                             "gpu_tile_adaptation"
                         ),
@@ -26920,6 +27353,34 @@ def _run_single(
                         ),
                     )
                 )
+                if _r55_block_pc_plan is not None:
+                    _r55_scheduler_block["gpu_tile_decision"].update(
+                        {
+                            # The scheduler reference Cell is NOT re-derived
+                            # here: the planner does not persist which real Cell
+                            # backed the infrastructure decision, and a resumed
+                            # attempt may legitimately resolve a different real
+                            # Cell. Naming one would be a fabrication; the tile
+                            # and the exact reference hash are the evidence.
+                            "scope": "scheduler_reference_decision",
+                            "reference_tile_px": int(
+                                _r55_block_candidate.tile_px
+                            ),
+                            "run_level_max_effective_tile_px": int(
+                                max(_r55_block_pc_tiles.values())
+                            ),
+                            "percell_tiles_differ": bool(
+                                len(set(_r55_block_pc_tiles.values())) > 1
+                            ),
+                            "note": (
+                                "selected_* / *_by_tile describe the scheduler "
+                                "REFERENCE Cell's own admitted ladder; the "
+                                "run-level tile is the largest EFFECTIVE "
+                                "per-Cell tile and is published in "
+                                "percell_tiles."
+                            ),
+                        }
+                    )
                 if _r55_run_telemetry and _r55_run_telemetry.get(
                     "gpu_tile_adaptation"
                 ):
@@ -26989,25 +27450,48 @@ def _run_single(
                 if isinstance(_r55_run_block, dict)
                 else None
             )
-            if _pc_block is None and _r55_active_gpu_decision is not None:
-                _pc_plan = getattr(
-                    _r55_active_gpu_decision, "percell_plan", None
-                )
-                if _pc_plan is not None:
-                    _pc_block = {
-                        "schema": zpercell.PERCELL_SCHEMA,
-                        "enabled": True,
-                        "policy": str(_pc_plan.policy),
-                        "max_tile_px": int(_pc_plan.max_tile_px),
-                        "entries": [
-                            _e.to_dict() for _e in _pc_plan.entries
-                        ],
-                        "labels": {
-                            "bounds": "MODEL (product arithmetic)",
-                            "device_execution": "NOT_RUN on this host",
-                        },
-                        "performance_guarantee": False,
-                    }
+            if _pc_block is None and _r55_block_pc_plan is not None:
+                # No runner block exists (a COMPLETE durable replay executed no
+                # Cell). Publish the FROZEN plan + the tiles the immutable
+                # commits really used, never the absence of the evidence.
+                # REWORK-1 (M2): EVERY effective tile comes from the strict
+                # durable-evidence map; there is NO planned fallback here.
+                _pc_tiles = dict(_r55_block_pc_tiles or {})
+                _pc_missing = [
+                    str(_e.cell_id)
+                    for _e in _r55_block_pc_plan.entries
+                    if str(_e.cell_id) not in _pc_tiles
+                ]
+                if _pc_missing:
+                    raise _R55PerCellTileEvidenceError(
+                        "per-Cell manifest REFUSED: no measured effective tile "
+                        f"for Cell(s) {_pc_missing}; a planned tile is never "
+                        "published as measured"
+                    )
+                _pc_entries = []
+                for _e in _r55_block_pc_plan.entries:
+                    _entry = _e.to_dict()
+                    _entry["planned_tile_px"] = int(_e.tile_px)
+                    _entry["effective_tile_px"] = int(
+                        _pc_tiles[str(_e.cell_id)]
+                    )
+                    _pc_entries.append(_entry)
+                _pc_block = {
+                    "schema": zpercell.PERCELL_SCHEMA,
+                    "enabled": True,
+                    "policy": str(_r55_block_pc_plan.policy),
+                    "max_tile_px": int(_r55_block_pc_plan.max_tile_px),
+                    "entries": _pc_entries,
+                    "source": "frozen_admission_durable_commits",
+                    "labels": {
+                        "bounds": "MODEL (product arithmetic)",
+                        "tiles": "MEASURED_RUN (durable commit tiles)",
+                        "device_execution": (
+                            "NOT_RUN in this attempt (complete durable replay)"
+                        ),
+                    },
+                    "performance_guarantee": False,
+                }
             if _pc_block is not None:
                 _r55_scheduler_block["percell_tiles"] = dict(_pc_block)
 

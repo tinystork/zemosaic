@@ -1540,10 +1540,23 @@ def percell_committed_tiles(store) -> dict[str, int]:
         try:
             manifest = getattr(record, "manifest", None) or {}
             meta = manifest.get("payload_meta") or {}
-            row = meta.get("record") or {}
-            if not isinstance(row, dict):
+            if not isinstance(meta, dict):
                 continue
-            raw = row.get("percell_tile_px")
+            # ZM-GPU-PERCELL-FINALIZE (REWORK-1, M3): the commit writer copies
+            # the cell RESULT into ``payload_meta``, whose nested ``record``
+            # already carries the executed ``percell_tile_px`` -- the historical
+            # nested read was therefore NOT empty (verified on a real synthetic
+            # store: 9/9 cells). The result ALSO carries the same key at the top
+            # level, so this widened read accepts either shape. It is defensive
+            # robustness for both writer shapes, never the explanation of the
+            # partial-resume credit failure (that was the run-wide reservation
+            # bound). The nested lookup stays as the compatibility path.
+            raw = meta.get("percell_tile_px")
+            if raw is None:
+                row = meta.get("record") or {}
+                if not isinstance(row, dict):
+                    continue
+                raw = row.get("percell_tile_px")
             if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
                 continue
             cid = str(getattr(record, "cell_id", ""))

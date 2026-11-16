@@ -33,6 +33,8 @@ the version is bumped only when the field is present.
 
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -50,6 +52,14 @@ PERCELL_POLICY = "percell_v1"
 PERCELL_SCHEMA = "zegrid-percell-tile-v1"
 #: Durable shrink-cap document (separate from the immutable admission).
 SHRINK_CAPS_SCHEMA = "zegrid-percell-shrink-caps-v1"
+#: Schema label of the heterogeneous per-Cell FINAL executable plan hash.
+#: It EXTENDS ``zsched.ACTIVE_FINAL_PLAN_SCHEMA`` (v1); it never replaces it.
+#: A homogeneous run keeps the v1 label and the exact strict hash byte for
+#: byte. v2 is emitted ONLY when a frozen per-Cell plan governs the run,
+#: because such a run has TWO distinct final facts v1 cannot express: the
+#: scheduler REFERENCE candidate (one real Cell + its exact mapping) and the
+#: per-Cell EFFECTIVE tiles (heterogeneous, shrink-only).
+FINAL_PLAN_SCHEMA = "zemosaic-r55d2-percell-final-executable-plan-v2"
 
 #: The GPU ladder stays at/above the qualified 32 px floor. This is a POLICY
 #: floor (not a physical one) and is deliberately unchanged by this feature.
@@ -781,6 +791,186 @@ def attach_percell(decision, plan: PerCellPlan):
 
 def plan_frozen_from_admission(raw: Any) -> PerCellPlan:
     return plan_from_admission(raw)
+
+
+# ---------------------------------------------------------------------------
+# Heterogeneous final executable plan hash (V3)
+# ---------------------------------------------------------------------------
+
+
+def final_plan_hash(
+    *,
+    reference_candidate,
+    reference_mapping,
+    mapping,
+    plan: "PerCellPlan",
+    effective_tiles,
+    identity,
+    envelope,
+    tile_ladder=zsched.PRODUCT_TILE_LADDER,
+) -> str:
+    """Deterministic hash of the heterogeneous per-Cell FINAL decision.
+
+    WHY THIS EXISTS
+    ---------------
+    :func:`scheduler.active_final_plan_hash` is the exact, strict identity of
+    ONE homogeneous executable decision: one candidate plus the ONE mapping
+    that candidate produces. It is deliberately NOT relaxed here -- a per-Cell
+    run genuinely executes DIFFERENT tiles per Cell, so its final execable
+    decision is a PAIR of facts:
+
+    * the scheduler REFERENCE decision -- the admitted candidate of one REAL
+      reference Cell and the exact mapping ``active_gpu_mapping_for_candidate``
+      derives from it (never a forged candidate at another Cell's tile);
+    * the frozen per-Cell plan and the per-Cell EFFECTIVE tiles that executed.
+
+    VALIDATION SCOPE (REWORK-1, L1) -- stated exactly, never overstated:
+    * the REFERENCE half is validated by CALLING the strict scheduler function
+      itself: candidate fields, ``reference_mapping`` derived from that
+      candidate, the frozen identity and the envelope TYPE are checked there,
+      and its hash is part of the payload;
+    * the RUN-WIDE envelope is checked HERE and separately (GPU backend, K=1,
+      ``gpu_tile`` == largest effective per-Cell tile, prefetch/workers equal to
+      the run-level mapping). The scheduler function does not cross-check
+      ``envelope.gpu_tile`` against a mapping, and this function does not claim
+      it does.
+    * the per-Cell half (coverage, declared rung, ``tile <= admitted``) is
+      checked here.
+
+    ``mapping`` is the run-level executable mapping published in the manifest:
+    identical to ``reference_mapping`` except ``gpu_streaming_tile``, which is
+    the LARGEST effective per-Cell tile (the documented descriptive rule of
+    ``_r55_active_gpu_apply``). Any other difference is refused.
+    """
+    if not isinstance(plan, PerCellPlan):
+        raise zsched.SchedulerConfigError(
+            f"final plan hash requires a PerCellPlan, got {type(plan).__name__}"
+        )
+    if not isinstance(reference_mapping, Mapping) or not isinstance(mapping, Mapping):
+        raise zsched.SchedulerConfigError(
+            "final plan hash requires both the reference and the run-level "
+            "mapping"
+        )
+    if not isinstance(effective_tiles, Mapping) or not effective_tiles:
+        raise zsched.SchedulerConfigError(
+            "final plan hash requires a non-empty effective tile mapping"
+        )
+    ladder = tuple(int(t) for t in tile_ladder)
+    # 1) REFERENCE half: the strict scheduler validator/hash is used AS IS.
+    reference_hash = zsched.active_final_plan_hash(
+        candidate=reference_candidate,
+        mapping=reference_mapping,
+        identity=identity,
+        envelope=envelope,
+        tile_ladder=ladder,
+    )
+    # 2) Per-Cell half: EXACT coverage, declared rung, never above the admitted
+    #    (or resume-capped) per-Cell tile. No growth is representable.
+    expected = set(plan.cell_ids())
+    got = {str(cid) for cid in effective_tiles}
+    if got != expected:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_INTERNAL_ERROR,
+            "final per-Cell plan hash coverage mismatch (missing="
+            f"{sorted(expected - got)}, extra={sorted(got - expected)})",
+            mapping=mapping,
+        )
+    normalised: dict[str, int] = {}
+    for cid in plan.cell_ids():
+        raw = effective_tiles[cid]
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise zsched.SchedulerConfigError(
+                f"effective tile for Cell {cid!r} must be a plain int, "
+                f"got {type(raw).__name__}"
+            )
+        tile = int(raw)
+        entry = plan.entry_for(cid)
+        if tile not in entry.declared_ladder:
+            raise zsched.ActivePlanRejected(
+                renv.REASON_SHRINK_TILE,
+                f"effective tile {tile} for Cell {cid!r} is outside its "
+                f"declared ladder {list(entry.declared_ladder)}",
+                mapping=mapping,
+            )
+        if tile > int(entry.tile_px):
+            raise zsched.GrowthRejected(
+                f"effective tile {tile} for Cell {cid!r} grows above its "
+                f"admitted tile {int(entry.tile_px)}"
+            )
+        normalised[str(cid)] = tile
+    max_tile = max(normalised.values())
+    # 3) The run-level mapping is the reference mapping with EXACTLY ONE
+    #    descriptive field replaced by the largest effective per-Cell tile.
+    executable = dict(reference_mapping)
+    executable["gpu_streaming_tile"] = int(max_tile)
+    if dict(mapping) != executable:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_INTERNAL_ERROR,
+            "final per-Cell plan hash mapping is neither the reference mapping "
+            f"nor its documented run-level max (mapping={dict(mapping)!r}, "
+            f"expected={executable!r})",
+            mapping=dict(mapping),
+        )
+    # 4) The product envelope must describe the SAME execution: GPU, K=1, the
+    #    run-level max tile and the mapping's own knobs.
+    env = envelope.to_dict() if hasattr(envelope, "to_dict") else dict(envelope)
+    if str(env.get("backend")) != str(zsched.BACKEND_GPU):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_UNKNOWN_BACKEND,
+            f"final per-Cell plan hash requires a GPU envelope, got "
+            f"backend={env.get('backend')!r}",
+            mapping=dict(mapping),
+        )
+    if env.get("gpu_tile") is None or int(env["gpu_tile"]) != int(max_tile):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_INTERNAL_ERROR,
+            "final per-Cell plan hash envelope gpu_tile "
+            f"{env.get('gpu_tile')!r} is not the largest effective per-Cell "
+            f"tile {int(max_tile)}",
+            mapping=dict(mapping),
+        )
+    if int(env.get("cells_in_flight", 0)) != 1:
+        raise zsched.ActivePlanRejected(
+            renv.REASON_REFUSE_HOST_RAM,
+            "final per-Cell plan hash requires the single-owner K=1 contract",
+            mapping=dict(mapping),
+        )
+    if int(env.get("prefetch_units", -1)) != int(mapping["prefetch_units"]):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_SHRINK_PREFETCH,
+            "final per-Cell plan hash prefetch mismatch (envelope "
+            f"{env.get('prefetch_units')!r} != mapping "
+            f"{mapping['prefetch_units']!r})",
+            mapping=dict(mapping),
+        )
+    if int(env.get("cache_workers_per_cell", -1)) != int(
+        mapping["workers_per_unit"]
+    ):
+        raise zsched.ActivePlanRejected(
+            renv.REASON_SHRINK_WORKERS,
+            "final per-Cell plan hash cache-worker mismatch (envelope "
+            f"{env.get('cache_workers_per_cell')!r} != mapping "
+            f"{mapping['workers_per_unit']!r})",
+            mapping=dict(mapping),
+        )
+    payload = {
+        "schema": FINAL_PLAN_SCHEMA,
+        "reference_plan_hash": str(reference_hash),
+        "reference_candidate": reference_candidate.to_dict(),
+        "reference_mapping": dict(reference_mapping),
+        "mapping": dict(mapping),
+        "percell_plan": plan.to_admission(),
+        "effective_tile_px_by_cell": {
+            str(cid): int(tile) for cid, tile in sorted(normalised.items())
+        },
+        "max_effective_tile_px": int(max_tile),
+        "identity": identity.to_dict(),
+        "product_envelope": env,
+    }
+    # The canonical encoder is the scheduler's (same bytes as the v1 hash).
+    return "sha256:" + hashlib.sha256(
+        zsched._canonical_active_json(payload)  # noqa: SLF001 - same package
+    ).hexdigest()
 
 
 # ---------------------------------------------------------------------------
