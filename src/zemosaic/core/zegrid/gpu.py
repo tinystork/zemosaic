@@ -52,12 +52,13 @@ __all__ = [
 ]
 
 # ONE VRAM policy for BOTH the legacy tiled planner and the ACTIVE readiness
-# path (A1c). 70 % of CURRENTLY FREE VRAM, integer arithmetic, 30 % residual
-# reserve for the CUDA context / allocator retention / other processes.
-# ``GPU_VRAM_SAFETY_FRACTION`` is kept as a float alias for older callers; the
-# budget itself is computed from the integer percent so both paths agree
-# byte-for-byte.
-GPU_VRAM_SAFETY_PERCENT = 70
+# path (A1c). ZM-MEMORY-90PCT-BETA (2026-11-16) raises the ceiling to 90 % of
+# CURRENTLY FREE VRAM for a direct beta comparison, integer arithmetic, leaving a
+# 10 % residual reserve for the CUDA context / allocator retention / other
+# processes. ``GPU_VRAM_SAFETY_FRACTION`` is kept as a float alias for older
+# callers; the budget itself is computed from the integer percent so both paths
+# agree byte-for-byte.
+GPU_VRAM_SAFETY_PERCENT = 90
 GPU_VRAM_SAFETY_FRACTION = GPU_VRAM_SAFETY_PERCENT / 100.0
 
 # Absolute floor: below this the tiled GPU path cannot hold even a small tile and

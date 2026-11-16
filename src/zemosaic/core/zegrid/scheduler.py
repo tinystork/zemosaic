@@ -3617,7 +3617,7 @@ def materialize_active_candidate(
     K, prefetch, workers) and preserves the previous projections. D2 must never
     serialize those stale projections as the FINAL executable candidate. This
     helper re-enumerates the owning context (optionally rebound to a fresh
-    4/5 PLAN observation) and returns the UNIQUE candidate with the exact same
+    9/10 PLAN observation) and returns the UNIQUE candidate with the exact same
     tuple, carrying truthful recomputed host/disk/device projections,
     feasibility/reason, estimate method/calibration and timing metadata.
 

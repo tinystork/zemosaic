@@ -704,7 +704,7 @@ assert 'cupy' not in sys.modules
 assert 'cupy.cuda' not in sys.modules
 assert parallel.PIPELINE_SCHEMA
 assert runtime_control.RUN_MAX_SAMPLE_INTERVAL_S == 5.0
-assert gpu_readiness.INITIAL_TARGET_PERCENT == 70
+assert gpu_readiness.INITIAL_TARGET_PERCENT == 90
 assert scheduler.MODE_ACTIVE == 'active'
 print('LAZY_OK')
 """

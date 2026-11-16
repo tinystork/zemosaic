@@ -340,11 +340,11 @@ def test_e10_fresh_vram_pressure_shrinks_downward_from_the_pruned_top(m106):
     assert recovered is None or recovered.tile_px < shrunk.tile_px
 
 
-def test_e10_policy_and_legacy_constants_are_untouched():
-    assert zz._R55E10_VRAM_SELECTION_HEADROOM_PERCENT == 85
-    assert zgr.INITIAL_TARGET_PERCENT == 70
-    assert zgr.VRAM_LADDER == (50, 65, 70, 75)
-    assert zgpu.GPU_VRAM_SAFETY_FRACTION == 0.5
+def test_e10_policy_and_legacy_constants_match_90pct_beta():
+    assert zz._R55E10_VRAM_SELECTION_HEADROOM_PERCENT == 100
+    assert zgr.INITIAL_TARGET_PERCENT == 90
+    assert zgr.VRAM_LADDER == (50, 65, 70, 75, 90)
+    assert zgpu.GPU_VRAM_SAFETY_FRACTION == 0.9
     assert zgpu.GPU_TAPER_HALO_PX == 9
 
 
@@ -449,8 +449,8 @@ def test_e10_diagnostics_report_headroom_and_selection_budget(m106):
     assert block["vram_percent"] == 70
 
     # New E10 audit fields.
-    assert block["selection_headroom_percent"] == 85
-    assert block["selection_headroom_fraction"] == pytest.approx(0.85)
+    assert block["selection_headroom_percent"] == 100
+    assert block["selection_headroom_fraction"] == pytest.approx(1.0)
     assert block["selection_budget_bytes"] == WITNESS_SELECTION_BUDGET
     assert block["selected_device_selection_margin_bytes"] == (
         WITNESS_SELECTION_BUDGET - WITNESS_SELECTED_DEVICE

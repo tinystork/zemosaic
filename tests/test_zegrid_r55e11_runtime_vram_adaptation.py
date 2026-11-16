@@ -405,7 +405,7 @@ def test_e11_diagnostics_distinguish_active_and_legacy_budgets():
     assert block["initial_tile_px"] == 448
     assert block["effective_tile_px"] == 384
     assert block["runtime_adaptation"]["shrink_count"] == 1
-    assert block["engine_provenance"]["active_vram_percent"] == 70
+    assert block["engine_provenance"]["active_vram_percent"] == 90
 
 
 # ---------------------------------------------------------------------------

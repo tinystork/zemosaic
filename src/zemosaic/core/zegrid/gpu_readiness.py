@@ -2,8 +2,8 @@
 
 This module is a *fact and contract* layer. It does not activate GPU scheduling
 and never makes CuPy mandatory. A1c unifies the VRAM policy: BOTH this module
-and the legacy tiled planner use :data:`gpu.GPU_VRAM_SAFETY_PERCENT` (70 % of
-currently free VRAM) with the same 64 MiB floor.
+and the legacy tiled planner use :data:`gpu.GPU_VRAM_SAFETY_PERCENT` (90 % of
+currently free VRAM under ZM-MEMORY-90PCT-BETA) with the same 64 MiB floor.
 
 Design invariants
 -----------------
@@ -19,11 +19,11 @@ Design invariants
 * **Pure integers**: the VRAM policy uses integer arithmetic only, refuses
   ``bool``/``float`` coercion, never inflates a budget up to a floor, and reports
   the explicit residual reserve.
-* **Provisional value, ONE policy**: the 70 % of currently free VRAM is the
-  single policy shared with ``gpu.vram_budget_bytes`` (A1c). Its *qualification*
+* **Provisional value, ONE policy**: the 90 % of currently free VRAM is the
+  single beta policy shared with ``gpu.vram_budget_bytes`` (A1c). Its *qualification*
   (real product-path HWM and parity at that budget) remains a later mission.
 * **Single owner / whole batch**: the RUN revalidation contract is shrink-only
-  (75 -> 70 -> 65 -> 50 -> CPU), never grows a resource after pressure, and a
+  (90 -> 75 -> 70 -> 65 -> 50 -> CPU), never grows a resource after pressure, and a
   GPU abandonment is an exact **whole-batch** CPU fallback with no mixed partial
   result.
 
@@ -44,7 +44,7 @@ try:  # package import: ONE policy source
 except ImportError:  # pragma: no cover - standalone module load (no package)
     # The readiness module is also loaded standalone by the CuPy-import guard
     # test. Keep the same value; the package path is asserted equal in A1c tests.
-    GPU_VRAM_SAFETY_PERCENT = 70
+    GPU_VRAM_SAFETY_PERCENT = 90
 
 try:  # Python 3.11+; the project also supports 3.10
     import tomllib
@@ -186,8 +186,9 @@ REASONS = frozenset(
 # ---------------------------------------------------------------------------
 
 # Provisional candidate ladder, ascending, in integer percent of CURRENTLY FREE
-# VRAM. 70 is the initial provisional target (product-owner decision R55-C).
-VRAM_LADDER = (50, 65, 70, 75)
+# VRAM. ZM-MEMORY-90PCT-BETA adds 90 as the initial target while preserving the
+# historical shrink rungs 75 -> 70 -> 65 -> 50 (product-owner decision R55-C).
+VRAM_LADDER = (50, 65, 70, 75, 90)
 INITIAL_TARGET_PERCENT = int(GPU_VRAM_SAFETY_PERCENT)
 # Progressive qualification path for a later mission (65 -> 70 -> 75).
 QUALIFICATION_LADDER = (65, 70, 75)
@@ -197,7 +198,7 @@ QUALIFICATION_LADDER = (65, 70, 75)
 # dependency-light. A test pins the two constants equal.
 MIN_VRAM_BUDGET_BYTES = 64 * 1024 * 1024
 
-# 70% is provisional and observe-only; it is NOT product-qualified.
+# 90% is provisional and observe-only; it is NOT product-qualified.
 POLICY_PROVENANCE = "provisional_observe_only"
 
 _ACTION_CONTINUE = "continue"
@@ -773,7 +774,7 @@ class VramPolicy:
         return tuple(self.candidate(free, p) for p in self.ladder)
 
     def initial(self, free_bytes: int) -> VramCandidate:
-        """The initial provisional target (70%) for a fresh observation."""
+        """The initial provisional target (90%) for a fresh observation."""
         return self.candidate(free_bytes, self.initial_percent)
 
     def next_shrink(self, current_percent: int, free_bytes: int) -> VramCandidate | None:
@@ -1239,7 +1240,7 @@ def _policy_contract_dict(policy: VramPolicy) -> dict:
         "execution_authority": False,
         "formula": "budget_bytes = floor(free_bytes * percent / 100)",
         "observation": "current free VRAM, fresh per bounded unit",
-        "shrink_order": "75 -> 70 -> 65 -> 50 -> cpu",
+        "shrink_order": "90 -> 75 -> 70 -> 65 -> 50 -> cpu",
         "growth_after_pressure": False,
         "fallback_scope": "whole_batch",
         "mixed_partial_result": False,

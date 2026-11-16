@@ -11,8 +11,8 @@ MIB = 2**20
 
 
 def test_one_percent_is_shared_by_both_paths():
-    assert gpu.GPU_VRAM_SAFETY_PERCENT == 70
-    assert gpu.GPU_VRAM_SAFETY_FRACTION == 0.70
+    assert gpu.GPU_VRAM_SAFETY_PERCENT == 90
+    assert gpu.GPU_VRAM_SAFETY_FRACTION == 0.9
     assert gr.INITIAL_TARGET_PERCENT == gpu.GPU_VRAM_SAFETY_PERCENT
 
 
@@ -25,5 +25,5 @@ def test_legacy_and_policy_budgets_are_identical(free):
 
 
 def test_below_floor_degrades_loudly_not_up():
-    free = 64 * MIB  # 70 % of 64 MiB < 64 MiB floor
+    free = 64 * MIB  # 90 % of 64 MiB is 57.6 MiB, still below the 64 MiB floor
     assert gpu.vram_budget_bytes({"available": True, "vram_free_bytes": free}) is None

@@ -7928,7 +7928,7 @@ def _r55_resolve_gpu_probe(use_gpu, zconfig):
 
 
 # ---------------------------------------------------------------------------
-# ZM-ZEGRID-R41-B — ONE executable bundle built under the PLAN budget (80 %)
+# ZM-ZEGRID-R41-B — ONE executable bundle built under the PLAN budget (90 %)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -10325,7 +10325,7 @@ def _ram_contract_diagnostics(
     credit_needed_bytes=None,
     capacity_sources=None,
 ) -> dict:
-    """JSON-safe R41-B manifest/log trail of the 80 %-plan / 90 %-admit contract.
+    """JSON-safe R41-B manifest/log trail of the 90 %-plan / 90 %-admit contract.
 
     Records BOTH raw observations and their OWN factors/budgets (never a
     serialized float factor, never ``0.9 * B_plan``), the initial and final
@@ -10398,12 +10398,13 @@ def _ram_contract_diagnostics(
         "gpu_pre_execution_fallback": bundle.gpu_pre_execution_fallback,
         "refinement_attempts": list(bundle.attempts),
         "note": (
-            "B_plan = floor(4/5 * raw plan observation); B_admit = "
+            "B_plan = floor(9/10 * raw plan observation); B_admit = "
             "floor(9/10 * a FRESH raw observation taken before every admission "
             "attempt and again immediately before launch. Each factor is applied "
-            "ONCE to its own raw observation. The 90 % ceiling is admission-only: "
-            "it never enlarges a layout, a tile or the concurrency. Host RAM only; "
-            "the VRAM reserve policy is unchanged."
+            "ONCE to its own raw observation. With both factors at 90 % the former "
+            "plan/admit tolerance band is empty; the limits never enlarge a layout, "
+            "a tile or the concurrency. Host RAM only; the VRAM beta policy is 90 % "
+            "of fresh free VRAM."
         ),
     }
     if gauge_workers_effective is not None:
@@ -12627,23 +12628,20 @@ _R55E2_MEASURE_PREFETCH_CAP = None
 # after this bound is a genuine stuck thread and fails closed.
 _R55E2_PIPELINE_JOIN_S = 60.0
 
-# R55-E10: SELECTION-TIME VRAM headroom for the ACTIVE GPU streaming tile.
+# R55-E10: SELECTION-TIME VRAM budget for the ACTIVE GPU streaming tile.
 #
-# R55-E9 derived the ladder top from the full fresh 70 % VRAM budget, so the
-# SELECTED tile filled that budget almost exactly (recorded M106 witness: 1.2 MiB
-# of margin). The device workspace is only an ESTIMATE (worst-case per-cell bytes
-# over the halo-expanded tile area plus a fixed overhead), free VRAM fluctuates
-# while the CuPy context/allocator warms up, and a miss is not recoverable in
-# place: an OOM forces a whole-batch CPU retry. RUN-time revalidation re-reads
-# fresh free VRAM once the CuPy context is live and saw a ~2 MiB drop on the
-# recorded run, which was enough to reject the razor-edge tile. The selected
-# tile must therefore fit only 85 % of that 70 % budget (~60 % of fresh free
-# VRAM), leaving a real safety margin on every device.
+# Under the historical 70 % policy R55-E9 derived the ladder top from the full
+# fresh 70 % VRAM budget, so the SELECTED tile filled that budget almost exactly
+# (recorded M106 witness: 1.2 MiB of margin). R55-E10 then pruned the ladder to
+# 85 % of that budget because the device workspace is only an ESTIMATE and a miss
+# forces a whole-batch CPU retry. ZM-MEMORY-90PCT-BETA raises the policy to 90 %
+# and sets this headroom to 100 %: the selected tile may use the full fresh 90 %
+# policy budget instead of a second 0.85 x 0.90 haircut (~76.5 % of free VRAM).
 #
-# This constant bounds SELECTION only. The 70 % qualification, the frozen policy
-# ladder and the RUN-time ``fresh_vram_revalidation`` are unchanged and remain
-# the hard backstop.
-_R55E10_VRAM_SELECTION_HEADROOM_PERCENT = 85
+# This constant bounds SELECTION only. The 90 % qualification, the frozen policy
+# ladder (90 -> 75 -> 70 -> 65 -> 50) and the RUN-time
+# ``fresh_vram_revalidation`` remain in place; the latter is the hard backstop.
+_R55E10_VRAM_SELECTION_HEADROOM_PERCENT = 100
 
 
 class _R55GpuRefused(RuntimeError):
@@ -12719,7 +12717,7 @@ class _R55GpuActiveDecision:
     worker_trail: tuple = ()
     # R55-E9: VRAM-derived max, declared GPU ladder and exact per-tile bounds.
     gpu_tile_max: int = 0
-    # Q1: the ACTUAL VramPolicy budget (70 % of fresh free VRAM) the ladder was
+    # Q1: the ACTUAL VramPolicy budget (90 % of fresh free VRAM) the ladder was
     # derived from; never reconstructed from the qualification percent.
     gpu_device_budget_bytes: int = 0
     gpu_tile_ladder: tuple = ()
@@ -12892,7 +12890,8 @@ def _r55_active_gpu_decide_single(
     initial = policy.candidate(free, policy.initial_percent)
     budget = int(initial.budget_bytes)
     # R55-E10: the tile ladder is bounded by a budget that already reserves the
-    # selection headroom. The 70 % policy budget itself is untouched.
+    # selection headroom. Under the beta policy that headroom is 100 %, so no
+    # second haircut is applied to the 90 % policy budget.
     selection_budget = (
         budget * _R55E10_VRAM_SELECTION_HEADROOM_PERCENT
     ) // 100
@@ -14346,7 +14345,7 @@ def _r55_active_apply(
 
     ``plan_raw_available_bytes`` / ``plan_factor_*`` / ``plan_budget_bytes``
     rebind the returned PlanEnvelope to the observation that actually governs a
-    pressure correction (the fresh 4/5 PLAN observation). When omitted the base
+    pressure correction (the fresh 9/10 PLAN observation). When omitted the base
     envelope's own observation is preserved (initial plan or an unchanged
     preflight decision).
     """
@@ -14699,7 +14698,7 @@ def _r55_next_materialized_shrink(*, decision, candidate, plan_obs=None):
     """Advance one legal tuple shrink and MATERIALIZE it canonically.
 
     ``next_shrink`` only changes tuple fields and preserves stale projections.
-    This helper re-enumerates the owning context (rebound to the fresh 4/5 PLAN
+    This helper re-enumerates the owning context (rebound to the fresh 9/10 PLAN
     observation when pressure created one), skips scheduler-infeasible tuples
     (still monotone), and returns the first FEASIBLE materialized candidate.
 
@@ -14751,7 +14750,7 @@ def _r55_next_materialized_grow(*, decision, candidate, plan_obs):
     * ``next_grow`` changes only tuple fields in ``GROW_ORDER`` (tile ->
       units -> workers -> prefetch), never the backend (CPU->GPU is forbidden);
     * the proposed tuple is re-enumerated through
-      ``materialize_active_candidate`` under the FRESH 4/5 PLAN observation, so
+      ``materialize_active_candidate`` under the FRESH 9/10 PLAN observation, so
       the accepted step carries TRUTHFUL recomputed host/disk/device projections
       (a stale ``_replace_candidate`` projection is never used);
     * an infeasible rung ends the walk (growing further cannot reduce bytes), so
@@ -14799,18 +14798,19 @@ def _r55_next_materialized_grow(*, decision, candidate, plan_obs):
         )
         if materialized.feasible:
             return name, materialized, examined
-        # A larger resource rung that does not fit the fresh 4/5 budget means
+        # A larger resource rung that does not fit the fresh 9/10 budget means
         # the growth frontier is reached: stop (never a blind escalation).
         return None, None, examined
 
 
 def _r55_grow_is_admissible(grown, plan_obs) -> bool:
-    """F5 hysteresis predicate: a grow step must fit the STRICT 4/5 budget.
+    """F5 hysteresis predicate: a grow step must fit the PLAN budget.
 
     Shrinking triggers above the 9/10 admission ceiling; growing requires the
-    next rung to fit the 4/5 PLAN budget. The 4/5..9/10 band is therefore a
-    dead band: a micro-rise inside it can neither grow (too tight) nor was it
-    caused by growth, so no shrink<->grow oscillation is possible.
+    next rung to fit the fresh PLAN budget. Under the beta policy both factors are
+    90 %, so the former 4/5..9/10 dead band is empty. Growth is still considered
+    only after a shrink, one scheduler field per step, bounded by ``GROW_ORDER``,
+    and remains subject to the no-growth envelope validation.
     """
     return (
         grown is not None
@@ -15028,7 +15028,7 @@ def _r55_active_admit(
     grows = 0
     shrink_plan_budget = None
 
-    # 1) The mapped product envelope must still fit the INITIAL 80 % B_plan.
+    # 1) The mapped product envelope must still fit the INITIAL 90 % B_plan.
     #    (The scheduler's host model does not include the product's cache
     #    phase, so an honest exact mapping is re-checked here.)
     while bundle.envelope.aggregate_bytes > bundle.envelope.budget_bytes:
@@ -15085,11 +15085,11 @@ def _r55_active_admit(
         admit_obs = rcontract.Observation.admit(_measure())
         observations.append(admit_obs)
         # F5 — SYMMETRIC GROWTH. Only a plan SHRUNK during admission is
-        # eligible, and only when a FRESH 4/5 PLAN observation (not the 9/10
-        # admission band) admits the next rung. This is the documented
-        # hysteresis: shrink triggers above the 9/10 ceiling, grow requires the
-        # stricter 4/5 budget, so the 4/5..9/10 band cannot oscillate. ONE
-        # field per step, backend never changes (CPU->GPU is forbidden).
+        # eligible, and only when a FRESH 9/10 PLAN observation admits the next
+        # rung. Under the beta policy the plan and admission factors are equal, so
+        # the former 4/5..9/10 dead band is empty; growth stays bounded to ONE
+        # field per step, at most len(GROW_ORDER) steps, and backend never changes
+        # (CPU->GPU is forbidden).
         if (
             shrunk
             and shrink_plan_budget is not None
@@ -15183,7 +15183,7 @@ def _r55_active_admit(
         observations.append(plan_obs)
         # Shrink under the SAME observation's B_plan, exactly like a rebuild,
         # but with scheduler-produced shrink-only choices. The resulting
-        # PlanEnvelope is REBOUND to that fresh 4/5 observation so the final
+        # PlanEnvelope is REBOUND to that fresh 9/10 observation so the final
         # manifest never reports a stale PLAN observation.
         while True:
             name, nxt, examined = _r55_next_materialized_shrink(
@@ -16072,7 +16072,7 @@ def _r55_gpu_tile_decision_dict(
     tile/prefetch and BOTH peaks that were actually validated: the exact ADDED
     host bound of the selected tile and the exact device workspace. R55-E11 adds
     the INITIAL vs EFFECTIVE tile, the runtime shrink history (when supplied)
-    and an explicit distinction between the ACTIVE 70 % budget and the legacy
+    and an explicit distinction between the ACTIVE 90 % budget and the legacy
     50 % probe budget, so neither can be read as the other.
     """
     tile = int(mapping["gpu_streaming_tile"])
@@ -16114,8 +16114,10 @@ def _r55_gpu_tile_decision_dict(
             decision.gpu_selection_budget_bytes - device_by_tile[tile]
         ),
         # R55-E11: budget provenance is explicit. ``vram_budget_bytes`` above is
-        # the ACTIVE policy budget (70 %); the legacy probe budget is 50 % and is
-        # reported separately so the two can never be confused.
+        # the ACTIVE policy budget (90 %); the legacy probe budget is 50 % and is
+        # reported separately so the two can never be confused. The
+        # ``active_r55_policy_70`` source tag is retained as a stable diagnostic
+        # identifier from the 70 % era; it reports the current ACTIVE budget.
         "vram_budget_source": "active_r55_policy_70",
         "legacy_probe_percent": 50,
         "legacy_probe_vram_budget_bytes": (
@@ -20124,7 +20126,7 @@ def _run_single(
     # ZM-ZEGRID-R41-B — ADMISSION PHASE. A FRESH raw observation is taken for
     # EVERY admission attempt at the 90 % ceiling, immediately before the cell
     # workers. On a miss the bundle is REBUILT under the SAME observation's
-    # exact 80 % B_plan (never 0.9 * B_plan, never a stale raw), bounded to
+    # exact 90 % B_plan (never 0.9 * B_plan, never a stale raw), bounded to
     # never coarsen the layout, grow the CPU/GPU tile or grow the concurrency.
     # ------------------------------------------------------------------
     requested_cell_gauge_mode = getattr(science_config, "cell_gauge_mode", None)
@@ -20522,7 +20524,7 @@ def _run_single(
     # ZM-ZEGRID-R41-B — the FINAL admitted bundle is the ONLY source for the
     # tasks / executor / diagnostics / log / manifest (no second plan, no stale
     # per-cell budget). ``available_now`` / ``per_cell_budget`` below are the
-    # FINAL PLAN observation and its exact 80 % budget (never a float factor).
+    # FINAL PLAN observation and its exact 90 % budget (never a float factor).
     # ------------------------------------------------------------------
     _plan = _final.plan
     available_now = int(_final.envelope.raw_available_bytes)
@@ -20787,7 +20789,7 @@ def _run_single(
         "cpu_streaming": dict(cpu_streaming),
         "cpu_fallback_used": False,
         "cpu_fallback_plan": dict(cpu_fallback_info),
-        # ZM-ZEGRID-R41-B: the full 80 %-plan / 90 %-admit contract trail.
+        # ZM-ZEGRID-R41-B: the full 90 %-plan / 90 %-admit contract trail.
         "ram_contract": _ram_contract_diagnostics(
             _adm,
             _final,
@@ -22922,7 +22924,7 @@ def _run_single(
         # and the single-owner consumer. The consumer is the only writer; the
         # producer only reads the CURRENT peak when it stages a unit, so a shrink
         # can never race a credit acquisition. The pipeline's device budget stays
-        # the admitted 70 % qualification budget (a hard, never-raised ceiling);
+        # the admitted 90 % qualification budget (a hard, never-raised ceiling);
         # each unit's lease records the exact peak it was staged for, and each
         # unit's execution records the tile it ACTUALLY ran with.
         # F1: the ADMITTED execution identity is the authority for the whole
@@ -26154,7 +26156,7 @@ def _run_single(
                 # H1 / R36 F-M2 / R41-B: classified GPU runtime failure -> ONE
                 # bounded, FULLY re-planned CPU admission cycle on the SAME final
                 # geometry (a mosaic whose scientific cells may already have been
-                # stacked is NEVER re-sliced), under a FRESH 80 % raw observation
+                # stacked is NEVER re-sliced), under a FRESH 90 % raw observation
                 # and admitted against a FRESH 90 % observation. No stale CPU
                 # budget is reused and no unchecked CPU rerun is possible.
                 runtime_gpu_fallback = {"reason": repr(exc), "type": type(exc).__name__}
@@ -26500,7 +26502,7 @@ def _run_single(
         gpu_ctx["durable_historical_execution"] = None
     # R55-E11: keep BOTH budgets distinguishable forever. Up to R55-E10 the
     # manifest's ``gpu.vram_budget_bytes`` was the legacy 50 % probe value even
-    # when the ACTIVE 70 % policy executed the GPU. The legacy value is retained
+    # when the ACTIVE 90 % policy executed the GPU. The legacy value is retained
     # under its own explicit key; ``vram_budget_bytes`` now reports the ACTIVE
     # budget whenever an ACTIVE GPU plan exists (executed or attempted).
     _legacy_probe_budget = gpu_ctx.get("vram_budget_bytes")
@@ -28992,7 +28994,7 @@ def _write_outputs(
             (per_cell_diagnostics or {}).get("vram_high_water")
             or zvh.disabled_record("not_sampled")
         ),
-        # ZM-ZEGRID-R41-B: the 80 %-plan / 90 %-admit host-RAM contract trail is
+        # ZM-ZEGRID-R41-B: the 90 %-plan / 90 %-admit host-RAM contract trail is
         # ALSO published at TOP LEVEL (the per_cell_diagnostics copy is retained
         # for backward compatibility).
         "ram_contract": (

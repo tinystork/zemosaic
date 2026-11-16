@@ -19,21 +19,24 @@ it must stay unit-testable and reusable.
 
 Two budgets, two observations
 ------------------------------
-Tristan's accepted amendment (2026-10-16) replaces the historical single 80 %
-factor with two explicit thresholds applied to the RAM *available* (not the
-physical total):
+Two explicit thresholds are applied to the RAM *available* (not the physical
+total). The historical policy planned at 80 % and admitted at 90 %; the
+ZM-MEMORY-90PCT-BETA policy (2026-11-16) raises the PLAN factor to 90 % for a
+direct beta comparison, so both thresholds now coincide at 90 %:
 
-* ``B_plan  = (4 * available_plan) // 5``  — the plan-BUILD budget;
+* ``B_plan  = (9 * available_plan) // 10`` — the plan-BUILD budget;
 * ``B_admit = (9 * available_now)  // 10`` — the admission CEILING for an
   already-built plan, re-measured just before execution.
 
-Each factor is applied to its OWN raw observation EXACTLY once. The 90 % ceiling
-is an ADMISSION-ONLY tolerance: it must never be handed to a rebuild (which
-always receives ``B_plan``). The plan is rebuilt under ``B_plan`` computed from
-the very observation that triggered the miss — never ``(9 // 10) * B_plan`` and
-never a stale observation. The controller does NOT TRUST the rebuild callback: it
+Each factor is applied to its OWN raw observation EXACTLY once. A rebuild always
+receives ``B_plan`` computed from the very observation that triggered the miss —
+never ``(9 // 10) * B_plan`` and never a stale observation. Admission still uses a
+FRESH observation, and the controller does NOT TRUST the rebuild callback: it
 validates the returned envelope against the raw observation and ``B_plan`` it was
-given (see :func:`validate_rebuilt_candidate`) before any later 90 % admission.
+given (see :func:`validate_rebuilt_candidate`) before any admission. With the
+plan and admission factors equal, the former 80–90 % admission-only tolerance
+band is empty (``requires_tolerance`` is always False); the two-observation
+contract and the no-growth rules are unchanged.
 """
 
 from __future__ import annotations
@@ -90,8 +93,8 @@ __all__ = [
 # Factors (integer, exact)
 # ---------------------------------------------------------------------------
 
-PLAN_FACTOR_NUM = 4
-PLAN_FACTOR_DEN = 5
+PLAN_FACTOR_NUM = 9
+PLAN_FACTOR_DEN = 10
 ADMIT_FACTOR_NUM = 9
 ADMIT_FACTOR_DEN = 10
 
@@ -222,7 +225,7 @@ def _require_positive_observation(available_bytes) -> int:
 # ---------------------------------------------------------------------------
 
 def plan_budget_bytes(available_bytes: int) -> int:
-    """``B_plan = (4 * available) // 5`` — exact integer arithmetic."""
+    """``B_plan = (9 * available) // 10`` — exact integer arithmetic."""
     a = _require_positive_observation(available_bytes)
     return (PLAN_FACTOR_NUM * a) // PLAN_FACTOR_DEN
 
@@ -292,13 +295,13 @@ def incremental_phase_budget_bytes(
 
 
 def requires_tolerance(aggregate_bytes: int, available_bytes: int) -> bool:
-    """True iff the plan sits in the 80–90 % ADMISSION-ONLY tolerance band.
+    """True iff the plan sits strictly between the PLAN and ADMISSION budgets.
 
-    ``(4 * available) // 5 < aggregate <= (9 * available) // 10``.
-
-    This flag is DESCRIPTIVE (it records that the plan leans on the admission
-    tolerance). It must never be used to enlarge a plan, a tile, or the
-    concurrency.
+    ``B_plan < aggregate <= B_admit`` for the SAME raw observation. Under the
+    ZM-MEMORY-90PCT-BETA policy both factors are 90 %, so this band is empty and
+    the predicate is always False. The helper stays factor-driven and
+    DESCRIPTIVE (it records that a plan leans on an admission tolerance); it must
+    never be used to enlarge a plan, a tile, or the concurrency.
     """
     return plan_budget_bytes(available_bytes) < int(aggregate_bytes) <= admit_budget_bytes(
         available_bytes
@@ -562,9 +565,9 @@ def validate_rebuilt_candidate(
 
     * ``phase == PHASE_PLAN``;
     * ``raw_available_bytes`` equals the miss observation's raw EXACTLY;
-    * factor equals the supplied factor (4/5 for a plan rebuild) EXACTLY;
+    * factor equals the supplied PLAN factor EXACTLY;
     * ``budget_bytes == (factor_num * raw) // factor_den`` EXACTLY;
-    * ``aggregate_bytes <= budget_bytes`` (the 80 % PLAN budget);
+    * ``aggregate_bytes <= budget_bytes`` (the configured PLAN budget);
     * ``aggregate_bytes == max(stack_total_bytes, cache_total_bytes)`` (also in
       :func:`validate_envelope`, re-checked here so the failure names the rebuild).
     """
@@ -589,12 +592,13 @@ def validate_rebuilt_candidate(
     if int(candidate.budget_bytes) != int(budget_bytes) or int(budget_bytes) != expected_budget:
         raise InvalidEnvelope(
             f"rebuilt candidate budget {candidate.budget_bytes} != its B_plan "
-            f"{budget_bytes} / exact {(4 * int(raw_available_bytes)) // 5}"
+            f"{budget_bytes} / exact "
+            f"{(int(factor_num) * int(raw_available_bytes)) // int(factor_den)}"
         )
     if int(candidate.aggregate_bytes) > int(budget_bytes):
         raise InvalidEnvelope(
             f"rebuilt candidate aggregate {candidate.aggregate_bytes} > B_plan "
-            f"{budget_bytes} (the 80 % plan budget)"
+            f"{budget_bytes} (the configured plan budget)"
         )
 
 
@@ -851,12 +855,12 @@ class AdmissionController:
     * a FRESH ``measure_available()`` happens before EVERY admission attempt;
     * an unchanged plan PASSES when ``aggregate <= B_admit`` of that observation;
     * on a miss, ``rebuild(B_plan, previous)`` is called with ``B_plan`` computed
-      from THAT SAME raw observation (never the 90 % ceiling, never a stale one);
+      from THAT SAME raw observation (never a stale one);
     * the rebuilt candidate is NOT trusted: it must be ``phase=plan``, carry the
-      SAME raw, the SAME 4/5 factor, that exact ``B_plan`` and
+      SAME raw, the SAME configured PLAN factor, that exact ``B_plan`` and
       ``aggregate <= B_plan``, and be envelope-consistent; otherwise a specific
-      :class:`InvalidEnvelope` is raised BEFORE any later 90 % admission;
-    * before launch the machine is observed AGAIN (a ``launch``-tagged 9/10
+      :class:`InvalidEnvelope` is raised BEFORE any later admission;
+    * before launch the machine is observed AGAIN (a ``launch``-tagged admission
       observation) and re-checked; that observation defines the final tolerance;
     * at most ``max_replans`` (default 2) replans, then a QUANTITATIVE
       :class:`AdmissionExhausted`;

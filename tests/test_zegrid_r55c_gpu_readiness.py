@@ -334,18 +334,18 @@ def test_policy_ladder_is_exact_and_ordered():
 def test_policy_refuses_bool_and_float_coercion():
     for bad in (True, False, 1.0, "1073741824", None):
         with pytest.raises(gr.InvalidVramObservation):
-            gr.policy_budget_bytes(bad, 70)
+            gr.policy_budget_bytes(bad, gr.INITIAL_TARGET_PERCENT)
         with pytest.raises(gr.InvalidVramObservation):
             gr.VramPolicy().candidates(bad)
-    for bad_percent in (True, 70.0, "70"):
+    for bad_percent in (True, 90.0, "90"):
         with pytest.raises(gr.InvalidVramObservation):
             gr.policy_budget_bytes(FREE_1GIB, bad_percent)
 
 
 def test_below_minimum_is_ineligible_and_never_inflated():
-    free = 64 * 2 ** 20  # 64 MiB free -> 70% is ~44.8 MiB, below the 64 MiB floor
+    free = 64 * 2 ** 20  # 64 MiB free -> 90% is ~57.6 MiB, below the 64 MiB floor
     candidate = gr.VramPolicy().initial(free)
-    assert candidate.budget_bytes == (free * 70) // 100
+    assert candidate.budget_bytes == (free * 90) // 100
     assert candidate.budget_bytes < gr.MIN_VRAM_BUDGET_BYTES
     assert candidate.eligible is False
     assert candidate.reason_code == gr.REASON_VRAM_BELOW_MINIMUM
@@ -356,9 +356,9 @@ def test_minimum_floor_matches_active_legacy_planner():
     from zemosaic.core.zegrid import gpu as legacy_gpu
 
     assert gr.MIN_VRAM_BUDGET_BYTES == legacy_gpu.GPU_MIN_VRAM_BUDGET_BYTES
-    # A1c: ONE policy shared with the ACTIVE readiness path (70 %).
-    assert legacy_gpu.GPU_VRAM_SAFETY_PERCENT == 70
-    assert legacy_gpu.GPU_VRAM_SAFETY_FRACTION == 0.70
+    # A1c/90 % beta: ONE policy shared with the ACTIVE readiness path.
+    assert legacy_gpu.GPU_VRAM_SAFETY_PERCENT == 90
+    assert legacy_gpu.GPU_VRAM_SAFETY_FRACTION == 0.9
     assert gr.INITIAL_TARGET_PERCENT == legacy_gpu.GPU_VRAM_SAFETY_PERCENT
 
 
