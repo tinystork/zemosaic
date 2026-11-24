@@ -1245,7 +1245,10 @@ def test_caldwell_816_auto_wired_planner_falls_back_to_bounded(monkeypatch):
     if len(frames) != 816:
         pytest.skip(f"expected 816 headers, got {len(frames)}")
     canvas = zg.build_canvas(frames)
-    raw = CALDWELL_BUDGET * rcontract.PLAN_FACTOR_DEN // rcontract.PLAN_FACTOR_NUM
+    # Fixture alignment (P1): CEILING inversion, so the product's integer
+    # ``(num*raw)//den`` reproduces the intended budget exactly.
+    raw = -(-CALDWELL_BUDGET * rcontract.PLAN_FACTOR_DEN
+            // rcontract.PLAN_FACTOR_NUM)
 
     zz._storage_policy_reset(None)
     bundle = zz._plan_bundle_auto(
@@ -1337,7 +1340,9 @@ def test_active_auto_halo_conflict_coarser_rescue_layout_refusal_falls_back_to_b
     assert floors.max_halo_overhead == 0.5
 
     budget = 4096 * MIB
-    raw = budget * rcontract.PLAN_FACTOR_DEN // rcontract.PLAN_FACTOR_NUM
+    # Fixture alignment (P1): CEILING inversion (floor lost one byte).
+    raw = -(-budget * rcontract.PLAN_FACTOR_DEN
+            // rcontract.PLAN_FACTOR_NUM)
 
     # Memory injection (accepted seam): in-memory never fits; the dense
     # streaming estimate exceeds the budget while the bounded one fits.

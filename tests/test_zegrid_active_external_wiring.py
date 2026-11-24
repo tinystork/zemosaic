@@ -154,7 +154,8 @@ def _bundle(
         _patch_stream(monkeypatch, stream_table)
     descs = _corpus() if descs is None else descs
     canvas = zg.build_canvas(descs)
-    budget = (4 * raw) // 5
+    # Fixture alignment (P1): the product's PLAN contract is 9/10, not 4/5.
+    budget = rcontract.plan_budget_bytes(int(raw))
     rank = None if pinned_layout is None else int(pinned_layout[0]) * int(
         pinned_layout[1]
     )
@@ -376,7 +377,7 @@ def test_forced_external_observation_failure_is_not_hidden(
         zz._build_execution_bundle(
             canvas, descs, None,
             raw_available_bytes=2 * GIB,
-            budget_bytes=(4 * 2 * GIB) // 5,
+            budget_bytes=rcontract.plan_budget_bytes(2 * GIB),
             cpu_count=8,
             cache_root=str(tmp_path / "cache"),
             force_external=True,
@@ -413,7 +414,7 @@ def test_frozen_external_resumes_external_even_when_ram_would_fit(
     bundle = zz._build_execution_bundle(
         canvas, descs, None,
         raw_available_bytes=2 * GIB,
-        budget_bytes=(4 * 2 * GIB) // 5,
+        budget_bytes=rcontract.plan_budget_bytes(2 * GIB),
         cpu_count=8,
         cache_root=str(tmp_path / "cache"),
         frozen_admission=frozen,

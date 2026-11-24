@@ -9988,6 +9988,12 @@ def _build_execution_bundle(
                 "batch_fixed_position_bytes": int(
                     zext.EXTERNAL_BATCH_FIXED_POSITION_BYTES
                 ),
+                # ZM-M33 P1: the EFFECTIVE halo width of the priced spool tile.
+                # It belongs to the frozen external geometry and lets a RUN
+                # column-batch re-derivation re-price the SAME tile without
+                # inverting clipped tile shapes (a small canvas clips the tile
+                # to the patch, so the halo is not recoverable from tile_hw).
+                "halo_px": int(_halo),
                 "phase_budget_bytes": int(
                     external_selection["phase_budget_bytes"]
                 ),
@@ -11736,6 +11742,20 @@ def _r55_external_contract(bundle) -> dict:
         raise zsched.SchedulerConfigError(
             "an external working-set bundle must carry its frozen external "
             "contract (tile, column batch, spool root, disk envelope)"
+        )
+    return _r55_validate_external_contract(contract)
+
+
+def _r55_validate_external_contract(contract) -> dict:
+    """Validate ONE frozen external contract dict (bundle-independent).
+
+    ZM-M33 P1: the RUN column-batch transition builds a SUCCESSOR contract
+    BEFORE any bundle carries it, so the validation must be callable on a plain
+    dict. The historical bundle wrapper above keeps its exact behaviour.
+    """
+    if not isinstance(contract, dict) or not contract:
+        raise zsched.SchedulerConfigError(
+            "an external working-set contract must be a non-empty dict"
         )
     if str(contract.get("class")) != WORKING_SET_EXTERNAL:
         raise zsched.SchedulerConfigError(
@@ -14336,6 +14356,7 @@ def _r55_active_apply(
     plan_factor_den=None,
     plan_budget_bytes=None,
     stage="preflight",
+    external_contract=None,
 ):
     """Apply an EXACT mapping to the frozen bundle's existing execution knobs.
 
@@ -14348,6 +14369,13 @@ def _r55_active_apply(
     pressure correction (the fresh 9/10 PLAN observation). When omitted the base
     envelope's own observation is preserved (initial plan or an unchanged
     preflight decision).
+
+    ``external_contract`` (ZM-M33 P1) is the ONE explicit seam that lets a RUN
+    column-batch transition apply a SUCCESSOR contract to a bundle that does not
+    carry it yet. It is validated by the SAME closed contract validator, and the
+    tasks this function builds carry it in slot 7 — so the executor runs the
+    successor batch, never the frozen one. ``None`` (every historical caller)
+    keeps reading the bundle's own frozen contract.
     """
     mode = mapping["cell_task_mode"]
     tile = mapping["cpu_streaming_tile"]
@@ -14366,9 +14394,12 @@ def _r55_active_apply(
             mapping=mapping,
         )
     external_class = mode == "external"
-    external_contract = None
     if external_class:
-        external_contract = _r55_external_contract(bundle)
+        external_contract = (
+            _r55_external_contract(bundle)
+            if external_contract is None
+            else _r55_validate_external_contract(dict(external_contract))
+        )
         if tile is None or int(tile) != int(external_contract["tile_size"]):
             raise zsched.ActivePlanRejected(
                 renv.REASON_SHRINK_TILE,
@@ -14483,7 +14514,12 @@ def _r55_active_apply(
         # Source-backed preparation builds NO aligned cache, so the generic
         # ``cache_worker_footprint_bytes`` RAM charge is a GHOST and is exactly
         # zero for this class. Disk residency stays in ``candidate.disk_bytes``.
-        contract = _r55_external_contract(bundle)
+        # ZM-M33 P1: the RESOLVED contract (bundle's own, or the explicit
+        # successor) is the single source for the envelope, the task bound and
+        # the published plan facts. Never re-read the bundle here: that would
+        # rebuild the envelope from the OLD contract while the tasks carry the
+        # successor.
+        contract = external_contract
         frozen_peak = int(contract["host_peak_bytes"])
         if int(per_cell_footprint) != frozen_peak:
             raise zsched.ActivePlanRejected(
@@ -14580,10 +14616,10 @@ def _r55_active_apply(
             {
                 "host_peak_bytes": int(per_cell_footprint),
                 "host_components": dict(
-                    (_r55_external_contract(bundle)).get("host_components") or {}
+                    (external_contract or {}).get("host_components") or {}
                 ),
                 "budget_domain": str(
-                    (_r55_external_contract(bundle)).get("budget_domain") or ""
+                    (external_contract or {}).get("budget_domain") or ""
                 ),
             }
             if external_class else {}
@@ -14615,6 +14651,17 @@ def _r55_active_apply(
             working_set_block["column_batch"] = int(
                 external_contract["column_batch"]
             )
+    # ZM-M33 P1 (rework-1, C4): the applied bundle gets its OWN layout dict
+    # whose ``working_set`` IS its own ``working_set_block``. Without this copy
+    # the successor bundle shared the initial layout object and the ONLY thing
+    # keeping ``layout["working_set"]`` coherent was a later in-place patch —
+    # which also mutated the INITIAL bundle's layout to the successor batch.
+    layout = (
+        dict(bundle.layout) if isinstance(bundle.layout, dict)
+        else bundle.layout
+    )
+    if isinstance(layout, dict) and working_set_block is not None:
+        layout["working_set"] = working_set_block
     attempts = list(bundle.attempts)
     attempts.append(
         {
@@ -14637,6 +14684,7 @@ def _r55_active_apply(
     )
     return replace(
         bundle,
+        layout=layout,
         cpu_streaming=dict(cpu_streaming),
         cpu_streaming_tile=(0 if tile is None else int(tile)),
         gpu_tile_size=None,
@@ -16567,6 +16615,145 @@ class _R55RunStopRequested(RuntimeError):
         self.result_registry = result_registry
 
 
+def _r55_remaining_pending_units(pending_tasks, offset) -> int:
+    """Dispatchable units remaining in the SPARSE pending list (C5).
+
+    ``offset`` indexes ``pending_tasks`` (the executed list), never the complete
+    canonical plan: on a partial resume the dense count over-reports. A task
+    with an empty mode slot is a non-dispatchable (empty) cell and is excluded.
+    """
+    start = max(0, int(offset))
+    return int(sum(1 for task in pending_tasks[start:] if task[4] is not None))
+
+
+def _r55_remap_tasks_after_bundle_replacement(
+    *, old_all_tasks, old_pending_tasks, new_bundle, new_tasks=None,
+):
+    """Rebuild BOTH task lists onto a REPLACED bundle (ZM-M33 P1, F2).
+
+    Every bundle replacement (the RUN column-batch shrink AND the existing
+    dense->bounded recovery) produces NEW task tuples. The wave loop slices
+    ``pending_tasks``, so a stale list silently executes the OLD contract — the
+    defect this helper closes.
+
+    Discipline (fail closed, no reordering):
+    * identity is the ``cell_id``; duplicates in the new bundle are refused;
+    * the canonical cell SET must be identical (never a lost or added cell);
+    * the canonical ORDER of the old complete list is preserved;
+    * the pending set is preserved exactly and stays a subsequence of it;
+    * the accepted/executed prefix is never touched (the caller's ``offset``
+      keeps indexing the SAME pending list shape).
+    """
+    new = list(new_bundle.cell_tasks if new_tasks is None else new_tasks)
+    if not new:
+        raise _R55RunRefused(
+            renv.REASON_INTERNAL_ERROR,
+            "a bundle replacement produced no executable task",
+            record={
+                "schema": zrt.RUN_CONTROL_SCHEMA,
+                "status": "refused",
+                "reason_code": renv.REASON_INTERNAL_ERROR,
+                "detail": "a bundle replacement produced no executable task",
+            },
+        )
+    by_id = {}
+    for task in new:
+        cell_id = str(task[0].cell_id)
+        if cell_id in by_id:
+            raise _R55RunRefused(
+                renv.REASON_INTERNAL_ERROR,
+                f"a bundle replacement duplicated cell {cell_id!r}",
+                record={
+                    "schema": zrt.RUN_CONTROL_SCHEMA,
+                    "status": "refused",
+                    "reason_code": renv.REASON_INTERNAL_ERROR,
+                    "detail": (
+                        f"a bundle replacement duplicated cell {cell_id!r}; "
+                        "refusing a double dispatch"
+                    ),
+                },
+            )
+        by_id[cell_id] = task
+    old_all_ids = [str(task[0].cell_id) for task in old_all_tasks]
+    old_pending_ids = [str(task[0].cell_id) for task in old_pending_tasks]
+    if len(set(old_all_ids)) != len(old_all_ids):
+        raise _R55RunRefused(
+            renv.REASON_INTERNAL_ERROR,
+            "the canonical task list already contains duplicate cells",
+            record={
+                "schema": zrt.RUN_CONTROL_SCHEMA,
+                "status": "refused",
+                "reason_code": renv.REASON_INTERNAL_ERROR,
+                "detail": "the canonical task list already contains duplicates",
+            },
+        )
+    missing = [cid for cid in old_all_ids if cid not in by_id]
+    extra = [cid for cid in by_id if cid not in set(old_all_ids)]
+    if missing or extra:
+        raise _R55RunRefused(
+            renv.REASON_INTERNAL_ERROR,
+            "a bundle replacement changed the canonical cell set "
+            f"(missing={missing[:4]}, extra={extra[:4]})",
+            record={
+                "schema": zrt.RUN_CONTROL_SCHEMA,
+                "status": "refused",
+                "reason_code": renv.REASON_INTERNAL_ERROR,
+                "detail": (
+                    "a bundle replacement changed the canonical cell set "
+                    f"(missing={missing[:4]}, extra={extra[:4]})"
+                ),
+            },
+        )
+    absent_pending = [cid for cid in old_pending_ids if cid not in by_id]
+    if absent_pending:
+        raise _R55RunRefused(
+            renv.REASON_INTERNAL_ERROR,
+            "a bundle replacement dropped pending cell(s) "
+            f"{absent_pending[:4]}",
+            record={
+                "schema": zrt.RUN_CONTROL_SCHEMA,
+                "status": "refused",
+                "reason_code": renv.REASON_INTERNAL_ERROR,
+                "detail": (
+                    "a bundle replacement dropped pending cell(s) "
+                    f"{absent_pending[:4]}"
+                ),
+            },
+        )
+    new_all = [by_id[cid] for cid in old_all_ids]
+    new_pending = [by_id[cid] for cid in old_pending_ids]
+    return {
+        "all_tasks": new_all,
+        "pending_tasks": new_pending,
+        "canonical_cids": [str(task[0].cell_id) for task in new_all],
+        "total_tasks": int(len(new_pending)),
+    }
+
+
+def _r55_publish_batch_transition(bundle, record) -> None:
+    """Publish ONE durable column-batch transition on the RUN bundle.
+
+    The manifest/log read ``working_set_block`` and ``layout["working_set"]``;
+    both must name the batch that ACTUALLY runs, beside the durable record (with
+    its plan generation), never only the pre-shrink value.
+    """
+    if not isinstance(record, dict):
+        return
+    to_batch = int(record.get("to_batch") or 0)
+    if to_batch < 1:
+        return
+    block = getattr(bundle, "working_set_block", None)
+    if isinstance(block, dict):
+        block["batch_transition"] = dict(record)
+        block["column_batch"] = int(to_batch)
+    # ``bundle.layout["working_set"]`` is the SAME object as
+    # ``bundle.working_set_block`` by construction in ``_r55_active_apply``, so
+    # the block above is the single source. This helper never repairs aliasing.
+    contract = getattr(bundle, "external_contract", None)
+    if isinstance(contract, dict):
+        contract["batch_transition"] = dict(record)
+
+
 def _r55_run_disk_root(cache_root, output_dir) -> Path:
     return Path(cache_root) if cache_root is not None else Path(output_dir)
 
@@ -16628,6 +16815,240 @@ def _r55_active_run_context(
         budget_bytes=int(budget),
         disk_free_bytes=int(disk_free),
     )
+
+
+def _r55_external_batch_geometry(contract) -> dict:
+    """Invert a frozen external contract back to its EXACT priced geometry.
+
+    ZM-M33 P1: the RUN transition must re-price the SAME geometry that was
+    admitted, never a re-derived one. The contract carries the explicit HOST
+    component model (patch/tile/interior shapes, channels, N), so the halo is
+    recovered from ``tile_hw = tile + 2*halo`` and every inconsistency fails
+    closed instead of guessing.
+    """
+    components = contract.get("host_components")
+    if not isinstance(components, dict) or not components:
+        raise zsched.SchedulerConfigError(
+            "external contract must carry its explicit HOST component model"
+        )
+    try:
+        patch_h = int(components["patch_hw"][0])
+        patch_w = int(components["patch_hw"][1])
+        tile_h = int(components["tile_hw"][0])
+        tile_w = int(components["tile_hw"][1])
+        interior_h = int(components["interior_hw"][0])
+        interior_w = int(components["interior_hw"][1])
+        channels = int(components["channels"])
+        n_frames = int(components["n_frames"])
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        raise zsched.SchedulerConfigError(
+            "the frozen external HOST component model is malformed: "
+            f"{exc}"
+        ) from exc
+    tile = int(contract["tile_size"])
+    declared_halo = contract.get("halo_px")
+    if declared_halo is not None:
+        halo = int(declared_halo)
+        if halo < 0:
+            raise zsched.SchedulerConfigError(
+                f"the frozen external contract carries a negative halo {halo}"
+            )
+    else:
+        # Historical contracts (no declared halo): the tile may be CLIPPED to
+        # the patch on a small canvas, so the inversion is only legal when both
+        # extents agree; otherwise fail closed.
+        halo = (tile_h - tile) // 2
+        if (
+            halo < 0
+            or (tile_w - tile) // 2 != halo
+            or tile_h != tile + 2 * halo
+            or tile_w != tile + 2 * halo
+        ):
+            raise zsched.SchedulerConfigError(
+                "the frozen external tile geometry cannot be inverted to ONE "
+                f"halo: tile={tile}, tile_hw={(tile_h, tile_w)}"
+            )
+    if min(patch_h, patch_w, interior_h, interior_w, channels, n_frames) < 1:
+        raise zsched.SchedulerConfigError(
+            "the frozen external HOST component model carries a non-positive "
+            f"shape (patch={(patch_h, patch_w)}, interior="
+            f"{(interior_h, interior_w)}, channels={channels}, n={n_frames})"
+        )
+    return {
+        "n_frames": int(n_frames),
+        "patch_hw": (int(patch_h), int(patch_w)),
+        "tile_hw": (int(tile_h), int(tile_w)),
+        "interior_hw": (int(interior_h), int(interior_w)),
+        "channels": int(channels),
+        "halo_px": int(halo),
+        "tile_size": int(tile),
+    }
+
+
+def _r55_external_batch_repricing(contract, *, column_batch: int) -> dict:
+    """Re-price ONE column batch of the frozen external cell (same model).
+
+    Uses ``external_stream.external_cell_host_components`` — the SAME function
+    ``estimate_external_working_set`` wraps — with the EXACT shapes carried by
+    the contract, so no geometry is re-derived and no coefficient is duplicated.
+    """
+    geometry = _r55_external_batch_geometry(contract)
+    host = zext.external_cell_host_components(
+        n_frames=int(geometry["n_frames"]),
+        patch_hw=tuple(geometry["patch_hw"]),
+        tile_hw=tuple(geometry["tile_hw"]),
+        interior_hw=tuple(geometry["interior_hw"]),
+        channels=int(geometry["channels"]),
+        column_batch=int(column_batch),
+        rejection_sink=True,
+        equalize_rgb=bool(contract["equalize_rgb"]),
+        rejection=str(contract["rejection"]),
+        combine=str(contract["combine"]),
+    )
+    return {
+        "geometry": geometry,
+        "host": host,
+        "peak_bytes": int(host["peak_bytes"]),
+        "batch_bytes": int(host["batch_total_bytes"]),
+    }
+
+
+def _r55_external_batch_successor(*, contract, phase_budget_bytes: int) -> dict:
+    """Derive the SHRINK-ONLY column-batch successor of a frozen contract.
+
+    Returns a dict with:
+
+    * ``already_fits`` — the frozen contract's OWN peak fits the phase budget
+      (nothing to do; the caller must not invent a transition);
+    * ``admissible`` — a strictly smaller batch fits (``contract`` and
+      ``transition`` are then present);
+    * ``reason_code="no_admissible_column_batch"`` — no smaller batch fits, so
+      the historical refusal stays byte-identical.
+
+    The phase budget is the margin-applied ceiling the caller derived ONCE from
+    the governed RUN budget. The helper never grows the batch, never changes the
+    class/tile/backend, and re-prices every candidate with the exact model.
+    """
+    budget = int(phase_budget_bytes)
+    if budget < 1:
+        raise ValueError(
+            f"phase_budget_bytes must be positive, got {phase_budget_bytes!r}"
+        )
+    frozen = int(contract["column_batch"])
+    priced = _r55_external_batch_repricing(contract, column_batch=frozen)
+    required = int(priced["peak_bytes"])
+    if required != int(contract["host_peak_bytes"]):
+        raise zsched.SchedulerConfigError(
+            "the frozen external contract is not reproducible from its own "
+            f"geometry (re-priced peak {required} != admitted host_peak "
+            f"{contract['host_peak_bytes']}); refusing to shrink an "
+            "inconsistent contract"
+        )
+    if required <= budget:
+        return {
+            "already_fits": True,
+            "admissible": False,
+            "required_peak_bytes": int(required),
+            "phase_budget_bytes": int(budget),
+        }
+    geometry = priced["geometry"]
+    shrink = zext.shrink_frozen_column_batch(
+        frozen_batch=int(frozen),
+        phase_budget_bytes=int(budget),
+        n_frames=int(geometry["n_frames"]),
+        height=int(geometry["patch_hw"][0]),
+        width=int(geometry["patch_hw"][1]),
+        channels=int(geometry["channels"]),
+        tile_size=int(geometry["tile_size"]),
+        halo_px=int(geometry["halo_px"]),
+        equalize_rgb=bool(contract["equalize_rgb"]),
+        rejection=str(contract["rejection"]),
+        combine=str(contract["combine"]),
+    )
+    if shrink is None:
+        return {
+            "already_fits": False,
+            "admissible": False,
+            "reason_code": "no_admissible_column_batch",
+            "required_peak_bytes": int(required),
+            "phase_budget_bytes": int(budget),
+        }
+    to_batch = int(shrink["to_batch"])
+    if not 1 <= to_batch < frozen:
+        raise zsched.SchedulerConfigError(
+            "the external batch shrink helper returned a non-shrink batch "
+            f"{to_batch} (frozen {frozen})"
+        )
+    successor_priced = _r55_external_batch_repricing(
+        contract, column_batch=to_batch
+    )
+    host = successor_priced["host"]
+    admitted = int(successor_priced["peak_bytes"])
+    # ZM-M33 P1: a rung that does not reduce the EFFECTIVE lot is a zero-gain
+    # rung (the request may already be clamped to the interior surface). Never
+    # publish a transition that buys nothing.
+    frozen_effective = int(priced["host"]["effective_column_batch"])
+    effective_gain = int(frozen_effective) - int(host["effective_column_batch"])
+    if effective_gain <= 0:
+        raise zsched.SchedulerConfigError(
+            "the external batch shrink produced no EFFECTIVE lot reduction "
+            f"(requested {frozen} -> {to_batch}, effective {frozen_effective} "
+            f"-> {int(host['effective_column_batch'])})"
+        )
+    if admitted > budget:
+        raise zsched.SchedulerConfigError(
+            "the external batch shrink helper admitted a batch above the phase "
+            f"budget ({admitted} > {budget})"
+        )
+    successor = dict(contract)
+    successor.update(
+        {
+            "column_batch": int(to_batch),
+            "requested_column_batch": int(host["requested_column_batch"]),
+            "effective_column_batch": int(host["effective_column_batch"]),
+            "column_batch_clamped": bool(host["column_batch_clamped"]),
+            "cache_budget_bytes": max(0, int(budget) - int(admitted)),
+            "reduction_workspace_bytes": int(host["batch_total_bytes"]),
+            "host_peak_bytes": int(admitted),
+            "host_components": dict(host),
+            # The disk envelope is batch-INVARIANT (spool peak, resident
+            # staging unit, durable result unit and cleanup margin are all
+            # geometry-only), so it is carried verbatim — never re-invented.
+        }
+    )
+    return {
+        "already_fits": False,
+        "admissible": True,
+        "required_peak_bytes": int(required),
+        "admitted_peak_bytes": int(admitted),
+        "phase_budget_bytes": int(budget),
+        "contract": successor,
+        "transition": {
+            "schema": zres.COLUMN_BATCH_TRANSITION_SCHEMA,
+            "from_batch": int(frozen),
+            "to_batch": int(to_batch),
+            "frozen_batch": int(frozen),
+            "required_peak_bytes": int(required),
+            "admitted_peak_bytes": int(admitted),
+            "phase_budget_bytes": int(budget),
+            "reason": (
+                f"RUN checkpoint phase budget {int(budget)} B < the frozen "
+                f"external host peak {int(required)} B; the frozen column_batch "
+                f"{int(frozen)} was re-derived to {int(to_batch)} under the "
+                "SAME exact host accounting (staging-only change: class, "
+                "backend, tile, geometry and science are unchanged)"
+            ),
+            # Diagnostics carried beside the durable required fields.
+            "requested_column_batch": int(host["requested_column_batch"]),
+            "effective_column_batch": int(host["effective_column_batch"]),
+            "column_batch_clamped": bool(host["column_batch_clamped"]),
+            "batch_total_bytes": int(host["batch_total_bytes"]),
+            "reduce_fixed_bytes": int(host["reduce_fixed_bytes"]),
+            "effective_gain_positions": int(effective_gain),
+            "ladder": [dict(entry) for entry in shrink["ladder"]],
+            "helper": "external_stream.shrink_frozen_column_batch",
+        },
+    }
 
 
 def _r55_run_checkpoint(
@@ -16770,7 +17191,24 @@ def _r55_run_checkpoint(
                 "shrink_steps",
                 "unavailable_shrinks",
             )
-        } | {"latched_host": latched_for_decision}
+        } | {"latched_host": latched_for_decision} | (
+            # ZM-M33 P1: a column-batch transition IS a deterministic RUN
+            # decision, so it enters the auditable structure. Absent for every
+            # historical (RAM/GPU/no-transition) checkpoint, which therefore
+            # stays byte-identical.
+            {
+                "batch_shrink": dict(record["batch_shrink"]),
+                "phase_budget_bytes": int(
+                    record.get("phase_budget_bytes") or 0
+                ),
+            }
+            if record.get("batch_shrink")
+            else (
+                {"batch_shrink_refusal": dict(record["batch_shrink_refusal"])}
+                if record.get("batch_shrink_refusal")
+                else {}
+            )
+        )
 
     # Fast path: the accepted candidate still fits the fresh 90 % budget and the
     # already-admitted product envelope still fits too. No mapping change.
@@ -16859,6 +17297,150 @@ def _r55_run_checkpoint(
                 f"saw_host_ram={bool(saw_host_ram)}, "
                 f"saw_non_memory={bool(saw_non_memory)})"
             )
+            # ZM-M33 P1: the external spool class has ONE more legal shrink
+            # rung that the frozen scheduler order cannot express: the staging
+            # COLUMN BATCH. It is tried only for a REAL host-RAM dead end (no
+            # disk / non-memory contribution), at this safe boundary, under the
+            # SAME governed observation and the SAME single margin.
+            _batch_attempt = None
+            if (
+                reason == renv.REASON_REFUSE_HOST_RAM
+                and saw_host_ram
+                and not saw_disk
+                and not saw_non_memory
+                and str(getattr(bundle, "stack_working_set", ""))
+                == WORKING_SET_EXTERNAL
+                and getattr(bundle, "external_contract", None) is not None
+            ):
+                _phase_budget = int(_r55_margin_raw_ceiling(int(budget)))
+                try:
+                    _batch_attempt = _r55_external_batch_successor(
+                        contract=_r55_external_contract(bundle),
+                        phase_budget_bytes=_phase_budget,
+                    )
+                except (
+                    zsched.SchedulerConfigError,
+                    zext.ExternalBudgetError,
+                    ValueError,
+                ) as exc:
+                    _internal_record = _record(
+                        "refused", candidate, mapping, examined, False
+                    )
+                    _internal_record["reason_code"] = renv.REASON_INTERNAL_ERROR
+                    _internal_record["detail"] = (
+                        "the frozen external contract cannot be re-priced for a "
+                        f"column-batch shrink: {exc}"
+                    )
+                    _internal_record["last_candidate"] = (
+                        zsched.active_candidate_tuple(current)
+                    )
+                    raise _R55RunRefused(
+                        renv.REASON_INTERNAL_ERROR,
+                        _internal_record["detail"],
+                        record=_internal_record,
+                    ) from exc
+                if _batch_attempt["admissible"]:
+                    _transition = dict(_batch_attempt["transition"])
+                    _successor = dict(_batch_attempt["contract"])
+                    try:
+                        _shrunk_bundle = _r55_active_apply(
+                            bundle,
+                            mapping=mapping,
+                            facts=decision.facts,
+                            plan_raw_available_bytes=raw,
+                            plan_factor_num=rcontract.ADMIT_FACTOR_NUM,
+                            plan_factor_den=rcontract.ADMIT_FACTOR_DEN,
+                            plan_budget_bytes=budget,
+                            stage=f"run_wave_{wave_index}_batch_shrink",
+                            # The SUCCESSOR contract is applied explicitly: the
+                            # initial bundle is NEVER applied unchanged, so the
+                            # generated tasks really carry the new batch.
+                            external_contract=_successor,
+                        )
+                    except (
+                        zsched.SchedulerError,
+                        rcontract.RamContractError,
+                    ) as exc:
+                        _internal_record = _record(
+                            "refused", candidate, mapping, examined, False
+                        )
+                        _internal_record["reason_code"] = (
+                            renv.REASON_INTERNAL_ERROR
+                        )
+                        _internal_record["detail"] = (
+                            "the successor external contract could not be "
+                            f"applied: {exc}"
+                        )
+                        raise _R55RunRefused(
+                            renv.REASON_INTERNAL_ERROR,
+                            _internal_record["detail"],
+                            record=_internal_record,
+                        ) from exc
+                    if int(_shrunk_bundle.envelope.aggregate_bytes) > int(budget):
+                        _internal_record = _record(
+                            "refused", candidate, mapping, examined, False
+                        )
+                        _internal_record["reason_code"] = (
+                            renv.REASON_INTERNAL_ERROR
+                        )
+                        _internal_record["detail"] = (
+                            "the successor external bundle aggregate "
+                            f"{int(_shrunk_bundle.envelope.aggregate_bytes)} B "
+                            f"exceeds the governed RUN budget {int(budget)} B"
+                        )
+                        raise _R55RunRefused(
+                            renv.REASON_INTERNAL_ERROR,
+                            _internal_record["detail"],
+                            record=_internal_record,
+                        )
+                    examined.append(
+                        {
+                            "step": "column_batch",
+                            # The scheduler TUPLE is unchanged by a staging
+                            # batch transition; the moved parameter is the
+                            # column batch, named explicitly instead of faking
+                            # a tuple change.
+                            "changed_kind": "column_batch_only",
+                            "from": zsched.active_candidate_tuple(current),
+                            "to": zsched.active_candidate_tuple(current),
+                            "column_batch": {
+                                "from": int(_transition["from_batch"]),
+                                "to": int(_transition["to_batch"]),
+                            },
+                            "accepted": True,
+                            "reason_code": None,
+                            "detail": (
+                                f"external staging column_batch "
+                                f"{_transition['from_batch']} -> "
+                                f"{_transition['to_batch']} (phase budget "
+                                f"{_transition['phase_budget_bytes']} B, "
+                                f"admitted peak "
+                                f"{_transition['admitted_peak_bytes']} B)"
+                            ),
+                            "projections": {
+                                "host_peak_bytes": int(
+                                    _transition["admitted_peak_bytes"]
+                                ),
+                                "disk_bytes": int(
+                                    int(mapping.get("units_in_flight", 1))
+                                    * int(_successor["disk_envelope_bytes"])
+                                ),
+                                "device_peak_bytes": 0,
+                            },
+                        }
+                    )
+                    record = _record(
+                        "accepted", candidate, mapping, examined, True
+                    )
+                    record["batch_shrink"] = dict(_transition)
+                    record["phase_budget_bytes"] = int(_phase_budget)
+                    return {
+                        "record": record,
+                        "deterministic_record": _deterministic(record),
+                        "bundle": _shrunk_bundle,
+                        "candidate": candidate,
+                        "mapping": mapping,
+                    }
             record = _record("refused", candidate, mapping, examined, False)
             record["reason_code"] = reason
             record["detail"] = detail
@@ -16869,6 +17451,27 @@ def _r55_run_checkpoint(
                 "saw_non_memory": bool(saw_non_memory),
                 "non_memory_reason": non_memory_reason,
             }
+            if _batch_attempt is not None:
+                # Distinguish "already fits" from "no smaller batch fits"
+                # without inventing a transition.
+                record["batch_shrink_refusal"] = {
+                    "already_fits": bool(_batch_attempt["already_fits"]),
+                    "reason_code": _batch_attempt.get("reason_code"),
+                    "required_peak_bytes": int(
+                        _batch_attempt["required_peak_bytes"]
+                    ),
+                    "phase_budget_bytes": int(
+                        _batch_attempt["phase_budget_bytes"]
+                    ),
+                }
+                record["classification"]["external_column_batch"] = (
+                    "already_fits"
+                    if _batch_attempt["already_fits"]
+                    else str(
+                        _batch_attempt.get("reason_code")
+                        or "no_admissible_column_batch"
+                    )
+                )
             and_eligible = bool(
                 reason == renv.REASON_REFUSE_HOST_RAM
                 and saw_host_ram
@@ -21961,6 +22564,81 @@ def _run_single(
                 _stack_report(idx, _stack_item_cid(pending_tasks, idx))
             return _cb
 
+        def _r55_persist_run_batch_shrink(proposal, *, wave_index,
+                                          remaining_units):
+            """Persist ONE RUN column-batch shrink BEFORE any dispatch (P1).
+
+            The durable record is the AUTHORITY at restart: a shrink that cannot
+            be recorded must never be applied in memory only, and no cell of the
+            wave may be dispatched. The existing recorder
+            (``run_resume.record_column_batch_shrink``) is the only writer: it
+            enforces shrink-only, a contiguous chain, the exact peak/budget
+            accounting and the durable identity digest, and it rewrites
+            ``state.admission.working_set.column_batch`` so a restart starts from
+            the batch the run really uses.
+            """
+            from zemosaic.core.zegrid import run_store as _zstore
+
+            detail_base = (
+                "a frozen external column_batch shrink requires a healthy "
+                "durable store: the durable state is authoritative at restart, "
+                "so no in-memory-only shrink is ever applied"
+            )
+            store = _store_state.get("store")
+            healthy = bool(
+                store is not None
+                and _store_state.get("publishing")
+                and _store_state.get("degraded_reason") is None
+            )
+
+            def _refuse(detail):
+                return _R55RunRefused(
+                    renv.REASON_INTERNAL_ERROR,
+                    detail,
+                    record={
+                        "schema": zrt.RUN_CONTROL_SCHEMA,
+                        "stage": _R55E1_RUN_STAGE,
+                        "status": "refused",
+                        "reason_code": renv.REASON_INTERNAL_ERROR,
+                        "detail": detail,
+                        "wave_index": int(wave_index),
+                        "remaining_units": int(remaining_units),
+                        "shrink_steps": [],
+                        "unavailable_shrinks": [
+                            dict(x) for x in _R55E1_UNAVAILABLE_SHRINKS
+                        ],
+                        "batch_shrink": dict(proposal),
+                    },
+                )
+
+            if not healthy:
+                raise _refuse(
+                    detail_base
+                    + " (no durable store is active/healthy at this boundary)"
+                )
+            identity = getattr(store, "identity", None)
+            if not isinstance(identity, Mapping):
+                raise _refuse(
+                    detail_base + " (the open store exposes no frozen identity)"
+                )
+            try:
+                durable = zres.record_column_batch_shrink(
+                    store.root,
+                    transition=dict(proposal),
+                    identity_sha256=_zstore.identity_sha256(identity),
+                )
+            except zres.ResumeError as exc:
+                raise _refuse(
+                    "the durable column_batch shrink record was REFUSED: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - never a silent shrink
+                raise _refuse(
+                    "the durable column_batch shrink record could not be "
+                    f"written: {type(exc).__name__}: {exc}"
+                ) from exc
+            return durable
+
         def _terminalize_refusal(exc, *, wave_index, offset,
                                  fallback_exhausted=False):
             """Record/clean the terminal refusal of the CURRENT boundary.
@@ -22067,8 +22745,10 @@ def _run_single(
                     },
                     result_registry=result_registry,
                 )
-            remaining_units = sum(
-                1 for t in all_tasks[offset:] if t[4] is not None
+            # ZM-M33 P1 (rework-1, C5): ``offset`` indexes the PENDING list
+            # (sparse on a resume), never the complete canonical plan.
+            remaining_units = _r55_remaining_pending_units(
+                pending_tasks, offset
             )
             facts = _r55_run_checkpoint_sample(disk_root)
             latched_fact = None
@@ -22134,9 +22814,27 @@ def _run_single(
                 bundle = _recovery["bundle"]
                 candidate = _recovery["candidate"]
                 mapping = _recovery["mapping"]
-                all_tasks = _recovery["tasks"]
-                total_tasks = len(all_tasks)
-                canonical_cids = [t[0].cell_id for t in all_tasks]
+                # ZM-M33 P1 (F2): the recovered bundle carries NEW tasks, so
+                # BOTH lists are rebuilt by cell_id. Reassigning ``all_tasks``
+                # alone left ``pending_tasks`` pointing at the pre-recovery
+                # (dense) tuples and the wave executed the OLD contract.
+                try:
+                    _recovery_remap = _r55_remap_tasks_after_bundle_replacement(
+                        old_all_tasks=all_tasks,
+                        old_pending_tasks=pending_tasks,
+                        new_bundle=bundle,
+                        new_tasks=_recovery["tasks"],
+                    )
+                except _R55RunRefused as _remap_exc:
+                    _terminalize_refusal(
+                        _remap_exc, wave_index=wave_index, offset=offset,
+                        fallback_exhausted=True,
+                    )
+                    raise
+                all_tasks = _recovery_remap["all_tasks"]
+                pending_tasks = _recovery_remap["pending_tasks"]
+                total_tasks = int(_recovery_remap["total_tasks"])
+                canonical_cids = list(_recovery_remap["canonical_cids"])
                 if result_registry is not None:
                     # Fencing groundwork: results from the pre-recovery plan are
                     # older than the new generation and can no longer be
@@ -22332,6 +23030,63 @@ def _run_single(
             candidate = checkpoint["candidate"]
             mapping = checkpoint["mapping"]
             record = checkpoint["record"]
+            if record.get("batch_shrink"):
+                # ZM-M33 P1: the durable transition is written BEFORE any cell
+                # of this wave is dispatched, and the executable task list is
+                # rebuilt from the SUCCESSOR bundle (same cells, canonical
+                # order, same pending set, offset untouched).
+                try:
+                    _durable_transition = _r55_persist_run_batch_shrink(
+                        record["batch_shrink"],
+                        wave_index=wave_index,
+                        remaining_units=remaining_units,
+                    )
+                    _batch_remap = _r55_remap_tasks_after_bundle_replacement(
+                        old_all_tasks=all_tasks,
+                        old_pending_tasks=pending_tasks,
+                        new_bundle=bundle,
+                    )
+                except _R55RunRefused as _batch_exc:
+                    _terminalize_refusal(
+                        _batch_exc, wave_index=wave_index, offset=offset
+                    )
+                    raise
+                all_tasks = _batch_remap["all_tasks"]
+                pending_tasks = _batch_remap["pending_tasks"]
+                total_tasks = int(_batch_remap["total_tasks"])
+                canonical_cids = list(_batch_remap["canonical_cids"])
+                _r55_publish_batch_transition(bundle, _durable_transition)
+                record["batch_shrink_durable"] = dict(_durable_transition)
+                if result_registry is not None:
+                    # Fencing: any result produced by the pre-transition plan is
+                    # older than this generation; the accepted prefix itself is
+                    # already durable and never touched.
+                    if _m3_fence is not None:
+                        _m3_fence.advance(reason="external_batch_shrink")
+                    else:
+                        result_registry.advance_generation(
+                            reason="external_batch_shrink"
+                        )
+                _emit(
+                    "ZeGrid: frozen external column_batch SHRUNK at the RUN "
+                    f"safe boundary before wave {wave_index}: "
+                    f"{_durable_transition['from_batch']} -> "
+                    f"{_durable_transition['to_batch']} "
+                    "(required_peak="
+                    f"{_durable_transition['required_peak_bytes']} B, "
+                    "phase_budget="
+                    f"{_durable_transition['phase_budget_bytes']} B, "
+                    "admitted_peak="
+                    f"{_durable_transition['admitted_peak_bytes']} B, raw="
+                    f"{int(record['host']['raw_available_bytes'])} B, "
+                    f"source={str(record.get('host_source', 'fresh'))}, "
+                    "plan_generation="
+                    f"{_durable_transition['plan_generation']}). The batch is "
+                    "a staging parameter only: class/backend/tile/geometry/"
+                    "science are unchanged; no cell of this wave was dispatched "
+                    "before the record was durable.",
+                    lvl="WARN", callback=progress_callback,
+                )
             checkpoints.append(record)
             deterministic_checkpoints.append(
                 checkpoint["deterministic_record"]
@@ -22340,6 +23095,11 @@ def _run_single(
                 shrink_count += sum(
                     1 for step in record["shrink_steps"] if step["accepted"]
                 )
+                # ZM-M33 P1 (rework-1, C1): the external staging-batch
+                # transition is ALREADY the auditable accepted entry
+                # ``{"step": "column_batch", "accepted": True}`` in
+                # ``record["shrink_steps"]``, so the sum above counts it
+                # exactly once. No extra increment exists.
 
             # ZM-ZEGRID-PER-CELL-SCHEDULER (rework-4): a WAVE is sliced by the
             # DISPATCH cap, never by the plan-wide K. The external class has
@@ -22730,7 +23490,17 @@ def _run_single(
                     "units_in_flight",
                     "tile_px",
                     "backend",
-                ],
+                ]
+                # ZM-M33 P1: the external spool class has ONE additional,
+                # staging-only rung that the frozen scheduler order cannot
+                # express. It is published ONLY for that class, so every RAM/GPU
+                # run keeps a byte-identical policy block.
+                + (
+                    ["column_batch"]
+                    if str(getattr(bundle, "stack_working_set", ""))
+                    == WORKING_SET_EXTERNAL
+                    else []
+                ),
                 "prefetch_units": 0,
                 "backend": "cpu",
                 "recovery_growth": "forbidden",
@@ -24608,7 +25378,17 @@ def _run_single(
                     "units_in_flight",
                     "tile_px",
                     "backend",
-                ],
+                ]
+                # ZM-M33 P1: the external spool class has ONE additional,
+                # staging-only rung that the frozen scheduler order cannot
+                # express. It is published ONLY for that class, so every RAM/GPU
+                # run keeps a byte-identical policy block.
+                + (
+                    ["column_batch"]
+                    if str(getattr(bundle, "stack_working_set", ""))
+                    == WORKING_SET_EXTERNAL
+                    else []
+                ),
                 "recovery_growth": "forbidden",
                 "fallback": "whole_batch_cpu_once",
             },
