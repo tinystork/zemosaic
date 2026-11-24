@@ -1749,23 +1749,87 @@ def _gather_block(
     row-major over ``(row, column, channel)`` within the block — identical to the
     full-row gather restricted to the column window ``[x0, x1)``, so a 2D tiling
     is bit-exact with the full-row path.
+
+    ZM-M33-EXT-GATHER: the two ``(n, positions)`` buffers are filled with grouped
+    copies of 4-D views — ``images[:n, rows, cols, :]`` into the float32 buffer
+    and ``weights[:n, rows, cols, None]`` broadcast over channels into the
+    float64 buffer — instead of one Python loop that builds per-row slices,
+    ``concatenate``s them and ``repeat``s the weights per frame. The values,
+    dtypes, C order and ownership are identical: both destinations are fresh
+    owning ``(n, positions)`` arrays written through C-contiguous reshapes, the
+    weights widening float32 -> float64 is the same exact cast as
+    ``np.asarray(..., dtype=np.float64)`` followed by ``np.repeat``, and the copy
+    keeps no all-N temporary (a strided assignment is buffered by NumPy, not
+    materialised).
+
+    The inputs must be the shapes the product actually spools:
+    ``images`` ``(N, th, tw, c)`` and ``weights`` ``(N, th, tw)``. They are
+    checked before any copy so an incoherent request (fewer frames than ``n``,
+    wrong ``tw``/``c``, empty span, block outside the tile) raises ``ValueError``
+    instead of silently broadcasting one frame or one channel into a duplicated
+    — hence false — stack.
     """
+    img_shape = getattr(images, "shape", None)
+    w_shape = getattr(weights, "shape", None)
+    if img_shape is None or len(img_shape) != 4:
+        raise ValueError(
+            f"images must be a (N, th, tw, c) array, got shape {img_shape!r}"
+        )
+    if w_shape is None or len(w_shape) != 3:
+        raise ValueError(
+            f"weights must be a (N, th, tw) array, got shape {w_shape!r}"
+        )
+    if int(img_shape[0]) < int(n) or int(w_shape[0]) < int(n):
+        raise ValueError(
+            f"gather needs {n} frames, images has {int(img_shape[0])} and "
+            f"weights has {int(w_shape[0])}"
+        )
+    if int(img_shape[2]) != int(tw) or int(img_shape[3]) != int(c):
+        raise ValueError(
+            f"images tile does not match tw={tw}, c={c}: {img_shape!r}"
+        )
+    if int(w_shape[1]) != int(img_shape[1]) or int(w_shape[2]) != int(tw):
+        raise ValueError(
+            f"weights tile {w_shape!r} does not match images {img_shape!r}"
+        )
+    if b <= a or x1 <= x0:
+        raise ValueError(
+            f"empty gather span rows [{a}, {b}) cols [{x0}, {x1})"
+        )
+    if a < 0 or x0 < 0 or x1 > int(w_int):
+        raise ValueError(
+            f"gather block rows [{a}, {b}) cols [{x0}, {x1}) outside the "
+            f"interior of {int(w_int)} columns"
+        )
+    if iy0 < 0 or ix0 < 0 or int(iy0) + int(b) > int(img_shape[1]):
+        raise ValueError(
+            f"gather block rows [{iy0 + a}, {iy0 + b}) outside the tile of "
+            f"{int(img_shape[1])} rows"
+        )
+    if int(ix0) + int(x1) > int(tw):
+        raise ValueError(
+            f"gather block cols [{ix0 + x0}, {ix0 + x1}) outside the tile of "
+            f"{int(tw)} columns"
+        )
+    rows = b - a
     bw = x1 - x0
-    positions = (b - a) * bw * c
+    positions = rows * bw * c
     img = np.empty((n, positions), dtype=np.float32)
     wt = np.empty((n, positions), dtype=np.float64)
-    for i in range(n):
-        parts = []
-        for iy in range(a, b):
-            start = ((iy0 + iy) * tw + ix0 + x0) * c
-            parts.append(images[i].reshape(-1)[start:start + bw * c])
-        img[i] = parts[0] if len(parts) == 1 else np.concatenate(parts)
-        w_rows = np.asarray(
-            weights[i][iy0 + a:iy0 + b, ix0 + x0:ix0 + x1], dtype=np.float64
+    if n:
+        row_slice = slice(iy0 + a, iy0 + b)
+        col_slice = slice(ix0 + x0, ix0 + x1)
+        # Exact grouped copies: (n, rows, bw, c) source views, no per-frame
+        # Python loop and no concatenate/repeat/astype temporary.
+        np.copyto(
+            img.reshape(n, rows, bw, c),
+            images[:n, row_slice, col_slice, :],
         )
-        wt[i] = np.repeat(w_rows, c, axis=1).reshape(-1)
+        np.copyto(
+            wt.reshape(n, rows, bw, c),
+            weights[:n, row_slice, col_slice][..., None],
+        )
     return img, wt
-
 
 def reduce_spooled_tile(
     tile: TileSpool,
