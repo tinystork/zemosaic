@@ -1844,6 +1844,13 @@ def reduce_spooled_tile(
             )
             support_w1 += wi
             support_w2 += wi * wi
+    # ZM-M33-EXT-LIFETIME: ``wi`` is ONLY the support-loop working map. Nothing
+    # below reads it, so the last active frame's (h_int, w_int) float64 plane
+    # would otherwise stay pinned in this frame for the whole block loop (it is
+    # bound by the loop, never rebound). Dropping the reference here is a plain
+    # rebind: when no frame was active the name was never bound, so this cannot
+    # raise UnboundLocalError and the science path below is unchanged.
+    wi = None
 
     rows_per_batch, cols_per_batch = batch_positions_for(
         column_batch, w_int, c
@@ -2306,6 +2313,13 @@ def run_cell_streaming_external(
             degenerate_count += int(tile["degenerate_count"])
             if "batch_geometry" in tile:
                 executed_tiles.append(dict(tile["batch_geometry"]))
+            # ZM-M33-EXT-LIFETIME: every tile-local plane has been copied into
+            # the persistent cell planes above and every counter/geometry
+            # diagnostic consumed. Drop the reduction dict NOW so the previous
+            # tile's extended-size arrays are not kept alive across the next
+            # tile's write/reduce nor through the finalize phase. No GC is
+            # forced and nothing scientific is recomputed.
+            del tile
 
         spool.finalize_manifest(
             taper_kind=taper_kind, taper_px=taper_px, taper_floor=taper_floor
