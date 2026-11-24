@@ -144,6 +144,12 @@ ATTESTED_RUNTIME_SHA256 = {
         "19d3cdd8f2ee02181d6dd2186b3c467a82abacb1c602a199b2aa50ebe7f8f0f5",
 }
 
+# Exact repository snapshot whose four product files were compared with the
+# Windows runtime slot during P0. This must not follow HEAD: once P1 is
+# committed, HEAD is intentionally the corrected code, not the historical
+# attribution baseline.
+ATTESTED_BASELINE_COMMIT = "07133a167efa3ebac754ab539b1fd8fd7d14e597"
+
 
 # ---------------------------------------------------------------------------
 # checkout guard — ALWAYS import THIS checkout, never another
@@ -244,13 +250,13 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _git_head_bytes(root: Path, rel: str) -> bytes | None:
-    """Content of ``rel`` at HEAD (uncommitted work excluded); None if absent."""
+def _git_baseline_bytes(root: Path, rel: str) -> bytes | None:
+    """Content of ``rel`` at the exact P0 baseline; None if unavailable."""
     import subprocess
 
     try:
         proc = subprocess.run(
-            ["git", "show", f"HEAD:{rel}"],
+            ["git", "show", f"{ATTESTED_BASELINE_COMMIT}:{rel}"],
             cwd=str(root),
             capture_output=True,
             timeout=60,
@@ -263,15 +269,14 @@ def _git_head_bytes(root: Path, rel: str) -> bytes | None:
 
 
 def checkout_provenance(root: Path | None = None) -> dict:
-    """Provenance of the four observed product files, working tree AND HEAD.
+    """Provenance of the observed files, working tree AND exact P0 baseline.
 
     ZM-M33 P1 modifies ``zemosaic_zegrid_mode.py`` in the SAME checkout, so the
-    P0 historical attestation can only be true of the HEAD baseline. Both facts
-    are published, never conflated:
+    P0 historical attestation belongs to ``ATTESTED_BASELINE_COMMIT``. Both
+    facts are published, never conflated:
 
-    * ``baseline_head.all_match`` — the P0 baseline (HEAD) still carries the code
-      observed in the Windows runtime slot: this is what the P0 attribution
-      attested;
+    * ``baseline_ref.all_match`` — the pinned P0 commit carries the code
+      observed in the Windows runtime slot;
     * ``working_tree.*`` — what THIS process actually imported while replaying.
     """
     root = repo_root() if root is None else Path(root)
@@ -279,35 +284,49 @@ def checkout_provenance(root: Path | None = None) -> dict:
     for rel, attested in ATTESTED_RUNTIME_SHA256.items():
         path = root / rel
         working = hashlib.sha256(path.read_bytes()).hexdigest()
-        head_bytes = _git_head_bytes(root, rel)
-        head = None if head_bytes is None else hashlib.sha256(head_bytes).hexdigest()
+        baseline_bytes = _git_baseline_bytes(root, rel)
+        baseline = (
+            None if baseline_bytes is None
+            else hashlib.sha256(baseline_bytes).hexdigest()
+        )
         files[rel] = {
             "sha256_working_tree": working,
-            "sha256_head": head,
+            "sha256_baseline_ref": baseline,
             "attested_sha256": attested,
             "working_tree_matches": working == attested,
-            "head_matches": head == attested if head is not None else None,
+            "baseline_ref_matches": (
+                baseline == attested if baseline is not None else None
+            ),
         }
-    head_all = all(item["head_matches"] for item in files.values())
+    baseline_all = all(
+        item["baseline_ref_matches"] for item in files.values()
+    )
     working_all = all(item["working_tree_matches"] for item in files.values())
+    baseline_block = {
+        "commit": ATTESTED_BASELINE_COMMIT,
+        "all_match": bool(baseline_all),
+        "diverged_from_attested": sorted(
+            rel for rel, item in files.items()
+            if item["baseline_ref_matches"] is False
+        ),
+        "unavailable": sorted(
+            rel for rel, item in files.items()
+            if item["baseline_ref_matches"] is None
+        ),
+    }
     return {
         "claim": (
-            "same code OBSERVED as the Windows runtime slot at the HEAD "
-            "baseline; this is not proof of immutability since the historical "
-            "launch, and the working tree may carry later missions"
+            "same code OBSERVED as the Windows runtime slot at the pinned "
+            f"baseline commit {ATTESTED_BASELINE_COMMIT}; this is not proof "
+            "of immutability since the historical launch, and the working "
+            "tree may carry later missions"
         ),
         "contract": (
-            "provenance.all_match is the P0 BASELINE attestation (HEAD); "
+            "provenance.all_match is the pinned P0 BASELINE attestation; "
             "provenance.working_tree is the code this replay executed"
         ),
-        "all_match": bool(head_all),
-        "baseline_head": {
-            "all_match": bool(head_all),
-            "diverged_from_attested": sorted(
-                rel for rel, item in files.items()
-                if item["head_matches"] is False
-            ),
-        },
+        "all_match": bool(baseline_all),
+        "baseline_ref": baseline_block,
         "working_tree": {
             "all_match": bool(working_all),
             "diverged_from_attested": sorted(

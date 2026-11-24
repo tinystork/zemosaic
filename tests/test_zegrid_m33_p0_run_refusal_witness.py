@@ -89,11 +89,14 @@ def _floor() -> int:
 
 def test_checkout_reproduces_the_observed_runtime_code():
     provenance = witness.checkout_provenance()
-    # The P0 attribution was made on the HEAD baseline; that hash match is what
-    # ``all_match`` means. P1 then modified exactly ONE of the four files, and
-    # the tool publishes that divergence instead of hiding it.
+    # The P0 attribution is pinned to the exact observed baseline commit; it
+    # must not follow HEAD after P1 itself is committed.
     assert provenance["all_match"] is True, provenance
-    assert provenance["baseline_head"]["diverged_from_attested"] == []
+    assert provenance["baseline_ref"]["commit"] == (
+        witness.ATTESTED_BASELINE_COMMIT
+    )
+    assert provenance["baseline_ref"]["diverged_from_attested"] == []
+    assert provenance["baseline_ref"]["unavailable"] == []
     assert provenance["working_tree"]["diverged_from_attested"] == [
         "src/zemosaic/zemosaic_zegrid_mode.py"
     ]
