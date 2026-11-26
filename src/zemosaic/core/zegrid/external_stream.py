@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -719,6 +720,213 @@ def scan_spool_root(
 
 
 # ---------------------------------------------------------------------------
+# Per-frame preparation (ONE authoritative body for legacy and pipeline)
+# ---------------------------------------------------------------------------
+
+def prepare_external_frame(
+    provider,
+    p1: _Phase1,
+    index: int,
+    ey0: int,
+    ey1: int,
+    ex0: int,
+    ex1: int,
+    *,
+    taper_kind: str,
+    taper_px: float,
+    taper_floor: float,
+):
+    """Prepare ONE extended tile frame exactly as the RAM path does.
+
+    This is the SINGLE authoritative per-frame body: ``ExternalSpool.write_tile``
+    (legacy, sequential) and the bounded two-producer pipeline call it. It keeps
+    every cast, operation order, coefficient application, validity rule, taper
+    and NaN rule unchanged. ``(None, None)`` means an inactive frame, for which
+    the writer stores NaN images and zero weights (the historical scalar write).
+    """
+    i = int(index)
+    c = int(p1.channels)
+    th = int(ey1) - int(ey0)
+    tw = int(ex1) - int(ex0)
+    if not p1.norm_active[i]:
+        return None, None
+    raw_tile, pre_valid = provider.get_tile(
+        i, int(ey0), int(ey1), int(ex0), int(ex1)
+    )
+    a = p1.coefficients[i]
+    src64 = raw_tile.astype(np.float64)
+    transformed = np.empty((th, tw, c), dtype=np.float64)
+    for ch in range(c):
+        transformed[:, :, ch] = a[ch, 0] * src64[:, :, ch] + a[ch, 1]
+    with np.errstate(over="ignore", invalid="ignore"):
+        transformed32 = transformed.astype(np.float32)
+    finite_all = np.all(np.isfinite(transformed32), axis=-1)
+    post_valid = pre_valid & finite_all
+    frame = np.empty((th, tw, c), dtype=np.float32)
+    frame[:] = np.nan
+    frame[post_valid] = transformed32[post_valid]
+    if taper_kind == "footprint":
+        taper = make_footprint_taper(
+            post_valid, feather_px=taper_px, floor=taper_floor
+        ).astype(np.float32)
+    else:
+        taper = np.ones((th, tw), dtype=np.float32)
+    wrow = np.where(post_valid, taper, np.float32(0.0)).astype(np.float32)
+    return frame, wrow
+
+
+class TileWriteSession:
+    """ONE open tile payload (geometry, memmaps, publish/abort).
+
+    The stale-directory refusal, extended geometry, memmap dtypes/shapes and the
+    partial-tile cleanup are authoritative here so the legacy writer and the
+    preparation pipeline can never diverge.
+    """
+
+    def __init__(self, *, spool: "ExternalSpool", y0: int, y1: int, x0: int,
+                 x1: int, halo_px: int, n_frames=None, channels=None) -> None:
+        self.spool = spool
+        self.y0 = int(y0)
+        self.y1 = int(y1)
+        self.x0 = int(x0)
+        self.x1 = int(x1)
+        self.ey0 = max(0, int(y0) - int(halo_px))
+        self.ey1 = min(int(spool.height), int(y1) + int(halo_px))
+        self.ex0 = max(0, int(x0) - int(halo_px))
+        self.ex1 = min(int(spool.width), int(x1) + int(halo_px))
+        self.th = int(self.ey1 - self.ey0)
+        self.tw = int(self.ex1 - self.ex0)
+        self.tile_dir = spool._tile_dir(y0, x0)
+        if self.tile_dir.exists():
+            raise ExternalSpoolStaleError(
+                f"tile spool directory already exists: {self.tile_dir}"
+            )
+        self.tile_dir.mkdir(parents=True, exist_ok=False)
+        self.images_path = self.tile_dir / IMAGES_NAME
+        self.weights_path = self.tile_dir / WEIGHTS_NAME
+        self.images = None
+        self.weights = None
+        self._published = False
+        self._closed = False
+        self._n_frames = int(n_frames if n_frames is not None else spool.n_frames)
+        self._channels = int(channels if channels is not None else spool.channels)
+        try:
+            n = self._n_frames
+            self.images = np.lib.format.open_memmap(
+                self.images_path, mode="w+", dtype=np.float32,
+                shape=(n, self.th, self.tw, self._channels),
+            )
+            self.weights = np.lib.format.open_memmap(
+                self.weights_path, mode="w+", dtype=np.float32,
+                shape=(n, self.th, self.tw),
+            )
+        except BaseException:
+            # A partially opened payload must not leave a mapping behind.
+            self._release_mapping(self.images)
+            self._release_mapping(self.weights)
+            self.images = self.weights = None
+            shutil.rmtree(self.tile_dir, ignore_errors=True)
+            raise
+
+    @property
+    def n_frames(self) -> int:
+        return int(self._n_frames)
+
+    @property
+    def channels(self) -> int:
+        return int(self._channels)
+
+    @staticmethod
+    def _release_mapping(arr) -> None:
+        """Flush and CLOSE one memmap before any directory deletion.
+
+        ``del`` alone is not deterministic: caller closures/loop variables can
+        keep the mapping alive, which on Windows blocks ``rmtree`` (WinError
+        32). The mapping is explicitly closed here.
+        """
+        if arr is None:
+            return
+        try:
+            arr.flush()
+        except Exception:  # noqa: BLE001 - cleanup must not mask the error
+            pass
+        mm = getattr(arr, "_mmap", None)
+        if mm is not None:
+            try:
+                mm.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def publish(self) -> TileSpool:
+        if self._published or self._closed:
+            raise ExternalSpoolError("tile write session already closed")
+        images, weights = self.images, self.weights
+        try:
+            images.flush()
+            weights.flush()
+            n = int(images.shape[0])
+            handle = TileSpool(
+                y0=self.y0, y1=self.y1, x0=self.x0, x1=self.x1,
+                ey0=self.ey0, ey1=self.ey1, ex0=self.ex0, ex1=self.ex1,
+                th=self.th, tw=self.tw,
+                images_path=str(self.images_path),
+                weights_path=str(self.weights_path),
+                images_shape=(n, self.th, self.tw, self.channels),
+                weights_shape=(n, self.th, self.tw),
+                images_bytes=int(self.images_path.stat().st_size),
+                weights_bytes=int(self.weights_path.stat().st_size),
+            )
+        except BaseException:
+            # Keep the session OPEN so the caller's abort() can close the
+            # mappings and remove the partial tile. Never mark it closed here.
+            raise
+        self._release_mapping(images)
+        self._release_mapping(weights)
+        self.images = self.weights = None
+        self._closed = True
+        self._published = True
+        self.spool._tiles.append(handle)
+        del images, weights
+        return handle
+
+    def abort(self) -> None:
+        """Drop this tile; a partial payload must never survive an attempt.
+
+        Idempotent and STILL effective after a FAILED publish(): the session is
+        only marked closed on real success, and the mappings are closed before
+        ``rmtree`` so a Windows proxy sees no open handle.
+        """
+        if self._published:
+            raise ExternalSpoolError("cannot abort a published tile")
+        if getattr(self, "_aborted", False):
+            return
+        self._aborted = True
+        images, weights = self.images, self.weights
+        self.images = self.weights = None
+        self._release_mapping(images)
+        self._release_mapping(weights)
+        del images, weights
+        shutil.rmtree(self.tile_dir, ignore_errors=True)
+        self._closed = True
+
+    def close_without_delete(self) -> None:
+        """Release the memmaps WITHOUT deleting a payload still referenced.
+
+        Used only when a producer survived the drain deadline: the Cell fails
+        and the provider set is quarantined, so deleting anything it may still
+        touch would be a use-after-free.
+        """
+        if self._closed and self.images is None and self.weights is None:
+            return
+        images, weights = self.images, self.weights
+        self.images = self.weights = None
+        self._release_mapping(images)
+        self._release_mapping(weights)
+        del images, weights
+        self._closed = True
+
+
+# ---------------------------------------------------------------------------
 # Spool writer / lifecycle
 # ---------------------------------------------------------------------------
 
@@ -931,6 +1139,19 @@ class ExternalSpool:
         name = f"tile_y{int(y0):06d}_x{int(x0):06d}"
         return _confined_child(self.attempt_dir, name)
 
+    def open_tile_writer(self, y0: int, y1: int, x0: int, x1: int, *,
+                         halo_px: int, n_frames=None, channels=None):
+        """Open ONE tile payload for writing (shared by legacy and pipeline).
+
+        The authoritative tile geometry, paths, memmap shapes/dtypes and the
+        stale-directory refusal live here exactly once. The caller owns the
+        returned :class:`TileWriteSession` and must publish or abort it.
+        """
+        return TileWriteSession(
+            spool=self, y0=y0, y1=y1, x0=x0, x1=x1, halo_px=halo_px,
+            n_frames=n_frames, channels=channels,
+        )
+
     def write_tile(
         self,
         provider,
@@ -947,86 +1168,47 @@ class ExternalSpool:
     ) -> TileSpool:
         """Prepare and spool ONE extended tile, frame by frame, exactly as RAM."""
         n = int(p1.n_frames)
-        c = int(p1.channels)
-        ey0 = max(0, int(y0) - int(halo_px))
-        ey1 = min(int(self.height), int(y1) + int(halo_px))
-        ex0 = max(0, int(x0) - int(halo_px))
-        ex1 = min(int(self.width), int(x1) + int(halo_px))
-        th = ey1 - ey0
-        tw = ex1 - ex0
-        tile_dir = self._tile_dir(y0, x0)
-        if tile_dir.exists():
-            raise ExternalSpoolStaleError(
-                f"tile spool directory already exists: {tile_dir}"
-            )
-        tile_dir.mkdir(parents=True, exist_ok=False)
-        images_path = tile_dir / IMAGES_NAME
-        weights_path = tile_dir / WEIGHTS_NAME
         try:
-            images = np.lib.format.open_memmap(
-                images_path, mode="w+", dtype=np.float32, shape=(n, th, tw, c)
+            session = self.open_tile_writer(
+                y0, y1, x0, x1, halo_px=halo_px,
+                n_frames=n, channels=int(p1.channels),
             )
-            weights = np.lib.format.open_memmap(
-                weights_path, mode="w+", dtype=np.float32, shape=(n, th, tw)
-            )
-            try:
-                for i in range(n):
-                    if not p1.norm_active[i]:
-                        images[i] = np.nan
-                        weights[i] = 0.0
-                        continue
-                    raw_tile, pre_valid = provider.get_tile(
-                        i, ey0, ey1, ex0, ex1
-                    )
-                    a = p1.coefficients[i]
-                    src64 = raw_tile.astype(np.float64)
-                    transformed = np.empty((th, tw, c), dtype=np.float64)
-                    for ch in range(c):
-                        transformed[:, :, ch] = (
-                            a[ch, 0] * src64[:, :, ch] + a[ch, 1]
-                        )
-                    with np.errstate(over="ignore", invalid="ignore"):
-                        transformed32 = transformed.astype(np.float32)
-                    finite_all = np.all(np.isfinite(transformed32), axis=-1)
-                    post_valid = pre_valid & finite_all
-                    frame = np.empty((th, tw, c), dtype=np.float32)
-                    frame[:] = np.nan
-                    frame[post_valid] = transformed32[post_valid]
-                    images[i] = frame
-                    if taper_kind == "footprint":
-                        taper = make_footprint_taper(
-                            post_valid, feather_px=taper_px, floor=taper_floor
-                        ).astype(np.float32)
-                    else:
-                        taper = np.ones((th, tw), dtype=np.float32)
-                    weights[i] = np.where(
-                        post_valid, taper, np.float32(0.0)
-                    ).astype(np.float32)
-            finally:
-                images.flush()
-                weights.flush()
-                del images
-                del weights
         except OSError as exc:
-            shutil.rmtree(tile_dir, ignore_errors=True)
+            # The payload files themselves could not be created (disk full /
+            # permissions). Typed exactly like the historical writer.
             raise ExternalSpoolWriteError(
-                f"failed to write tile spool {tile_dir}: {exc}"
+                f"failed to write tile spool {self._tile_dir(y0, x0)}: {exc}"
             ) from exc
-        except Exception:
+        try:
+            images = session.images
+            weights = session.weights
+            for i in range(n):
+                frame, wrow = prepare_external_frame(
+                    provider, p1, i,
+                    session.ey0, session.ey1, session.ex0, session.ex1,
+                    taper_kind=taper_kind, taper_px=taper_px,
+                    taper_floor=taper_floor,
+                )
+                if frame is None:
+                    images[i] = np.nan
+                    weights[i] = 0.0
+                else:
+                    images[i] = frame
+                    weights[i] = wrow
+            return session.publish()
+        except OSError as exc:
+            images = weights = None
+            del images, weights
+            session.abort()
+            raise ExternalSpoolWriteError(
+                f"failed to write tile spool {session.tile_dir}: {exc}"
+            ) from exc
+        except BaseException:
             # A partial tile must never survive for a later attempt.
-            shutil.rmtree(tile_dir, ignore_errors=True)
+            images = weights = None
+            del images, weights
+            session.abort()
             raise
-        handle = TileSpool(
-            y0=int(y0), y1=int(y1), x0=int(x0), x1=int(x1),
-            ey0=int(ey0), ey1=int(ey1), ex0=int(ex0), ex1=int(ex1),
-            th=int(th), tw=int(tw),
-            images_path=str(images_path), weights_path=str(weights_path),
-            images_shape=(n, th, tw, c), weights_shape=(n, th, tw),
-            images_bytes=int(images_path.stat().st_size),
-            weights_bytes=int(weights_path.stat().st_size),
-        )
-        self._tiles.append(handle)
-        return handle
 
     def open_tile(self, handle: TileSpool):
         """Open + validate the tile payload; return read-only memmaps."""
@@ -2099,6 +2281,10 @@ def run_cell_streaming_external(
     gpu_fallback_out: dict | None = None,
     memory_probe=None,
     progress_probe=None,
+    provider_factory=None,
+    preparation_budget: dict | None = None,
+    preparation_gate=None,
+    tile_gate=None,
 ) -> CanonicalStackResult:
     """External-working-set execution of ONE canonical request.
 
@@ -2153,6 +2339,70 @@ def run_cell_streaming_external(
     taper_kind, taper_px, taper_floor, halo = _resolve_taper(request)
     if rejection_sink is not None:
         _validate_rejection_sink(rejection_sink, n, h, w, c)
+
+    # ZM-M33-PREP-PIPELINE: the factory is the ONLY opt-in. Without it the
+    # historical provider/executor path below is byte-identical. With it, the
+    # per-tile preparation runs through the bounded two-producer pipeline and
+    # the tile payload must still be bit-identical (same shared helper).
+    _prepare_pipeline = None
+    _prep_acc = None
+    if provider_factory is not None:
+        if not callable(provider_factory):
+            raise CanonicalStackValidationError(
+                "provider_factory must be callable"
+            )
+        if not isinstance(preparation_budget, dict):
+            raise CanonicalStackValidationError(
+                "provider_factory requires an explicit preparation_budget"
+            )
+        _grant = preparation_budget.get("producer_grant_bytes")
+        _producers = preparation_budget.get("producers", 2)
+        if not isinstance(_grant, int) or isinstance(_grant, bool) or _grant <= 0:
+            raise CanonicalStackValidationError(
+                "preparation_budget.producer_grant_bytes must be a positive int"
+            )
+        if not isinstance(_producers, int) or isinstance(_producers, bool):
+            raise CanonicalStackValidationError(
+                "preparation_budget.producers must be an int"
+            )
+        if _producers < 1:
+            raise CanonicalStackValidationError(
+                "preparation_budget.producers must be >= 1"
+            )
+        if preparation_gate is not None and not callable(preparation_gate):
+            raise CanonicalStackValidationError(
+                "preparation_gate must be callable"
+            )
+        from . import prepare_pipeline as _prepare_pipeline
+        _prep_acc = {
+            "mode": "pipeline",
+            "effective_mode": str(preparation_budget.get("effective_mode", "auto")),
+            "effective_mode_last": str(
+                preparation_budget.get("effective_mode", "auto")
+            ),
+            "producers": int(_producers),
+            "producer_grant_bytes": int(_grant),
+            "tiles": 0,
+            "prepared": 0,
+            "written": 0,
+            "dropped": 0,
+            "max_inflight_bytes": 0,
+            "provider_opens": 0,
+            "provider_closes": 0,
+            "provider_close_failures": 0,
+            "provider_close_failures_detail": 0,
+            "ledger_wait_s": 0.0,
+            "ledger_waits": 0,
+            "ledger_peak_bytes": 0,
+            "drain_incomplete": False,
+            "quarantined": False,
+            "fallback_reason": preparation_budget.get("reason"),
+            "tiles_pipeline": 0,
+            "tiles_legacy": 0,
+            "gate_probes": 0,
+            "fallback_at_tile": None,
+            "sticky_fallback_reason": None,
+        }
 
     def _live(fields: dict) -> None:
         """Bounded live progress: plain scalars only, never fatal."""
@@ -2271,23 +2521,125 @@ def run_cell_streaming_external(
 
     try:
         _phase_start("write")
+        _pipeline_active = _prepare_pipeline is not None
         for _tile_index, (y0, y1, x0, x1) in enumerate(
             _iter_tiles(h, w, tile_size), start=1
         ):
-            _live({
+            # ZM-M33 REWORK2: revalidate the admission at EVERY tile boundary,
+            # AFTER the previous reduce and BEFORE any new provider/pool. A
+            # downgrade is STICKY: the remaining tiles run the historical
+            # sequential writer (same science, same spool format).
+            if (
+                _pipeline_active
+                and preparation_gate is not None
+                and _tile_index > 1
+            ):
+                try:
+                    _gate_decision = preparation_gate()
+                    _prep_acc["gate_probes"] += 1
+                    if str(_gate_decision.get("effective_mode")) != "auto":
+                        _pipeline_active = False
+                        _prep_acc["effective_mode_last"] = "legacy"
+                        _prep_acc["fallback_at_tile"] = int(_tile_index)
+                        _prep_acc["sticky_fallback_reason"] = str(
+                            _gate_decision.get("reason")
+                        )
+                        logging.getLogger(__name__).warning(
+                            "ZeGrid: M33 preparation AUTO -> legacy at tile %s: %s",
+                            _tile_index, _gate_decision.get("reason"),
+                        )
+                except Exception as _gate_exc:  # noqa: BLE001 - fail closed
+                    _pipeline_active = False
+                    _prep_acc["effective_mode_last"] = "legacy"
+                    _prep_acc["fallback_at_tile"] = int(_tile_index)
+                    _prep_acc["sticky_fallback_reason"] = (
+                        f"preparation_gate_error:{type(_gate_exc).__name__}"
+                    )
+            if tile_gate is not None:
+                # Optional cooperative guard (witness/telemetry only). It can
+                # abort BETWEEN tiles; it never changes a scientific value.
+                tile_gate()
+            _write_progress = {
                 "phase": "write",
                 "tile_current": _tile_index,
                 "tile_total": _tile_total,
-            })
+            }
+            if _prep_acc is not None and not _pipeline_active:
+                # Legacy/fallback tile: exactly ONE writer-side producer. This
+                # is a CURRENT-phase counter, cleared by any phase/tile change.
+                _write_progress["producers_effective"] = 1
+            _live(_write_progress)
             _probe("write")
+            if _prep_acc is not None:
+                _prep_acc["tiles"] += 1
             _tw = time.perf_counter()
-            handle = spool.write_tile(
-                provider, p1, y0, y1, x0, x1,
-                taper_kind=taper_kind,
-                taper_px=taper_px,
-                taper_floor=taper_floor,
-                halo_px=halo,
-            )
+            if _pipeline_active:
+                try:
+                    handle, _pstat = _prepare_pipeline.write_tile_two_producers(
+                        spool, provider_factory, p1,
+                        y0, y1, x0, x1,
+                        grant_bytes=int(preparation_budget["producer_grant_bytes"]),
+                        producers=int(preparation_budget.get("producers", 2)),
+                        taper_kind=taper_kind,
+                        taper_px=taper_px,
+                        taper_floor=taper_floor,
+                        halo_px=halo,
+                        drain_timeout_s=float(
+                            preparation_budget.get("drain_timeout_s", 5.0)
+                        ),
+                        progress_callback=(
+                            (lambda fields, _ti=_tile_index: _live({
+                                **fields,
+                                "tile_current": _ti,
+                                "tile_total": _tile_total,
+                            }))
+                            if progress_probe is not None else None
+                        ),
+                    )
+                except _prepare_pipeline.PreparationQuarantineError:
+                    # A live producer may still reference its provider and the
+                    # uncommitted tile: the attempt MUST be retained, never
+                    # cleaned as if the drain had succeeded.
+                    raise
+                _prep_acc["tiles_pipeline"] += 1
+                _prep_acc["prepared"] += int(_pstat.get("prepared", 0))
+                _prep_acc["written"] += int(_pstat.get("written", 0))
+                _prep_acc["dropped"] += int(_pstat.get("dropped", 0))
+                _prep_acc["provider_opens"] += int(_pstat.get("provider_opens", 0))
+                _prep_acc["provider_closes"] += int(_pstat.get("provider_closes", 0))
+                _prep_acc["provider_close_failures"] += int(
+                    _pstat.get("provider_close_failures", 0)
+                )
+                _prep_acc["drain_incomplete"] = bool(
+                    _prep_acc["drain_incomplete"]
+                    or _pstat.get("drain_incomplete", False)
+                )
+                _prep_acc["quarantined"] = bool(
+                    _prep_acc["quarantined"] or _pstat.get("quarantined", False)
+                )
+                _ledger = _pstat.get("ledger") or {}
+                _prep_acc["ledger_wait_s"] += float(
+                    _ledger.get("wait_s", 0.0) or 0.0
+                )
+                _prep_acc["ledger_waits"] += int(_ledger.get("waits", 0) or 0)
+                _prep_acc["ledger_peak_bytes"] = max(
+                    int(_prep_acc["ledger_peak_bytes"]),
+                    int(_ledger.get("peak_used_bytes", 0) or 0),
+                )
+                _prep_acc["max_inflight_bytes"] = max(
+                    int(_prep_acc["max_inflight_bytes"]),
+                    int(_ledger.get("peak_used_bytes", 0) or 0),
+                )
+            else:
+                if _prep_acc is not None:
+                    _prep_acc["tiles_legacy"] += 1
+                handle = spool.write_tile(
+                    provider, p1, y0, y1, x0, x1,
+                    taper_kind=taper_kind,
+                    taper_px=taper_px,
+                    taper_floor=taper_floor,
+                    halo_px=halo,
+                )
             _phase_acc["write"] += time.perf_counter() - _tw
             sink_cp = (
                 rejection_sink.checkpoint() if rejection_sink is not None else None
@@ -2446,12 +2798,22 @@ def run_cell_streaming_external(
                         int(g["cols_per_batch"]) for g in executed_tiles
                     }),
                 },
+                **({"preparation_pipeline": dict(_prep_acc)}
+                   if _prep_acc is not None else {}),
             })
         _phase_line("end", "write", _phase_acc["write"])
         if "reduce" in _phase_started:
             _phase_line("end", "reduce", _phase_acc["reduce"])
-    except BaseException:
-        if not retain_on_failure:
+    except BaseException as _exc:
+        _quarantined = False
+        if _prepare_pipeline is not None:
+            try:
+                _quarantined = isinstance(
+                    _exc, _prepare_pipeline.PreparationQuarantineError
+                )
+            except Exception:  # noqa: BLE001
+                _quarantined = False
+        if not retain_on_failure and not _quarantined:
             try:
                 spool.cleanup()
             except Exception:

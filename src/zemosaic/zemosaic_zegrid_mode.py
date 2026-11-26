@@ -146,6 +146,7 @@ from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
 from .core.zegrid import external_stream as zext
+from .core.zegrid import prepare_pipeline as zprep
 from .core.zegrid import memory_peak as zmem
 from .core.zegrid import sweep as zsw
 from .core.zegrid.executor import ExecutorConfig
@@ -1066,18 +1067,41 @@ def _decode_bayer_section_hwc(
         return None
     rows, cols = shape
     key = frame_desc.frame_id.logical_path
-    cached = None if stats_cache is None else stats_cache.get(key)
-    if cached is None:
-        cached = _frame_global_minmax(frame_desc, hdu, header)
+    # ZM-M33-PREP-PIPELINE: the publication key binds the SOURCE identity and
+    # the decode POLICY, never a window. Two producers of the same cell share
+    # one immutable (min,max) instead of re-reading the full frame.
+    registry_key = (
+        str(key),
+        str(getattr(frame_desc, "header_sha256", "") or ""),
+        tuple(int(v) for v in frame_desc.shape_hw),
+        "loader_global_minmax_f32_v1",
+    )
+    cached = None
+    computed_here = False
+    if stats_cache is not None and hasattr(stats_cache, "get_or_compute"):
+        cached, computed_here = stats_cache.get_or_compute(
+            registry_key,
+            lambda: _frame_global_minmax(frame_desc, hdu, header),
+        )
         if cached is None:
             return None
-        if stats_cache is not None:
-            stats_cache[key] = cached
-        if stats is not None:
+    else:
+        cached = None if stats_cache is None else stats_cache.get(registry_key)
+        if cached is None:
+            cached = _frame_global_minmax(frame_desc, hdu, header)
+            computed_here = cached is not None
+            if cached is None:
+                return None
+            if stats_cache is not None:
+                stats_cache[registry_key] = cached
+    if stats is not None:
+        if computed_here:
             # Honest I/O: the pre-scan really reads the whole frame once.
             stats["prescans"] += 1
             stats["prescan_pixels"] += int(rows * cols)
             stats["prescan_bytes"] += int(rows * cols * int(np.dtype(hdu.data.dtype).itemsize))
+        else:
+            stats["prescans_shared"] += 1
     data_min, data_max = cached
     y0, y1 = int(bounds.y0), int(bounds.y1)
     x0, x1 = int(bounds.x0), int(bounds.x1)
@@ -1415,6 +1439,18 @@ class _SourceFrameCache:
         self.bytes = 0
         self.stats["cache_bytes"] = 0
 
+    def disable_and_release(self, policy="disabled_pipeline_producer"):
+        """Drop the cache and make it unreachable (science-neutral).
+
+        ZM-M33-PREP-PIPELINE: when per-tile producer providers read their own
+        source windows, keeping an all-frames decoded cache in the BASE
+        provider would duplicate the largest budget term while serving no tile.
+        """
+        self.enabled = False
+        self.stats["cache_active"] = False
+        self.stats["cache_policy"] = str(policy)
+        self.release()
+
 
 def _new_source_window_stats() -> dict:
     """Honest, additive counters for the windowed source path."""
@@ -1423,6 +1459,7 @@ def _new_source_window_stats() -> dict:
         "full_decode_fallbacks": 0,
         "bounds_expand_fallbacks": 0,
         "prescans": 0,
+        "prescans_shared": 0,
         "prescan_pixels": 0,
         "prescan_bytes": 0,
         # Whole-frame decodes (degradation or cache miss); windowed section
@@ -1491,6 +1528,40 @@ def _prepare_cell_source_window(
     return rgb, geom
 
 
+class _ProviderStatsProxy:
+    """Delegate to a provider and publish ONE telemetry dict at close.
+
+    Keeps the per-cell stats list O(tiles) small dicts instead of retaining
+    providers, closures and planned frames until the end of the cell.
+    """
+
+    def __init__(self, provider, sink):
+        self._provider = provider
+        self._sink = sink
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._provider, name)
+
+    def close(self):
+        if self._closed:
+            return
+        try:
+            close = getattr(self._provider, "close", None)
+            if close is not None:
+                close()
+        finally:
+            self._closed = True
+            try:
+                telemetry = self._provider.window_telemetry()
+            except Exception:  # noqa: BLE001 - telemetry never fails a cell
+                telemetry = {}
+            try:
+                self._sink.append(dict(telemetry))
+            except Exception:  # noqa: BLE001
+                pass
+
+
 @dataclass(frozen=True)
 class _CellSourceContext:
     """Pickle-safe cell input recipe, never image arrays or a live provider.
@@ -1508,11 +1579,13 @@ class _CellSourceContext:
     def frame_ids(self):
         return tuple(f.frame_id.logical_path for f, _bounds in self.planned)
 
-    def open_provider(self, *, budget_bytes=None):
+    def open_provider(self, *, budget_bytes=None, cfa_registry=None,
+                      provider_stats=None):
         stats = _new_source_window_stats()
         stats["decodes"] = 0
         # Per-frame CFA global statistics (two floats), never the frame itself.
-        stats_cache = {}
+        # The cell-scope registry is the ONLY shared state between producers.
+        stats_cache = {} if cfa_registry is None else cfa_registry
         frame_bytes = 0
         for frame, _bounds in self.planned:
             fh, fw = (int(v) for v in frame.shape_hw)
@@ -1565,7 +1638,32 @@ class _CellSourceContext:
             prepare, len(self.planned), frame_ids=self.frame_ids,
             expected_hw=self.patch_hw, prepare_window=prepare_window,
             expected_channels=3, window_stats=stats,
+            source_frame_cache=decoded,
         )
+
+    def pipeline_provider_factory(self, *, cfa_registry=None,
+                                  provider_stats=None):
+        """Explicit factory for the bounded two-producer preparation.
+
+        Each call opens an INDEPENDENT provider (no decoded-frame RAM cache,
+        no shared live window). The only cross-provider state is the immutable
+        CFA min/max registry, keyed by source identity + decode policy.
+
+        ``provider_stats`` receives ONE small immutable telemetry dict per
+        provider at close (never the provider/closure), so a long cell with
+        many tiles does not accumulate closed objects.
+        """
+        def factory():
+            provider = self.open_provider(
+                budget_bytes=None,
+                cfa_registry=cfa_registry,
+                provider_stats=None,
+            )
+            if provider_stats is None:
+                return provider
+            return _ProviderStatsProxy(provider, provider_stats)
+
+        return factory
 
 
 def _plan_cell_source_frames(descs, canvas, patch, mem):
@@ -3957,6 +4055,180 @@ def _run_cell_stream(cache_dir, patch, config, progress_callback, tile_size=STRE
 # ZM-ZEGRID-AUTO-EXTERNAL-STREAMING M3 — external cell executor
 # ---------------------------------------------------------------------------
 
+#: Internal A/B selector for the bounded two-producer preparation. Product
+#: default is ``auto`` (admission decides); ``legacy`` forces the historical
+#: sequential writer. Never a GUI knob, never a science input.
+_M33_PREP_ENV = "ZEMOSAIC_M33_PREP_PIPELINE"
+
+
+def _m33_prep_mode_request() -> str:
+    token = os.environ.get(_M33_PREP_ENV, "auto").strip().lower()
+    return token if token in ("auto", "legacy") else "auto"
+
+
+def _resolve_m33_preparation_pipeline(
+    *, source_context, provider, tiles, max_th, max_tw, patch, column_batch,
+):
+    """Resolve the preparation strategy ONCE at the cell boundary.
+
+    AUTO requires ALL of: a source-recipe context (explicit provider factory),
+    a qualified constructive grant, and a LIVE net-available observation large
+    enough for two grants + the already-committed result planes + the 512 MiB
+    host reserve. Otherwise the sequential historical writer runs and the
+    reason is published. RSS alone never authorizes two producers.
+    """
+    mode = _m33_prep_mode_request()
+    info = {
+        "schema": "zemosaic-m33-prep-selection-v1",
+        "selector_env": _M33_PREP_ENV,
+        "requested_mode": mode,
+        "effective_mode": "legacy",
+        "producers": 1,
+        "reason": None,
+        "decision": None,
+        "grant": None,
+        "cfa_registry": None,
+        "provider_window_stats": None,
+    }
+    if mode == "legacy":
+        info["reason"] = "requested_legacy_control"
+        return None, None, info, None
+    if source_context is None:
+        info["reason"] = "no_source_context_factory"
+        return None, None, info, None
+    if not isinstance(source_context, _CellSourceContext):
+        info["reason"] = "invalid_source_context"
+        return None, None, info, None
+
+    max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in tiles)
+    max_iw = zext._max_interior_width(tiles)
+    patch_hw = tuple(int(v) for v in patch.patch_shape_hw)
+    source_hw = (0, 0)
+    source_roi_hw = (0, 0)
+    for frame, bounds in source_context.planned:
+        source_hw = (
+            max(source_hw[0], int(frame.shape_hw[0])),
+            max(source_hw[1], int(frame.shape_hw[1])),
+        )
+        source_roi_hw = (
+            max(source_roi_hw[0], int(bounds.y1) - int(bounds.y0)),
+            max(source_roi_hw[1], int(bounds.x1) - int(bounds.x0)),
+        )
+    channels = int(getattr(provider, "channels", 3) or 3)
+    grant = zprep.preparation_grant_components(
+        patch_hw=patch_hw,
+        tile_hw=(int(max_th), int(max_tw)),
+        source_hw=source_hw if source_hw[0] > 0 else patch_hw,
+        channels=channels,
+        n_frames=int(provider.n_frames),
+        source_roi_hw=(
+            source_roi_hw if source_roi_hw[0] > 0 else None
+        ),
+    )
+    committed = None
+    try:
+        committed = int(zext.external_cell_host_components(
+            n_frames=int(provider.n_frames),
+            patch_hw=patch_hw,
+            tile_hw=(int(max_th), int(max_tw)),
+            interior_hw=(int(max_ih), int(max_iw)),
+            channels=channels,
+            column_batch=int(column_batch),
+            rejection_sink=True,
+        )["persistent_result_bytes"])
+    except Exception:  # noqa: BLE001 - FAIL CLOSED: committed is NOT zero
+        committed = None
+    available = None
+    probe_source = None
+    try:
+        observation = zrec.default_capacity_probe()
+        available = int(observation["raw_available_bytes"])
+        probe_source = str(observation.get("source"))
+    except Exception:  # noqa: BLE001 - unknown probe => sequential, explicitly
+        available = None
+    decision = zprep.decide_preparation_pipeline(
+        requested_mode="auto",
+        available_bytes=available,
+        producer_grant_bytes=int(grant["peak_bytes"]),
+        existing_commitment_bytes=committed,
+        producers=2,
+        unqualified_terms=grant.get("unqualified_terms", ()),
+        empirical_terms=grant.get("empirical_terms", ()),
+    )
+    decision["available_probe_source"] = probe_source
+    info["decision"] = decision
+    info["grant"] = grant
+    info["reason"] = decision["reason"]
+    info["effective_mode"] = decision["effective_mode"]
+    info["producers"] = int(decision["effective_producers"])
+    if decision["effective_mode"] != "auto":
+        return None, None, info, None
+
+    def _gate():
+        """Revalidate at a tile boundary with known domains + live probe.
+
+        No new provider is opened before this succeeds. The caller makes a
+        non-auto result STICKY for the remaining tiles (sequential writer,
+        identical science/spool).
+        """
+        gate_available = None
+        try:
+            gate_available = int(zrec.default_capacity_probe()[
+                "raw_available_bytes"
+            ])
+        except Exception:  # noqa: BLE001 - unknown => legacy, fail closed
+            gate_available = None
+        return zprep.decide_preparation_pipeline(
+            requested_mode="auto",
+            available_bytes=gate_available,
+            producer_grant_bytes=int(grant["peak_bytes"]),
+            existing_commitment_bytes=committed,
+            producers=int(decision["effective_producers"]),
+            unqualified_terms=grant.get("unqualified_terms", ()),
+            empirical_terms=grant.get("empirical_terms", ()),
+        )
+
+    registry = zprep.CfaMinMaxRegistry()
+    provider_window_stats: list = []
+    factory = source_context.pipeline_provider_factory(
+        cfa_registry=registry, provider_stats=provider_window_stats,
+    )
+    budget = {
+        "producer_grant_bytes": int(grant["peak_bytes"]),
+        "producers": int(decision["effective_producers"]),
+        "drain_timeout_s": 5.0,
+        "effective_mode": "auto",
+        "reason": decision["reason"],
+    }
+    info["cfa_registry"] = registry
+    info["provider_window_stats"] = provider_window_stats
+    _emit(
+        "ZeGrid: M33 preparation pipeline AUTO "
+        f"({decision['effective_producers']} producers, grant "
+        f"{int(grant['peak_bytes'])} B each, available {available} B, "
+        f"committed {committed} B); selector {_M33_PREP_ENV}",
+        lvl="INFO",
+    )
+    return factory, budget, info, _gate
+
+
+def _aggregate_provider_window_stats(entries) -> dict:
+    totals: dict = {}
+    for entry in entries or ():
+        if hasattr(entry, "window_telemetry"):
+            try:
+                entry = entry.window_telemetry()
+            except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+                continue
+        if not isinstance(entry, dict):
+            continue
+        for key, value in entry.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            totals[key] = totals.get(key, 0) + value
+    return totals
+
+
 def _run_cell_external(
     cache_dir, patch, config, progress_callback, tile_size, column_batch,
     spool_root, fixed=None, storage_profile=None, storage_info=None,
@@ -4007,6 +4279,8 @@ def _run_cell_external(
     # may carry such a value. Only un-interpretable values (< 1) are refused,
     # by ``_select_external_fallback`` (``frozen_batch_invalid``).
     _batch_truth = None
+    _tiles = None
+    _max_th = _max_tw = 0
     try:
         _tiles, _max_th, _max_tw = zext._tile_geometry(
             int(patch.patch.height), int(patch.patch.width),
@@ -4059,6 +4333,38 @@ def _run_cell_external(
         spool_info = {}
         gpu_fallback = {}
 
+        # ZM-M33-PREP-PIPELINE: resolve the internal comparison selector ONCE
+        # per cell, before any allocation/submission. Legacy keeps the exact
+        # historical call shape (the factory keywords are simply absent).
+        _prep_factory = None
+        _prep_budget = None
+        _prep_info = None
+        _prep_gate = None
+        if _tiles:
+            _prep_factory, _prep_budget, _prep_info, _prep_gate = (
+                _resolve_m33_preparation_pipeline(
+                    source_context=(
+                        source_context if zsp.is_bounded(_profile) else None
+                    ),
+                    provider=provider,
+                    tiles=_tiles,
+                    max_th=_max_th,
+                    max_tw=_max_tw,
+                    patch=patch,
+                    column_batch=_executed_batch,
+                )
+            )
+            if _prep_factory is not None:
+                # The base provider serves phase 1 only; per-tile producers read
+                # their own source windows. An all-frames decoded cache here
+                # would duplicate the largest term the grant already excludes.
+                _cache = getattr(provider, "source_frame_cache", None)
+                if _cache is not None:
+                    try:
+                        _cache.disable_and_release()
+                    except Exception:  # noqa: BLE001 - telemetry-only cache
+                        pass
+
         # ZM-CELL-LIVE-OBS: bounded tile/block live progress for THIS cell. The
         # fields are plain scalars; the writer owns the rate limit and swallows
         # every failure, so this can never change the reduction.
@@ -4105,6 +4411,11 @@ def _run_cell_external(
                 memory_probe=(
                     _mem_tracker.mark if _mem_tracker is not None else None
                 ),
+                **({
+                    "provider_factory": _prep_factory,
+                    "preparation_budget": _prep_budget,
+                    "preparation_gate": _prep_gate,
+                } if _prep_factory is not None else {}),
             )
         finally:
             if _mem_tracker is not None:
@@ -4114,6 +4425,31 @@ def _run_cell_external(
                 except Exception:  # noqa: BLE001 - telemetry only
                     _mem_components = None
         if storage_info is not None:
+            _prep_window = (
+                _aggregate_provider_window_stats(
+                    _prep_info.get("provider_window_stats")
+                ) if _prep_info is not None else None
+            )
+            # ZM-M33-PREP-PIPELINE: in AUTO the tiles are prepared by the
+            # per-tile producers, so the BASE provider's counters stay zero.
+            # Publish the SUMMED real counters instead of a misleading "0".
+            _base_window = (
+                provider.window_telemetry()
+                if isinstance(provider, zfp.WindowedCanonicalProvider)
+                else None
+            )
+            _source_window = None
+            if _base_window is not None:
+                _source_window = dict(_base_window)
+                for _k, _v in (_prep_window or {}).items():
+                    if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+                        continue
+                    _source_window[_k] = _source_window.get(_k, 0) + _v
+            _extra_prepared = int((_prep_window or {}).get("prepared_count", 0))
+            _extra_bytes = int(
+                (_prep_window or {}).get("prepared_aligned_bytes", 0)
+            )
+            _base_bytes = getattr(provider, "bytes_read", None)
             storage_info.update({
                 "profile": _profile,
                 "model": zsp.storage_model_id(_profile),
@@ -4121,12 +4457,15 @@ def _run_cell_external(
                 "provider_storage_domain": getattr(
                     provider, "storage_domain", None
                 ),
-                "bytes_read": getattr(provider, "bytes_read", None),
+                "bytes_read": (
+                    None if _base_bytes is None
+                    else int(_base_bytes) + _extra_bytes
+                ),
                 **({
-                    "prepared_count": provider.prepared_count,
+                    "prepared_count": int(provider.prepared_count) + _extra_prepared,
                     "bytes_read_semantics": "prepared_aligned_bytes_not_source_io",
                     # ZM-M33 lot 1: honest windowed-source proof counters.
-                    "source_window": provider.window_telemetry(),
+                    "source_window": _source_window,
                 } if isinstance(provider, zfp.WindowedCanonicalProvider) else {}),
                 "open_count": getattr(provider, "open_count", None),
                 "open_failures": getattr(provider, "open_failures", None),
@@ -4168,6 +4507,33 @@ def _run_cell_external(
                     "rejection_mask_available": (
                         result.rejection_mask is not None
                     ),
+                    # ZM-M33-PREP-PIPELINE: effective mode, fallback reason,
+                    # grant, byte credits and REAL prescan/provider counters.
+                    # Object handles (factory/registry) are never published.
+                    **({
+                        "preparation_pipeline": {
+                            **{
+                                k: v for k, v in _prep_info.items()
+                                if k not in ("cfa_registry",
+                                             "provider_window_stats")
+                            },
+                            "provider_window_stats": (
+                                _aggregate_provider_window_stats(
+                                    _prep_info.get("provider_window_stats")
+                                )
+                            ),
+                            "cfa_registry_stats": (
+                                _prep_info["cfa_registry"].stats()
+                                if _prep_info.get("cfa_registry") is not None
+                                else None
+                            ),
+                            # Real execution counters from the tile loop (the
+                            # selection block above is the admission decision).
+                            "runtime": dict(
+                                spool_info.get("preparation_pipeline") or {}
+                            ),
+                        }
+                    } if _prep_info is not None else {}),
                 },
                 "external_spool": dict(spool_info),
                 # ZM-ZEGRID-PEAK-ATTRIBUTION: owned vs file-backed peaks per
@@ -5174,6 +5540,12 @@ def _live_progress(fields) -> None:
             tile_total=fields.get("tile_total"),
             block_current=fields.get("block_current"),
             block_total=fields.get("block_total"),
+            frame_current=fields.get("frame_current"),
+            frame_total=fields.get("frame_total"),
+            frame_prepared=fields.get("frame_prepared"),
+            bytes_reserved=fields.get("bytes_reserved"),
+            bytes_peak=fields.get("bytes_peak"),
+            producers_effective=fields.get("producers_effective"),
             elapsed_s=fields.get("elapsed_s"),
             force=bool(fields.get("force")),
         )

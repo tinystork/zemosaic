@@ -873,6 +873,7 @@ class WindowedCanonicalProvider:
     def __init__(
         self, prepare, n_frames, *, frame_ids=None, expected_hw=None,
         prepare_window=None, expected_channels=None, window_stats=None,
+        source_frame_cache=None,
     ):
         self._prepare = prepare
         # ZM-M33 lot 1: optional WINDOWED preparation. ``prepare_window(i, y0,
@@ -882,6 +883,9 @@ class WindowedCanonicalProvider:
         self._prepare_window = prepare_window
         # Caller-owned mutable counters (decoded/reprojected source pixels).
         self._window_stats = window_stats
+        # ZM-M33-PREP-PIPELINE: optional decoded-frame cache handle. The mode
+        # can disable/release it when per-tile producers own the source reads.
+        self.source_frame_cache = source_frame_cache
         self.n_frames = int(n_frames)
         if self.n_frames < 0:
             raise CanonicalStackValidationError("n_frames must be >= 0")

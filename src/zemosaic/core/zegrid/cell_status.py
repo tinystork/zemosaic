@@ -347,7 +347,9 @@ class LiveTelemetryWriter:
 
     def progress(self, phase: str, *, tile_current=None, tile_total=None,
                  block_current=None, block_total=None, elapsed_s=None,
-                 force: bool = False) -> bool:
+                 frame_current=None, frame_total=None, frame_prepared=None,
+                 bytes_reserved=None, bytes_peak=None,
+                 producers_effective=None, force: bool = False) -> bool:
         """Write ONE coalesced progress sample (no image, no dtype, no array)."""
         now = self._clock()
         key = (
@@ -356,6 +358,11 @@ class LiveTelemetryWriter:
             None if tile_total is None else int(tile_total),
             None if block_current is None else int(block_current),
             None if block_total is None else int(block_total),
+            None if frame_current is None else int(frame_current),
+            None if frame_prepared is None else int(frame_prepared),
+            None if bytes_reserved is None else int(bytes_reserved),
+            None if bytes_peak is None else int(bytes_peak),
+            None if producers_effective is None else int(producers_effective),
         )
         if not force:
             if key == self._last_progress_key:
@@ -374,6 +381,20 @@ class LiveTelemetryWriter:
             payload["tile"] = [int(tile_current), int(tile_total or 0)]
         if block_current is not None:
             payload["block"] = [int(block_current), int(block_total or 0)]
+        if frame_current is not None:
+            payload["frame"] = [int(frame_current), int(frame_total or 0)]
+        if frame_current is not None:
+            payload["frame_current"] = int(frame_current)
+        if frame_total is not None:
+            payload["frame_total"] = int(frame_total)
+        if frame_prepared is not None:
+            payload["frame_prepared"] = int(frame_prepared)
+        if bytes_reserved is not None:
+            payload["bytes_reserved"] = int(bytes_reserved)
+        if bytes_peak is not None:
+            payload["bytes_peak"] = int(bytes_peak)
+        if producers_effective is not None:
+            payload["producers_effective"] = int(producers_effective)
         if elapsed_s is not None:
             payload["elapsed_s"] = round(float(elapsed_s), 3)
         if not self._write(payload):
@@ -467,6 +488,9 @@ class LiveCellStates:
 
     def note_progress(self, cell_id, *, phase=None, tile_current=None,
                       tile_total=None, block_current=None, block_total=None,
+                      frame_current=None, frame_total=None,
+                      frame_prepared=None, bytes_reserved=None,
+                      bytes_peak=None, producers_effective=None,
                       elapsed_s=None, observed_at=None) -> bool:
         """Attach the latest PROGRESS facts without changing the state.
 
@@ -477,25 +501,55 @@ class LiveCellStates:
         phase or the tile really changes.
         """
         cid = str(cell_id)
+        # Counters that describe the CURRENT write phase/sample. They must not
+        # survive a phase or tile transition (a reduce phase has no producer,
+        # and a sticky-fallback tile runs legacy with ONE producer).
+        progress_keys = (
+            "frame", "frame_current", "frame_total", "frame_prepared",
+            "bytes_reserved", "bytes_peak", "producers_effective",
+        )
         with self._lock:
             current = self._states.get(cid)
             if current in (None, QUEUED, COMMITTED, FAILED, CANCELLED):
                 return False
             entry = self._detail.setdefault(cid, {})
+            phase_changed = False
             if phase is not None:
                 new_phase = str(phase)
-                if entry.get("phase") != new_phase:
-                    # A new phase invalidates the previous block counter.
+                phase_changed = entry.get("phase") != new_phase
+                if phase_changed:
+                    # A new phase invalidates the previous block counter and
+                    # every per-write progress counter.
                     entry["block"] = None
+                    for key in progress_keys:
+                        entry.pop(key, None)
                 entry["phase"] = new_phase
+            tile_changed = False
             if tile_current is not None:
                 new_tile = [int(tile_current), int(tile_total or 0)]
-                if entry.get("tile") != new_tile:
-                    # A new tile invalidates the previous tile's block counter.
+                tile_changed = entry.get("tile") != new_tile
+                if tile_changed:
+                    # A new tile invalidates the previous tile's block counter
+                    # and every per-write progress counter.
                     entry["block"] = None
+                    for key in progress_keys:
+                        entry.pop(key, None)
                 entry["tile"] = new_tile
             if block_current is not None:
                 entry["block"] = [int(block_current), int(block_total or 0)]
+            if frame_current is not None:
+                entry["frame"] = [int(frame_current), int(frame_total or 0)]
+                entry["frame_current"] = int(frame_current)
+                if frame_total is not None:
+                    entry["frame_total"] = int(frame_total)
+            if frame_prepared is not None:
+                entry["frame_prepared"] = int(frame_prepared)
+            if bytes_reserved is not None:
+                entry["bytes_reserved"] = int(bytes_reserved)
+            if bytes_peak is not None:
+                entry["bytes_peak"] = int(bytes_peak)
+            if producers_effective is not None:
+                entry["producers_effective"] = int(producers_effective)
             if elapsed_s is not None:
                 entry["elapsed_s"] = float(elapsed_s)
             if observed_at is not None:
@@ -597,6 +651,18 @@ def live_cell_line(row: dict) -> str:
     block = row.get("block")
     if block:
         parts.append(f"block={int(block[0])}/{int(block[1])}")
+    frame = row.get("frame")
+    if frame:
+        parts.append(f"frame={int(frame[0])}/{int(frame[1])}")
+    prepared = row.get("frame_prepared")
+    if prepared is not None:
+        parts.append(f"prepared={int(prepared)}")
+    reserved = row.get("bytes_reserved")
+    if reserved is not None:
+        parts.append(f"bytes_reserved={int(reserved)}")
+    producers = row.get("producers_effective")
+    if producers is not None:
+        parts.append(f"producers={int(producers)}")
     elapsed = row.get("elapsed_s")
     if elapsed is not None:
         parts.append(f"elapsed_s={float(elapsed):.1f}")
@@ -860,6 +926,7 @@ def apply_events(states: LiveCellStates, events: dict, *, now=None) -> list[dict
         if isinstance(event, dict):
             tile = event.get("tile") or None
             block = event.get("block") or None
+            frame = event.get("frame") or None
             states.note_progress(
                 cid,
                 phase=event.get("phase"),
@@ -869,6 +936,20 @@ def apply_events(states: LiveCellStates, events: dict, *, now=None) -> list[dict
                 tile_total=(tile[1] if tile else None),
                 block_current=(block[0] if block else None),
                 block_total=(block[1] if block else None),
+                frame_current=(
+                    event.get("frame_current")
+                    if event.get("frame_current") is not None
+                    else (frame[0] if frame else None)
+                ),
+                frame_total=(
+                    event.get("frame_total")
+                    if event.get("frame_total") is not None
+                    else (frame[1] if frame else None)
+                ),
+                frame_prepared=event.get("frame_prepared"),
+                bytes_reserved=event.get("bytes_reserved"),
+                bytes_peak=event.get("bytes_peak"),
+                producers_effective=event.get("producers_effective"),
                 elapsed_s=event.get("elapsed_s"),
                 observed_at=stamp,
             )
@@ -988,6 +1069,11 @@ class LiveReporter:
                         row.get("phase"),
                         tuple(row.get("tile") or ()),
                         tuple(row.get("block") or ()),
+                        tuple(row.get("frame") or ()),
+                        row.get("frame_prepared"),
+                        row.get("bytes_reserved"),
+                        row.get("bytes_peak"),
+                        row.get("producers_effective"),
                     )
                     if self._last_rows.get(cid) == key:
                         continue
