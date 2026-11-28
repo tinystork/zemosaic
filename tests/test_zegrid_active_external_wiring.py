@@ -15,6 +15,7 @@ These regressions exercise the REAL product seam:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from zemosaic import zemosaic_zegrid_mode as zz
 from zemosaic.core.zegrid import auto_layout as zal
 from zemosaic.core.zegrid import external_stream as xstream
 from zemosaic.core.zegrid import geometry as zg
+from zemosaic.core.zegrid import run_store as zrs
 from zemosaic.core.zegrid import parallel as zpar
 from zemosaic.core.zegrid import ram_contract as rcontract
 from zemosaic.core.zegrid import resource_envelope as renv
@@ -145,7 +147,7 @@ def _bundle(
     tmp_path, monkeypatch, *, stream_table=None, raw=2 * GIB,
     force_external=False, gauge_workers=None, cache_build_workers=None,
     pinned_layout=None, frozen_admission=None, free_bytes=100 * GIB,
-    descs=None, halo_px=None,
+    descs=None, halo_px=None, output_dir=None, checkpoint_run_id=None,
 ):
     monkeypatch.setattr(zz, "_STACK_STORAGE_PROFILE", "bounded")
     monkeypatch.setattr(zal, "FITTED_MEMORY_MODEL", _FakeModel(1 << 62))
@@ -172,6 +174,8 @@ def _bundle(
         max_refinement_rank=rank,
         frozen_admission=frozen_admission,
         halo_px=halo_px,
+        output_dir=None if output_dir is None else str(output_dir),
+        checkpoint_run_id=checkpoint_run_id,
     )
 
 
@@ -281,6 +285,45 @@ def test_external_bundle_survives_active_seam(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # 2. RAM bundle passes the preliminary planner but misses the ACTIVE margin.
 # ---------------------------------------------------------------------------
+
+def test_external_builder_propagates_source_binding_and_run_binding(
+    tmp_path, monkeypatch
+):
+    """Real builder -> external task info -> frozen run binding, no hand digest."""
+    inp = _write_e2e_corpus(tmp_path, frames=4, hw=40, halo=8)
+    descs, _rejected = zg.read_manifest(inp)
+    table = {int(t): 5 * GIB for t in zz.CPU_STREAMING_TILE_LADDER}
+    bundle = _bundle(
+        tmp_path, monkeypatch, stream_table=table, force_external=True,
+        descs=descs, halo_px=8, output_dir=tmp_path / "out",
+    )
+    assert bundle.chosen_mode == "external"
+    external_tasks = [
+        task for task in bundle.cell_tasks
+        if len(task) >= 8 and isinstance(task[7], dict)
+        and task[7].get("class") == zz.WORKING_SET_EXTERNAL
+    ]
+    assert external_tasks
+    info = external_tasks[0][7]
+    assert info["checkpoint_root"] is not None
+    binding = info["checkpoint_source_binding"]
+    assert isinstance(binding, dict) and binding["frames"]
+    row = binding["frames"][0]
+    content_sha, nbytes = zrs.content_sha256_file(descs[0].source_path)
+    assert row["content_sha256"] == content_sha
+    assert row["nbytes"] == nbytes
+    assert row["wcs_sha256"] == hashlib.sha256(
+        descs[0].wcs_header.encode("utf-8")
+    ).hexdigest()
+    assert binding["canvas"]["wcs_sha256"]
+
+    # The frozen run id is attached to the ALREADY-BUILT task payload, exactly
+    # as the product does after the durable store opens.
+    assert info["checkpoint_run_id"] is None
+    bound = zz._bind_tile_checkpoint_run([bundle], "run-frozen")
+    assert bound >= 1
+    assert info["checkpoint_run_id"] == "run-frozen"
+
 
 def test_ram_bundle_missing_active_margin_selects_external_same_identity(
     tmp_path, monkeypatch
@@ -550,6 +593,29 @@ def test_run_zegrid_mode_active_external_end_to_end(tmp_path, monkeypatch):
             "synthetic qualified VRAM decline (no physical GPU claim)",
         )
 
+    def _decline_external_gpu(selection, **_kwargs):
+        """ZM-M33 lot 3: the EXTERNAL bounded-block decline seam."""
+        return {
+            "schema": zz.zgex.GPU_EXTERNAL_SCHEMA,
+            "requested_backend": "gpu",
+            "selected_backend": "cpu",
+            "effective_backend": "cpu",
+            "admitted": False,
+            "reason": "vram_block_floor",
+            "detail": "synthetic external block decline (no physical GPU claim)",
+            "batch": {
+                "requested": int(selection.get("column_batch", 1)),
+                "selected": int(selection.get("column_batch", 1)),
+                "rows": None, "cols": None,
+                "positions": int(selection.get("column_batch", 1)),
+                "clamped": False,
+            },
+            "device": None,
+            "probe": {},
+            "owner": {},
+            "policy": {},
+        }
+
     with monkeypatch.context() as m:
         m.setattr(zz, "available_memory_bytes", lambda: 1536 * MIB)
         m.setattr(zz, "_estimate_streaming_bytes", lambda *a, **k: 6 * GIB)
@@ -570,6 +636,7 @@ def test_run_zegrid_mode_active_external_end_to_end(tmp_path, monkeypatch):
             ),
         )
         m.setattr(zz, "_r55_active_gpu_decide", _decline_gpu)
+        m.setattr(zz, "_external_gpu_admission", _decline_external_gpu)
         m.setattr(zz.zext, "run_cell_streaming_external", _spy)
         zz.run_zegrid_mode(
             str(inp), str(ext_out), zconfig=_e2e_config(),
@@ -621,6 +688,89 @@ def test_run_zegrid_mode_active_external_end_to_end(tmp_path, monkeypatch):
         for c in ext_manifest.get("cells", [])
     ]
     assert ext_cells_ids == ref_cells
+
+
+@pytest.mark.slow
+def test_external_run_persists_source_bound_checkpoint_manifest(
+    tmp_path, monkeypatch
+):
+    """Rework-2 boundary: real external run, no injected digest, manifest bound."""
+    inp = _write_e2e_corpus(tmp_path)
+    out = tmp_path / "ext-only"
+
+    calls = []
+    real_external = zz.zext.run_cell_streaming_external
+
+    def _spy(*args, **kwargs):
+        calls.append(kwargs.get("cell_id"))
+        # The product path must not be given a hand-made digest by this test.
+        assert kwargs.get("checkpoint_source_digest")
+        return real_external(*args, **kwargs)
+
+    def _decline_gpu(**_kwargs):
+        raise zz._R55GpuRefused(
+            zz.zgr.REASON_REFUSE_VRAM,
+            "synthetic qualified VRAM decline (no physical GPU claim)",
+        )
+
+    with monkeypatch.context() as m:
+        m.setattr(zz, "available_memory_bytes", lambda: 1536 * MIB)
+        m.setattr(zz, "_estimate_streaming_bytes", lambda *a, **k: 6 * GIB)
+        m.setattr(
+            zz, "_r55_resolve_gpu_probe",
+            lambda *_a, **_k: (
+                True,
+                "synthetic",
+                {
+                    "available": True,
+                    "device": "synthetic-gpu",
+                    "cupy_version": "n/a",
+                    "vram_total_bytes": 2 * GIB,
+                    "vram_free_bytes": 2 * GIB,
+                    "reason": None,
+                },
+                1 * GIB,
+            ),
+        )
+        m.setattr(zz, "_r55_active_gpu_decide", _decline_gpu)
+        m.setattr(zz.zext, "run_cell_streaming_external", _spy)
+        zz.run_zegrid_mode(
+            str(inp), str(out), zconfig=_e2e_config(),
+            storage_profile="bounded", use_gpu=True,
+            cell_gauge_mode="per_cell",
+        )
+
+    manifest = json.loads((out / "zegrid_manifest.json").read_text())
+    ext_cells = [c for c in manifest.get("cells", []) if c.get("storage")]
+    assert ext_cells and calls
+    persisted = set()
+    for path in sorted((out / ".zegrid-tile-checkpoints").glob("*/checkpoint.json")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        binding = record["sections"]["source_binding"]
+        assert binding["schema"] == "zemosaic-zegrid-tile-checkpoint-source-v1"
+        assert binding["digest"]
+        assert record["sections"]["execution"]["column_batch"] > 0
+        persisted.add(binding["digest"])
+    reported = {
+        cell["storage"]["tile_checkpoints"]["source_binding_digest"]
+        for cell in ext_cells
+        if (cell.get("storage") or {}).get("tile_checkpoints")
+    }
+    assert persisted and persisted <= reported
+
+    # Re-derive the frame-level proof from the ACTUAL corpus bytes + WCS.
+    descs, _rejected = zg.read_manifest(inp)
+    live_binding, reason = zz._checkpoint_source_binding(
+        descs, zg.build_canvas(descs)
+    )
+    assert reason is None and live_binding is not None
+    for row, desc in zip(live_binding["frames"], descs):
+        content_sha, nbytes = zrs.content_sha256_file(desc.source_path)
+        assert row["content_sha256"] == content_sha
+        assert row["nbytes"] == nbytes
+        assert row["wcs_sha256"] == hashlib.sha256(
+            desc.wcs_header.encode("utf-8")
+        ).hexdigest()
 
 
 @pytest.mark.slow
@@ -711,6 +861,30 @@ def test_run_zegrid_mode_auto_external_gpu_host_ram_declines_to_cpu(
             record={"gpu_host_bound_bytes_by_tile": {"128": 1375295488}},
         )
 
+    def _decline_external_gpu(selection, **_kwargs):
+        """ZM-M33 lot 3: the EXTERNAL bounded-block decline seam."""
+        return {
+            "schema": zz.zgex.GPU_EXTERNAL_SCHEMA,
+            "requested_backend": "gpu",
+            "selected_backend": "cpu",
+            "effective_backend": "cpu",
+            "admitted": False,
+            "reason": "vram_block_floor",
+            "detail": "synthetic external block decline (no physical GPU claim)",
+            "batch": {
+                "requested": int(selection.get("column_batch", 1)),
+                "selected": int(selection.get("column_batch", 1)),
+                "rows": None, "cols": None,
+                "positions": int(selection.get("column_batch", 1)),
+                "clamped": False,
+            },
+            "device": None,
+            "probe": {},
+            "owner": {},
+            "policy": {},
+        }
+
+
     messages = []
 
     def _cb(msg, _cur, lvl, **_kw):
@@ -738,6 +912,7 @@ def test_run_zegrid_mode_auto_external_gpu_host_ram_declines_to_cpu(
             ),
         )
         m.setattr(zz, "_r55_active_gpu_decide", _decline_host_ram)
+        m.setattr(zz, "_external_gpu_admission", _decline_external_gpu)
         m.setattr(zz, "_r55_active_decide", _cpu_decide)
         m.setattr(zz.zphot, "compute_global_gauge", _gauge_spy)
         m.setattr(zz.zext, "run_cell_streaming_external", _spy)
@@ -755,7 +930,7 @@ def test_run_zegrid_mode_auto_external_gpu_host_ram_declines_to_cpu(
     assert len(snap["transitions"]) == 1
     assert snap["transitions"][0]["from"] == "dense"
     assert snap["transitions"][0]["to"] == "bounded"
-    assert snap["transitions"][0]["phase"] == "plan_layout"
+    assert snap["transitions"][0]["phase"] == "plan_gpu_admission"
     assert snap["transitions"][0]["reason_code"] == (
         renv.REASON_REFUSE_HOST_RAM
     )
@@ -763,11 +938,11 @@ def test_run_zegrid_mode_auto_external_gpu_host_ram_declines_to_cpu(
     # ---- GPU requested on the INITIAL EXTERNAL bundle, refused before work ----
     assert len(gpu_attempts) == 1
     attempt = gpu_attempts[0]
-    assert attempt["profile"] == "bounded"
-    assert attempt["fallback_count"] == 1
-    assert attempt["working_set"] == zz.WORKING_SET_EXTERNAL
-    assert attempt["mode"] == "external"
-    assert attempt["gpu_used"] is False
+    # The DENSE resident-GPU attempt refused host RAM and consumed the ONE
+    # profile transition; the bounded external bundle then had its external
+    # block admission declined (no physical GPU claim).
+    assert attempt["profile"] == "dense"
+    assert attempt["fallback_count"] == 0
     assert attempt["gauge_calls_at_refusal"] == 0
 
     # NO second profile switch was requested or performed.
@@ -780,7 +955,7 @@ def test_run_zegrid_mode_auto_external_gpu_host_ram_declines_to_cpu(
     # The refusal is explicit, typed and ordered BEFORE the gauge.
     decline_idx = next(
         i for i, (_lvl, msg) in enumerate(messages)
-        if "ACTIVE GPU declined before the gauge/stack" in msg
+        if "external GPU not admitted" in msg
     )
     gauge_idx = next(
         i for i, (_lvl, msg) in enumerate(messages)
@@ -788,9 +963,9 @@ def test_run_zegrid_mode_auto_external_gpu_host_ram_declines_to_cpu(
     )
     assert decline_idx < gauge_idx
     assert any(
-        renv.REASON_REFUSE_HOST_RAM in msg
+        "vram_block_floor" in msg
         for _lvl, msg in messages
-        if "ACTIVE GPU declined before the gauge/stack" in msg
+        if "external GPU not admitted" in msg
     )
     assert gauge_calls == [1]
 
@@ -837,12 +1012,13 @@ def test_run_zegrid_mode_auto_external_gpu_host_ram_declines_to_cpu(
     assert gpu["effective"] is False
     assert gpu["actually_used"] is False
     assert gpu["final_backend"] == "cpu"
-    fallback = ext_manifest["r55_scheduler"]["gpu_fallback"]
-    assert fallback["reason_code"] == renv.REASON_REFUSE_HOST_RAM
+    fallback = gpu["pre_execution_fallback"]
+    assert fallback["reason"] == "vram_block_floor"
     assert fallback["working_set_class"] == zz.WORKING_SET_EXTERNAL
-    assert fallback["storage_profile"] == "bounded"
-    assert fallback["decline"] == "external_working_set_cpu_only"
-    assert fallback["stage"] == "admission"
+    # ZM-M33 lot 3: the external bounded-block admission record is published
+    # separately from the legacy resident-GPU decline.
+    assert gpu["external"]["admitted"] is False
+    assert gpu["external"]["reason"] == "vram_block_floor"
 
     # ---- same science/coverage as the RAM reference at the SAME config ----
     for name in ("mosaic_grid.fits", "mosaic_grid_coverage.fits"):

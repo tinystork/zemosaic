@@ -234,3 +234,50 @@ class BoundedCountingRejectionSink:
         self.blocks = int(snapshot["blocks"])
         self.max_write_bytes = int(snapshot["max_write_bytes"])
         self.max_block_bytes = int(snapshot["max_block_bytes"])
+
+    def restore_tile_delta(self, delta: dict) -> None:
+        """Restore ONE already reduced tile's exact contribution.
+
+        ZM-M33-TILE-CHECKPOINTS: a resumed external Cell must not replay the
+        rejection mask of a checkpointed tile. The additive counters are merged
+        once per canonical tile; the cumulative byte maxima are merged with
+        ``max`` so the published sink statistics stay identical to an
+        uninterrupted run. Unknown/negative values are refused so a corrupt
+        checkpoint can never invent counts.
+        """
+        self._check_open()
+        if not isinstance(delta, dict):
+            raise TypeError("restore_tile_delta expects a mapping")
+        additive = {}
+        for key in ("true_count", "written_cells", "writes", "blocks"):
+            value = delta.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(
+                    f"restore_tile_delta.{key} must be an integer, got {value!r}"
+                )
+            value = int(value)
+            if value < 0:
+                raise ValueError(
+                    f"restore_tile_delta.{key} must be >= 0, got {value}"
+                )
+            additive[key] = value
+        for key in ("max_write_bytes_after", "max_block_bytes_after"):
+            value = delta.get(key, 0)
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(
+                    f"restore_tile_delta.{key} must be an integer, got {value!r}"
+                )
+            if int(value) < 0:
+                raise ValueError(
+                    f"restore_tile_delta.{key} must be >= 0, got {value}"
+                )
+        self.true_count += additive["true_count"]
+        self.written_cells += additive["written_cells"]
+        self.writes += additive["writes"]
+        self.blocks += additive["blocks"]
+        self.max_write_bytes = max(
+            self.max_write_bytes, int(delta.get("max_write_bytes_after", 0))
+        )
+        self.max_block_bytes = max(
+            self.max_block_bytes, int(delta.get("max_block_bytes_after", 0))
+        )

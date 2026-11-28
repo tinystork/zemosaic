@@ -81,7 +81,9 @@ from zemosaic.core.canonical_streaming import (
     _validate_rejection_sink,
     finalize_streaming_result,
 )
-from zemosaic.core.zegrid.gpu import is_gpu_runtime_error
+from zemosaic.core.zegrid.gpu import is_gpu_runtime_error, probe_gpu_backend
+from zemosaic.core.zegrid import gpu_external as zgx
+from zemosaic.core.zegrid import tile_checkpoints as ztcp
 
 __all__ = [
     "SPOOL_SCHEMA",
@@ -2285,6 +2287,12 @@ def run_cell_streaming_external(
     preparation_budget: dict | None = None,
     preparation_gate=None,
     tile_gate=None,
+    checkpoint_root=None,
+    checkpoint_run_id=None,
+    checkpoint_source_digest=None,
+    checkpoint_policy: str = "recompute_corrupt",
+    checkpoint_out: dict | None = None,
+    gpu_probe=None,
 ) -> CanonicalStackResult:
     """External-working-set execution of ONE canonical request.
 
@@ -2304,6 +2312,14 @@ def run_cell_streaming_external(
     never with an image, mask or dtype. The CALLER owns the rate limit/coalescing
     (see :mod:`zemosaic.core.zegrid.cell_status`); every call is wrapped so a
     telemetry failure can never change a single scientific value.
+
+    ``checkpoint_root`` (ZM-M33 lot 2, default ``None`` = historical path)
+    enables durable completed-tile checkpoints in that explicit Cell directory.
+    Only the REDUCED interior planes are stored; reuse requires the exact frozen
+    identity (source order, request, gauge, backend, tile geometry). ``None``
+    keeps every current byte of behaviour unchanged. Checkpointing requires a
+    counting rejection sink (a dense ``(N,H,W,C)`` mask is refused explicitly)
+    and never stores the N-axis tile pool.
     """
     if not isinstance(request, CanonicalStackRequest):
         raise CanonicalStackValidationError(
@@ -2416,6 +2432,150 @@ def run_cell_streaming_external(
     _live({"phase": "phase1", "force": True})
     p1 = _fixed_phase1(provider, request, fixed)
 
+    # ZM-M33-TILE-CHECKPOINTS (lot 2): opt-in durable completed-tile reuse.
+    # ``checkpoint_root is None`` keeps the historical path byte-identical. The
+    # lock is deliberately opened LATER, after every result allocation and the
+    # spool constructor, so an allocation/MemoryError can never leak it.
+    _checkpoint_store = None
+    _checkpoint_tiles = []
+    _checkpoint_info: dict = {}
+    _backend_counts = {"gpu": 0, "cpu": 0}
+    _checkpoint_backend_counts = _backend_counts
+    _checkpoint_restored_sticky_cpu = False
+    # ZM-M33 lot 3 rework-1: the run-start probe may be old by the time the
+    # gauge finishes. The FIRST actual GPU reduction of EACH Cell revalidates
+    # the FROZEN block policy against the CURRENT free VRAM. A Cell that only
+    # reuses checkpoints never probes and never attempts a GPU allocation.
+    _device_point = {"done": False, "fallback": None}
+
+    def _current_probe() -> dict:
+        """Fresh device observation; a probe failure is an unknown decline."""
+        if isinstance(gpu_probe, dict):
+            return dict(gpu_probe)
+        try:
+            if callable(gpu_probe):
+                value = gpu_probe()
+            else:
+                value = probe_gpu_backend()
+        except Exception as exc:  # noqa: BLE001 - unknown => decline
+            return {
+                "available": False,
+                "reason": f"probe_error:{type(exc).__name__}",
+            }
+        return value if isinstance(value, dict) else {
+            "available": False, "reason": "probe_invalid"
+        }
+
+    def _publish_backend_progress() -> None:
+        """Persist backend provenance even if the Cell aborts mid-tiles."""
+        if gpu_fallback_out is None:
+            return
+        try:
+            gpu_fallback_out.update({
+                "fallback_count": len(gpu_fallback_tiles),
+                "fallback_tiles": list(gpu_fallback_tiles),
+                "requested_backend": str(token),
+                "effective_backend": str(effective_token),
+                "sticky_cpu": bool(
+                    str(token) == "gpu" and str(effective_token) == "cpu"
+                ),
+                "restored_sticky_cpu": bool(
+                    _checkpoint_restored_sticky_cpu
+                ),
+                "gpu_tiles": int(_backend_counts.get("gpu", 0)),
+                "cpu_tiles": int(_backend_counts.get("cpu", 0)),
+                "device_fallback": bool(_device_point["fallback"]),
+                "device_fallback_reason": (
+                    None if _device_point["fallback"] is None
+                    else str(_device_point["fallback"]["reason"])
+                ),
+                "device_fallback_tile": (
+                    None if _device_point["fallback"] is None
+                    else int(_device_point["fallback"]["tile"])
+                ),
+                "device_revalidation": (
+                    None if _device_point["fallback"] is None
+                    else dict(_device_point["fallback"]["record"])
+                ),
+            })
+        except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+            pass
+
+    def _publish_checkpoint_progress() -> None:
+        """Persist truthful checkpoint counters even if the Cell aborts."""
+        if checkpoint_out is None or _checkpoint_store is None:
+            return
+        try:
+            _checkpoint_info["reused_tiles"] = int(
+                _checkpoint_store.reused_tiles
+            )
+            _checkpoint_info["recomputed_tiles"] = int(
+                _checkpoint_store.recomputed_tiles
+            )
+            _checkpoint_info["corrupt_recomputed"] = int(
+                _checkpoint_store.corrupt_recomputed
+            )
+            _checkpoint_info["saved_tiles"] = int(
+                _checkpoint_store.saved_tiles
+            )
+            _checkpoint_info["write_failures"] = int(
+                _checkpoint_store.write_failures
+            )
+            _checkpoint_info["checkpointed_tiles"] = int(
+                _checkpoint_store.reused_tiles
+                + _checkpoint_store.saved_tiles
+            )
+            _checkpoint_info["not_checkpointed_tiles"] = max(
+                0,
+                int(_checkpoint_info.get("tile_total", 0))
+                - int(_checkpoint_info["checkpointed_tiles"]),
+            )
+            _checkpoint_info["requested_backend"] = str(token)
+            _checkpoint_info["effective_backend"] = str(effective_token)
+            _checkpoint_info["sticky_cpu"] = bool(
+                str(token) == "gpu" and str(effective_token) == "cpu"
+            )
+            _checkpoint_info["restored_sticky_cpu"] = bool(
+                _checkpoint_restored_sticky_cpu
+            )
+            _checkpoint_info["gpu_tiles"] = int(
+                _backend_counts.get("gpu", 0)
+            )
+            _checkpoint_info["cpu_tiles"] = int(
+                _backend_counts.get("cpu", 0)
+            )
+            _checkpoint_info["device_fallback"] = bool(
+                _device_point["fallback"]
+            )
+            _checkpoint_info["device_fallback_reason"] = (
+                None if _device_point["fallback"] is None
+                else str(_device_point["fallback"]["reason"])
+            )
+            checkpoint_out.update(_checkpoint_info)
+        except Exception:  # noqa: BLE001 - telemetry must never fail a cell
+            pass
+    if checkpoint_root is not None:
+        # Fail closed BEFORE any allocation/spool/lock. The lock itself is still
+        # opened only after the result planes and spool constructor.
+        if rejection_sink is None:
+            raise CanonicalStackValidationError(
+                "durable tile checkpoints require a counting rejection sink; "
+                "a dense (N,H,W,C) rejection mask cannot be reconstructed from "
+                "reduced checkpoints (no N-axis mask is ever archived)"
+            )
+        if str(token) not in ("cpu", "gpu"):
+            raise CanonicalStackValidationError(
+                "durable tile checkpoints require the canonical cpu or gpu "
+                f"backend; requested backend {token!r} is refused"
+            )
+        if not isinstance(checkpoint_source_digest, str) or not checkpoint_source_digest:
+            raise CanonicalStackValidationError(
+                "durable tile checkpoints require a strong frozen source "
+                "binding digest (pixels + WCS/transforms + canvas/patch + "
+                "mask/calibration); labels alone are not enough. Refusing "
+                "activation instead of silently reusing or disabling"
+            )
+
     science_c = np.empty((h, w, c), dtype=np.float32)
     weight_sum_c = np.zeros((h, w, c), dtype=np.float64)
     valid_mask_c = np.zeros((h, w, c), dtype=bool)
@@ -2495,6 +2655,22 @@ def run_cell_streaming_external(
             pass
 
     _tile_total = sum(1 for _ in _iter_tiles(h, w, tile_size))
+    # Frozen point-of-use geometry: the SAME resolved block the executor will
+    # pass to the reducer. Never adapted at revalidation time.
+    _po_ih, _po_iw, _po_positions = 1, 1, int(c)
+    if str(token) == "gpu":
+        _po_tiles, _po_max_th, _po_max_tw = _tile_geometry(
+            h, w, tile_size, halo
+        )
+        _po_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in _po_tiles)
+        _po_iw = _max_interior_width(_po_tiles)
+        _po_positions = int(
+            resolve_column_batch(
+                int(column_batch),
+                interior_hw=(int(_po_ih), int(_po_iw)),
+                channels=int(c),
+            )["batch_positions"]
+        )
 
     def _reduce_extra(tile_index: int) -> dict:
         """Reducer keywords for ONE tile, empty when no probe is armed.
@@ -2519,7 +2695,100 @@ def run_cell_streaming_external(
 
         return {"block_probe": _probe}
 
+    # ZM-M33-TILE-CHECKPOINTS (rework-1 H3): the lock is opened ONLY here,
+    # after every result allocation and the spool constructor. The main
+    # try/except/finally below owns it until the tile work and spool manifest
+    # are complete; a MemoryError/constructor/finalizer failure can never leak
+    # the lock into the next attempt.
     try:
+        if checkpoint_root is not None:
+            if rejection_sink is None:
+                raise CanonicalStackValidationError(
+                    "durable tile checkpoints require a counting rejection sink; "
+                    "a dense (N,H,W,C) rejection mask cannot be reconstructed from "
+                    "reduced checkpoints (no N-axis mask is ever archived)"
+                )
+            if str(token) not in ("cpu", "gpu"):
+                raise CanonicalStackValidationError(
+                    "durable tile checkpoints require the canonical cpu or gpu "
+                    f"backend; requested backend {token!r} is refused"
+                )
+            if not isinstance(checkpoint_source_digest, str) or not checkpoint_source_digest:
+                raise CanonicalStackValidationError(
+                    "durable tile checkpoints require a strong frozen source "
+                    "binding digest (pixels + WCS/transforms + canvas/patch + "
+                    "mask/calibration); labels alone are not enough. Refusing "
+                    "activation instead of silently reusing or disabling"
+                )
+            _cp_geom, _cp_max_th, _cp_max_tw = _tile_geometry(
+                h, w, tile_size, halo
+            )
+            _checkpoint_tiles = [
+                (int(y0), int(y1), int(x0), int(x1))
+                for (y0, y1, x0, x1, _th, _tw) in _cp_geom
+            ]
+            _cp_max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1) in _checkpoint_tiles)
+            _cp_max_iw = max(int(x1 - x0) for (_y0, _y1, x0, x1) in _checkpoint_tiles)
+            _cp_resolved_batch = resolve_column_batch(
+                int(column_batch), interior_hw=(_cp_max_ih, _cp_max_iw),
+                channels=c,
+            )
+            _cp_identity = ztcp.build_tile_identity(
+                provider=provider, request=request, p1=p1,
+                cell_id=str(cell_id), tile_size=tile_size, halo_px=int(halo),
+                tiles=_checkpoint_tiles, backend=str(token),
+                source_binding_digest=str(checkpoint_source_digest),
+                column_batch=int(column_batch),
+                resolved_batch=_cp_resolved_batch,
+            )
+            _checkpoint_store = ztcp.TileCheckpointStore(
+                ztcp.cell_directory(checkpoint_root, str(cell_id)),
+                identity=_cp_identity,
+                run_id=(None if checkpoint_run_id is None else str(checkpoint_run_id)),
+                policy=str(checkpoint_policy),
+                session_id=f"{cell_id}:{attempt_id}",
+            )
+            _checkpoint_store.open()
+            _checkpoint_info = {
+                "schema": "zemosaic-zegrid-tile-checkpoint-runtime-v1",
+                "root": str(_checkpoint_store.root),
+                "identity_digest": str(_cp_identity["identity_digest"]),
+                "source_binding_digest": str(checkpoint_source_digest),
+                "run_id": (
+                    None if checkpoint_run_id is None else str(checkpoint_run_id)
+                ),
+                "policy": str(checkpoint_policy),
+                "column_batch": int(column_batch),
+                "tile_total": int(len(_checkpoint_tiles)),
+                # ZM-M33 lot 3: requested vs per-tile EFFECTIVE backend. A GPU
+                # run whose reduction fell back to CPU is persisted truthfully;
+                # a resumed tile is never relabelled GPU.
+                "requested_backend": str(token),
+                "effective_backend": str(effective_token),
+                "sticky_cpu": False,
+                "restored_sticky_cpu": False,
+                "gpu_tiles": 0,
+                "cpu_tiles": 0,
+                "device_fallback": False,
+                "device_fallback_reason": None,
+                "reused_tiles": 0,
+                "recomputed_tiles": 0,
+                "corrupt_recomputed": 0,
+                "saved_tiles": 0,
+                "write_failures": 0,
+                "runtime_complete": False,
+                "durable_complete": False,
+            }
+            if checkpoint_out is not None:
+                checkpoint_out.update(_checkpoint_info)
+            logging.getLogger(__name__).info(
+                "ZeGrid: durable tile checkpoints armed for cell %s at %s "
+                "(identity %s, source %s, %d tile(s))",
+                cell_id, _checkpoint_store.root,
+                _cp_identity["identity_digest"][:16],
+                str(checkpoint_source_digest)[:16], len(_checkpoint_tiles),
+            )
+
         _phase_start("write")
         _pipeline_active = _prepare_pipeline is not None
         for _tile_index, (y0, y1, x0, x1) in enumerate(
@@ -2559,6 +2828,116 @@ def run_cell_streaming_external(
                 # Optional cooperative guard (witness/telemetry only). It can
                 # abort BETWEEN tiles; it never changes a scientific value.
                 tile_gate()
+            # Exact interior window of THIS tile (identical to the spool handle
+            # arithmetic; computed before the write so a reused tile needs no
+            # spool handle at all).
+            _ey0 = max(0, int(y0) - int(halo))
+            _ex0 = max(0, int(x0) - int(halo))
+            iy0 = int(y0 - _ey0)
+            ix0 = int(x0 - _ex0)
+            h_int = int(y1 - y0)
+            w_int = int(x1 - x0)
+            # ZM-M33-TILE-CHECKPOINTS: a validated completed tile is restored
+            # BEFORE any provider read / spool write / reduction. The logical
+            # Cell still uses the exact same frozen math and frame order.
+            if _checkpoint_store is not None:
+                try:
+                    _cp_tile = _checkpoint_store.load_tile(
+                        _tile_index, (y0, y1, x0, x1)
+                    )
+                except ztcp.TileCheckpointCorrupt as _cp_exc:
+                    if str(checkpoint_policy) == "refuse_corrupt":
+                        raise
+                    logging.getLogger(__name__).warning(
+                        "ZeGrid: corrupt tile checkpoint for cell %s tile %s "
+                        "(%s); recomputing ONLY this tile",
+                        cell_id, _tile_index, _cp_exc,
+                    )
+                    _checkpoint_store.corrupt_recomputed += 1
+                    _checkpoint_info["corrupt_recomputed"] = int(
+                        _checkpoint_info.get("corrupt_recomputed", 0)
+                    ) + 1
+                    _cp_tile = None
+                if _cp_tile is not None:
+                    # ZM-M33 lot 3: a persisted tile carries the backend that
+                    # REALLY produced it. A GPU-requested Cell must restore the
+                    # sticky CPU fallback from such a tile instead of resuming
+                    # it as a false GPU result. Verified historical GPU tiles
+                    # may still be restored after a CPU-recomputed hole; their
+                    # provenance is retained without enabling new GPU work.
+                    _cp_backend = _cp_tile.get("backend")
+                    if isinstance(_cp_backend, dict):
+                        _stored_req = str(
+                            _cp_backend.get("requested") or "cpu"
+                        )
+                        _stored_eff = str(
+                            _cp_backend.get("effective") or "cpu"
+                        )
+                        if _stored_req != str(token):
+                            raise ztcp.TileCheckpointIncompatible(
+                                "a stored tile was produced by requested "
+                                f"backend {_stored_req!r} but this attempt "
+                                f"requests {str(token)!r}; refusing to reuse "
+                                "a mixed-backend proof",
+                                reasons=[{
+                                    "section": "backend",
+                                    "stored": _stored_req,
+                                    "current": str(token),
+                                }],
+                            )
+                        if _stored_eff == "cpu" and gpu_active:
+                            gpu_active = False
+                            effective_token = "cpu"
+                            _checkpoint_restored_sticky_cpu = True
+                            _publish_backend_progress()
+                        # ZM-M33 lot 3 rework-2: a VALID historical GPU tile may
+                        # be restored after a CPU-recomputed hole (e.g. tile 1
+                        # was corrupt and recomputed on CPU, tiles 2..N are the
+                        # previous GPU checkpoints). Historical per-tile
+                        # provenance is distinct from the CURRENT sticky CPU
+                        # state: restore the verified tile, keep gpu_active
+                        # False for remaining NEW work, and never relabel it
+                        # CPU. Requested-backend mismatches and malformed
+                        # markers are still refused above.
+                        _checkpoint_backend_counts[_stored_eff] = (
+                            _checkpoint_backend_counts.get(_stored_eff, 0) + 1
+                        )
+                    else:
+                        # Legacy CPU checkpoints have no per-tile backend field;
+                        # the identity requested backend already proves CPU.
+                        _checkpoint_backend_counts["cpu"] += 1
+                    _cp_arrays = _cp_tile["arrays"]
+                    science_c[y0:y1, x0:x1] = _cp_arrays["science"]
+                    weight_sum_c[y0:y1, x0:x1] = _cp_arrays["weight_sum"]
+                    valid_mask_c[y0:y1, x0:x1] = _cp_arrays["valid_mask"]
+                    surviving_c[y0:y1, x0:x1] = _cp_arrays["surviving"]
+                    support_w1[y0:y1, x0:x1] = _cp_arrays["support_w1"]
+                    support_w2[y0:y1, x0:x1] = _cp_arrays["support_w2"]
+                    _cp_ctr = _cp_tile["counters"]
+                    iterations_used = max(
+                        iterations_used, int(_cp_ctr["tile_iters"])
+                    )
+                    initial_count += int(_cp_ctr["initial_count"])
+                    rejected_count += int(_cp_ctr["rejected_count"])
+                    low_n_count += int(_cp_ctr["low_n_count"])
+                    degenerate_count += int(_cp_ctr["degenerate_count"])
+                    executed_tiles.append(dict(_cp_tile["batch_geometry"]))
+                    if rejection_sink is not None:
+                        ztcp.apply_sink_delta(
+                            rejection_sink, _cp_tile.get("sink_delta")
+                        )
+                        rejection_sink.flush_batch()
+                    _checkpoint_store.reused_tiles += 1
+                    _checkpoint_info["reused_tiles"] = int(
+                        _checkpoint_info.get("reused_tiles", 0)
+                    ) + 1
+                    _publish_checkpoint_progress()
+                    _live({
+                        "phase": "reduce",
+                        "tile_current": _tile_index,
+                        "tile_total": _tile_total,
+                    })
+                    continue
             _write_progress = {
                 "phase": "write",
                 "tile_current": _tile_index,
@@ -2653,6 +3032,42 @@ def run_cell_streaming_external(
             })
             _tr = time.perf_counter()
             try:
+                # ZM-M33 lot 3 rework-2: the point-of-use revalidation happens
+                # HERE, AFTER the CPU spool write / producer join and
+                # IMMEDIATELY BEFORE the first actual GPU reduce branch. It is
+                # too late to change the write (already staged) and early
+                # enough to avoid ANY GPU allocation. A failure is a sticky CPU
+                # execution fallback for the remaining uncomputed tiles.
+                if gpu_active and not _device_point["done"]:
+                    _device_point["done"] = True
+                    _po_record = zgx.validate_external_gpu_point_of_use(
+                        probe=_current_probe(),
+                        n_frames=int(n),
+                        positions=int(_po_positions),
+                        interior_hw=(int(_po_ih), int(_po_iw)),
+                        channels=int(c),
+                    )
+                    if not bool(_po_record.get("ok")):
+                        gpu_active = False
+                        effective_token = "cpu"
+                        _device_point["fallback"] = {
+                            "tile": int(_tile_index),
+                            "reason": str(_po_record.get("reason")),
+                            "detail": str(_po_record.get("detail")),
+                            "record": dict(_po_record),
+                        }
+                        logging.getLogger(__name__).warning(
+                            "ZeGrid: external GPU point-of-use revalidation "
+                            "declined for cell %s tile %s (%s: %s); the "
+                            "already written staging tile is reduced on CPU "
+                            "and remaining uncomputed tiles execute on CPU "
+                            "with the FROZEN batch identity",
+                            cell_id, _tile_index,
+                            _po_record.get("reason"),
+                            _po_record.get("detail"),
+                        )
+                        _publish_backend_progress()
+                        _publish_checkpoint_progress()
                 if gpu_active:
                     try:
                         tile = reduce_spooled_tile(
@@ -2688,6 +3103,7 @@ def run_cell_streaming_external(
                             **_reduce_extra(_tile_index),
                         )
                         gpu_fallback_tiles.append((int(y0), int(x0)))
+                        _publish_backend_progress()
                 else:
                     tile = reduce_spooled_tile(
                         handle, p1, request,
@@ -2697,16 +3113,76 @@ def run_cell_streaming_external(
                         backend="cpu",
                         **_reduce_extra(_tile_index),
                     )
+                # ZM-M33-TILE-CHECKPOINTS: publish the REDUCED tile durably
+                # BEFORE the spool tile (its N-axis input) is discarded. A
+                # checkpoint write failure is logged, never fatal: it only
+                # loses this tile's future reuse, it can never forge a commit.
+                _tile_effective_backend = "gpu" if gpu_active else "cpu"
+                _backend_counts[_tile_effective_backend] = (
+                    _backend_counts.get(_tile_effective_backend, 0) + 1
+                )
+                _publish_backend_progress()
+                if _checkpoint_store is not None:
+                    _checkpoint_store.recomputed_tiles += 1
+                    _checkpoint_info["recomputed_tiles"] = int(
+                        _checkpoint_info.get("recomputed_tiles", 0)
+                    ) + 1
+                    try:
+                        _cp_delta = ztcp.sink_delta_between(
+                            sink_cp,
+                            (rejection_sink.checkpoint()
+                             if rejection_sink is not None else None),
+                        )
+                        _checkpoint_store.save_tile(
+                            _tile_index, (y0, y1, x0, x1),
+                            arrays=ztcp.interior_arrays(
+                                tile, iy0=iy0, ix0=ix0,
+                                h_int=h_int, w_int=w_int,
+                            ),
+                            interior_origin=(iy0, ix0),
+                            interior_shape=(h_int, w_int, c),
+                            extended_bounds=(
+                                _ey0, min(h, y1 + int(halo)),
+                                _ex0, min(w, x1 + int(halo)),
+                            ),
+                            counters={
+                                "tile_iters": int(tile["tile_iters"]),
+                                "initial_count": int(tile["initial_count"]),
+                                "rejected_count": int(tile["rejected_count"]),
+                                "low_n_count": int(tile["low_n_count"]),
+                                "degenerate_count": int(tile["degenerate_count"]),
+                            },
+                            batch_geometry=dict(tile.get("batch_geometry") or {}),
+                            sink_delta=_cp_delta,
+                            backend=(
+                                None
+                                if str(token) == "cpu"
+                                else {
+                                    "requested": str(token),
+                                    "effective": _tile_effective_backend,
+                                }
+                            ),
+                        )
+
+                    except Exception as _cp_write_exc:  # noqa: BLE001
+                        _checkpoint_store.write_failures += 1
+                        _checkpoint_info["write_failures"] = int(
+                            _checkpoint_info.get("write_failures", 0)
+                        ) + 1
+                        logging.getLogger(__name__).warning(
+                            "ZeGrid: could not checkpoint cell %s tile %s "
+                            "(%s: %s); keeping the reduced science, this tile "
+                            "will be recomputed on a future attempt",
+                            cell_id, _tile_index,
+                            type(_cp_write_exc).__name__, _cp_write_exc,
+                        )
+                    _publish_checkpoint_progress()
             finally:
                 spool.discard_tile(handle)
             _phase_acc["reduce"] += time.perf_counter() - _tr
             if rejection_sink is not None:
                 rejection_sink.flush_batch()
 
-            iy0 = int(handle.y0 - handle.ey0)
-            ix0 = int(handle.x0 - handle.ex0)
-            h_int = int(handle.y1 - handle.y0)
-            w_int = int(handle.x1 - handle.x0)
             science_c[y0:y1, x0:x1] = tile["science"][
                 iy0:iy0 + h_int, ix0:ix0 + w_int
             ]
@@ -2737,15 +3213,67 @@ def run_cell_streaming_external(
             # forced and nothing scientific is recomputed.
             del tile
 
+        if _checkpoint_store is not None:
+            _checkpoint_store.mark_cell_complete()
+            _checkpoint_info["runtime_complete"] = True
+            _checkpoint_info["durable_complete"] = False
+            _checkpoint_info["requested_backend"] = str(token)
+            _checkpoint_info["effective_backend"] = str(effective_token)
+            _checkpoint_info["sticky_cpu"] = bool(
+                str(token) == "gpu" and str(effective_token) == "cpu"
+            )
+            _checkpoint_info["restored_sticky_cpu"] = bool(
+                _checkpoint_restored_sticky_cpu
+            )
+            _checkpoint_info["gpu_tiles"] = int(
+                _checkpoint_backend_counts.get("gpu", 0)
+            )
+            _checkpoint_info["cpu_tiles"] = int(
+                _checkpoint_backend_counts.get("cpu", 0)
+            )
+            _checkpoint_info["device_fallback"] = bool(
+                _device_point["fallback"]
+            )
+            _checkpoint_info["device_fallback_reason"] = (
+                None if _device_point["fallback"] is None
+                else str(_device_point["fallback"]["reason"])
+            )
+            _checkpoint_info["reused_tiles"] = int(
+                _checkpoint_store.reused_tiles
+            )
+            _checkpoint_info["recomputed_tiles"] = int(
+                _checkpoint_store.recomputed_tiles
+            )
+            _checkpoint_info["corrupt_recomputed"] = int(
+                _checkpoint_store.corrupt_recomputed
+            )
+            _checkpoint_info["saved_tiles"] = int(
+                _checkpoint_store.saved_tiles
+            )
+            _checkpoint_info["write_failures"] = int(
+                _checkpoint_store.write_failures
+            )
+            _checkpoint_info["checkpointed_tiles"] = int(
+                _checkpoint_store.reused_tiles
+                + _checkpoint_store.saved_tiles
+            )
+            _checkpoint_info["not_checkpointed_tiles"] = max(
+                0,
+                int(_checkpoint_info["tile_total"])
+                - int(_checkpoint_info["checkpointed_tiles"]),
+            )
+            if checkpoint_out is not None:
+                checkpoint_out.update(_checkpoint_info)
+            # Release the single-writer lock BEFORE the parent's post-commit
+            # cleanup. The checkpoints themselves are NEVER deleted here: the
+            # final durable Cell commit is the only cleanup authority.
+            _checkpoint_store.close()
+
         spool.finalize_manifest(
             taper_kind=taper_kind, taper_px=taper_px, taper_floor=taper_floor
         )
         if gpu_fallback_out is not None:
-            gpu_fallback_out.update({
-                "fallback_count": len(gpu_fallback_tiles),
-                "fallback_tiles": list(gpu_fallback_tiles),
-                "requested_backend": str(token),
-            })
+            _publish_backend_progress()
         # M4: the attempt is READY (result computed) but NOT committed. The
         # caller commits the Cell durably first, then cleans it.
         spool.mark_ready()
@@ -2769,6 +3297,9 @@ def run_cell_streaming_external(
                 "bytes_written": int(payload),
                 "bytes_read": int(payload),
                 "tile_count": int(manifest.get("tile_count", 0)),
+                "tile_checkpoints": (
+                    dict(_checkpoint_info) if _checkpoint_store is not None else None
+                ),
                 "executed_batch": {
                     "schema": "zemosaic-zegrid-executed-batch-v1",
                     "requested_column_batch": int(column_batch),
@@ -2819,6 +3350,16 @@ def run_cell_streaming_external(
             except Exception:
                 pass
         raise
+    finally:
+        # ZM-M33-TILE-CHECKPOINTS (rework-1 H3): ONE unconditional lifecycle
+        # owner. Every exit (success, MemoryError, spool/contract error, manifest
+        #/finalizer error) releases the single-writer lock; the primary
+        # exception is never masked by a close failure.
+        if _checkpoint_store is not None:
+            try:
+                _checkpoint_store.close()
+            except Exception:  # noqa: BLE001 - never mask the primary failure
+                pass
 
     if cleanup_on_success and not keep_spool:
         spool.cleanup()

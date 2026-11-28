@@ -55,6 +55,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from . import run_store as zrs
 from . import run_resume as zres
+from . import tile_checkpoints as ztcp
 
 SCHEMA = "zemosaic.zegrid.run_publication.v1"
 POINTER_SCHEMA = "zemosaic.zegrid.run_publication_pointer.v1"
@@ -847,6 +848,17 @@ def detect_previous_publication(
     for entry in entries:
         name = entry.name
         if name in ignore:
+            continue
+        if name == ztcp.TILE_CHECKPOINT_DIRNAME:
+            # ZM-M33 rework-3: OWNERSHIP proof, never a name-only ignore. A
+            # strict valid plain root (valid manifests, no live owner) is OUR
+            # resumable residue and may be explicitly overwritten; a symlink,
+            # unknown entry, malformed/forged manifest or live owner stays
+            # foreign and the existing refusal protects it.
+            owned = ztcp.inspect_owned_checkpoint_root(entry)
+            if owned.get("owned"):
+                continue
+            foreign.append(name)
             continue
         if name in {
             "zegrid_manifest.json", "zegrid_run.log",

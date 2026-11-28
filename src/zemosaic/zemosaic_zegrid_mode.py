@@ -121,6 +121,7 @@ from .core.zegrid import file_provider as zfp
 from .core.zegrid import final_mosaic_finishing as zfin
 from .core.zegrid import geometry as zg
 from .core.zegrid import gpu as zgpu
+from .core.zegrid import gpu_external as zgex
 from .core.zegrid import gpu_readiness as zgr
 from .core.zegrid import storage_profile as zsp
 from .core.zegrid import rejection_sink as zrej
@@ -146,6 +147,7 @@ from .core.zegrid import vram_high_water as zvh
 from .core.zegrid import science_adapter as zs
 from .core.zegrid import streaming as zstream
 from .core.zegrid import external_stream as zext
+from .core.zegrid import tile_checkpoints as ztcp
 from .core.zegrid import prepare_pipeline as zprep
 from .core.zegrid import memory_peak as zmem
 from .core.zegrid import sweep as zsw
@@ -4235,6 +4237,9 @@ def _run_cell_external(
     cell_id="cell", attempt_id=None, required_free_bytes=None,
     owner_token=None, owner_record=None, owner_liveness=None,
     retain_for_commit=False, source_context=None, cache_budget_bytes=None,
+    checkpoint_root=None, checkpoint_run_id=None,
+    checkpoint_source_binding=None, checkpoint_source_digest=None,
+    backend=None, gpu_admission=None, device_probe=None,
 ):
     """Run ONE cell through the exact external working set (M2 primitive).
 
@@ -4321,6 +4326,17 @@ def _run_cell_external(
     sink = None
     try:
         request = zstream.build_streaming_request(config, provider.n_frames)
+        # ZM-M33 lot 3: the external contract OWNS the requested backend. The
+        # executor must never inherit a stale process-global backend (a GPU
+        # fallback or a resume may have changed it); the frozen task fact wins.
+        if backend is not None:
+            _backend_token = str(backend)
+            if _backend_token not in ("cpu", "gpu"):
+                raise CanonicalStackValidationError(
+                    "external task backend must be 'cpu' or 'gpu', got "
+                    f"{backend!r}"
+                )
+            request = replace(request, backend=_backend_token)
         sink = zrej.BoundedCountingRejectionSink(
             (provider.n_frames, provider.height, provider.width, provider.channels)
         )
@@ -4332,6 +4348,70 @@ def _run_cell_external(
         )
         spool_info = {}
         gpu_fallback = {}
+        checkpoint_info = {}
+        # ZM-M33-TILE-CHECKPOINTS (rework-1 H1/H4): bind the per-Cell patch to
+        # the frozen source content proof and gate the lot to the CPU path. A
+        # missing proof disables checkpointing with a LOUD reason; a non-CPU
+        # request never carries a checkpoint root (no fake GPU provenance).
+        _checkpoint_digest = checkpoint_source_digest
+        if (
+            checkpoint_root is not None
+            and _checkpoint_digest is None
+            and isinstance(checkpoint_source_binding, dict)
+        ):
+            _patch_wcs = getattr(patch, "patch_wcs_header", None)
+            if not isinstance(_patch_wcs, str) or not _patch_wcs.strip():
+                _emit(
+                    "ZeGrid: durable tile checkpoints DISABLED for cell "
+                    f"{cell_id} — the Cell patch exposes no serialized "
+                    "WCS/transform; refusing to hash an empty proof",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+                checkpoint_root = None
+            else:
+                _cp_binding = dict(checkpoint_source_binding)
+                _cp_binding["cell"] = {
+                    "cell_id": str(cell_id),
+                    "patch_wcs_sha256": hashlib.sha256(
+                        _patch_wcs.encode("utf-8")
+                    ).hexdigest(),
+                    "patch_shape_hw": [
+                        int(patch.patch.height), int(patch.patch.width)
+                    ],
+                    "halo_px": int(getattr(patch, "halo_px", 0) or 0),
+                    "bounds": [
+                        int(getattr(patch.patch, "x0", 0)),
+                        int(getattr(patch.patch, "y0", 0)),
+                        int(getattr(patch.patch, "x1", 0)),
+                        int(getattr(patch.patch, "y1", 0)),
+                    ],
+                }
+                _checkpoint_digest = ztcp.source_binding_digest(_cp_binding)
+        if checkpoint_root is not None:
+            _backend_req = str(
+                backend
+                if backend is not None
+                else getattr(config, "backend", "cpu")
+            )
+            if _checkpoint_digest is None:
+                _emit(
+                    "ZeGrid: durable tile checkpoints DISABLED for cell "
+                    f"{cell_id} — no frozen source binding proof is available; "
+                    "refusing silent label-only reuse",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+                checkpoint_root = None
+            elif _backend_req not in ("cpu", "gpu"):
+                _emit(
+                    "ZeGrid: durable tile checkpoints DISABLED for cell "
+                    f"{cell_id} — unknown backend {_backend_req!r}; only the "
+                    "canonical cpu/gpu backends can prove checkpoint identity",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+                checkpoint_root = None
 
         # ZM-M33-PREP-PIPELINE: resolve the internal comparison selector ONCE
         # per cell, before any allocation/submission. Legacy keeps the exact
@@ -4402,6 +4482,14 @@ def _run_cell_external(
                 owner_record=owner_record,
                 owner_liveness=owner_liveness,
                 gpu_fallback_out=gpu_fallback,
+                checkpoint_root=checkpoint_root,
+                checkpoint_run_id=checkpoint_run_id,
+                checkpoint_source_digest=_checkpoint_digest,
+                checkpoint_out=checkpoint_info,
+                # ZM-M33 lot 3 rework-1: fresh point-of-use device probe before
+                # the first ACTUAL GPU reduction of this Cell (never for a
+                # checkpoint-only reuse). Tests inject an explicit probe.
+                gpu_probe=device_probe,
                 # ZM-CELL-LIVE-OBS: the probe is armed ONLY when the wave driver
                 # wired telemetry, so an OFF run keeps the historical call shape
                 # (and allocates nothing per tile/block).
@@ -4504,6 +4592,39 @@ def _run_cell_external(
                         if _batch_truth is not None else False
                     ),
                     "spool_root": str(spool_root),
+                    # ZM-M33 lot 3: requested/selected/effective backend facts
+                    # from the EXECUTOR itself (per-tile sticky fallback is
+                    # aggregated there). Never inferred from the request alone.
+                    "backend": {
+                        "requested": str(
+                            gpu_fallback.get("requested_backend")
+                            or getattr(request, "backend", "cpu")
+                        ),
+                        "selected": str(
+                            (gpu_admission or {}).get("selected_backend")
+                            or getattr(request, "backend", "cpu")
+                        ),
+                        "effective": str(
+                            gpu_fallback.get("effective_backend")
+                            or getattr(request, "backend", "cpu")
+                        ),
+                        "sticky_cpu": bool(
+                            gpu_fallback.get("sticky_cpu", False)
+                        ),
+                        "restored_sticky_cpu": bool(
+                            gpu_fallback.get("restored_sticky_cpu", False)
+                        ),
+                        "gpu_tiles": int(gpu_fallback.get("gpu_tiles", 0)),
+                        "cpu_tiles": int(gpu_fallback.get("cpu_tiles", 0)),
+                        "fallback_tiles": list(
+                            gpu_fallback.get("fallback_tiles") or []
+                        ),
+                    },
+                    "gpu_admission": (
+                        None
+                        if not isinstance(gpu_admission, dict)
+                        else dict(gpu_admission)
+                    ),
                     "rejection_mask_available": (
                         result.rejection_mask is not None
                     ),
@@ -4536,6 +4657,9 @@ def _run_cell_external(
                     } if _prep_info is not None else {}),
                 },
                 "external_spool": dict(spool_info),
+                "tile_checkpoints": (
+                    dict(checkpoint_info) if checkpoint_info else None
+                ),
                 # ZM-ZEGRID-PEAK-ATTRIBUTION: owned vs file-backed peaks per
                 # phase (additive; None when the sampler is unavailable).
                 "memory_peak_components": (
@@ -6908,6 +7032,21 @@ def _prepare_stack_cell(task):
 _TILE_PREFETCH_ENV = "ZEMOSAIC_ZEGRID_TILE_PREFETCH"
 
 
+#: Internal A/B switch for durable completed-tile checkpoints (lot 2). DEFAULT
+#: ON for external Cells; ``off`` restores the historical discard-per-tile path.
+#: Never a GUI knob and never a science input.
+_TILE_CHECKPOINT_ENV = "ZEMOSAIC_ZEGRID_TILE_CHECKPOINTS"
+#: Parent-owned, persistent checkpoint root (outside the temporary cache root,
+#: which is pruned during the run).
+_TILE_CHECKPOINT_DIRNAME = ztcp.TILE_CHECKPOINT_DIRNAME
+
+
+def _tile_checkpoints_requested() -> bool:
+    """Internal run-scoped opt-in (default ON) for external tile checkpoints."""
+    token = os.environ.get(_TILE_CHECKPOINT_ENV, "on").strip().lower()
+    return token not in ("0", "off", "false", "no")
+
+
 def _gpu_tile_prefetch_request():
     """Normalized GPU prefetch request from the internal env switch."""
     token = os.environ.get(_TILE_PREFETCH_ENV, "auto").strip().lower()
@@ -7030,6 +7169,16 @@ def _consume_stack_cell(prepared, *, tile_size=None):
             owner_record=_ext.get("owner_record"),
             retain_for_commit=bool(_EXTERNAL_RETAIN_FOR_COMMIT),
             cache_budget_bytes=int(_ext.get("cache_budget_bytes") or 0),
+            checkpoint_root=_ext.get("checkpoint_root"),
+            checkpoint_run_id=_ext.get("checkpoint_run_id"),
+            checkpoint_source_binding=_ext.get("checkpoint_source_binding"),
+            backend=_ext.get("backend"),
+            gpu_admission=_ext.get("gpu"),
+            device_probe=(
+                zgpu.probe_gpu_backend
+                if str(_ext.get("backend") or "") == "gpu"
+                else None
+            ),
             **source_kwargs,
         )
     elif mode == "inmem":
@@ -7143,6 +7292,18 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         _STACK_GLOBAL_REF, cell_frame_ids, sres.reference_frame_id,
         per_cell=(cell_gauge_mode == zphot.CELL_GAUGE_MODE_PER_CELL),
     )
+    # ZM-M33 lot 3: the per-Cell backend evidence is the EXTERNAL executor's
+    # effective backend when this is an external Cell (a GPU cell that fell back
+    # must never be recorded as a GPU success). Non-external Cells keep the
+    # historical process-global backend fact byte-for-byte.
+    _record_backend = getattr(_STACK_CONFIG, "backend", "cpu")
+    _external_backend_block = None
+    if mode == "external":
+        _external_backend_block = dict(
+            (storage_info.get("external") or {}).get("backend") or {}
+        )
+        if _external_backend_block.get("effective"):
+            _record_backend = str(_external_backend_block["effective"])
     record = {
         **(
             {"percell_tile_px": int(tile_size)}
@@ -7155,7 +7316,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
         "patch_bounds": patch_bounds,
         "patch_shape_hw": patch_shape_hw,
         "cell_gauge_mode": cell_gauge_mode,
-        "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
+        "backend_used": _record_backend,
         "reference_frame_id": sres.reference_frame_id,
         "reference_frame_role": prov["reference_frame_role"],
         "bookkeeping_reference_frame_id": prov["bookkeeping_reference_frame_id"],
@@ -7211,6 +7372,11 @@ def _consume_stack_cell(prepared, *, tile_size=None):
                 ) or None
             ),
             "spool_root": str((external_info or {}).get("spool_root")),
+            "backend": (
+                None
+                if _external_backend_block is None
+                else dict(_external_backend_block)
+            ),
         }
         # The external Cell's headline memory number must name its process and
         # its provenance, so a reader can never mistake the coordinator's RSS
@@ -7314,7 +7480,7 @@ def _consume_stack_cell(prepared, *, tile_size=None):
 
     result = {
         "cell_id": cid, "status": "complete", "core": core, "record": record,
-        "backend_used": getattr(_STACK_CONFIG, "backend", "cpu"),
+        "backend_used": _record_backend,
         "n_frames": int(manifest.get("n_frames", 0)),
         "total_bytes": int(manifest.get("total_bytes", 0)),
         "cache_build_s": cache_build_s, "stack_s": stack_s,
@@ -7856,6 +8022,9 @@ def _manifest_gpu_block(gpu_used, gpu_context=None) -> dict:
         "engine_provenance": ctx.get("engine_provenance"),
         "fallback_reason": ctx.get("fallback_reason"),
         "runtime_fallback": ctx.get("runtime_fallback"),
+        # ZM-M33 lot 3: the external bounded-block admission (requested /
+        # selected / effective / reason / batch / device model / probe).
+        "external": ctx.get("external"),
         # ZM-ZEGRID-R36 (F2): a GPU selected at start but RAM-infeasible is caught
         # BEFORE execution and degraded to exact CPU (recorded, never hidden).
         "pre_execution_fallback": ctx.get("pre_execution_fallback"),
@@ -8381,6 +8550,10 @@ class ExecutionBundle:
     # parity evidence). It is the truthful source of the durable admission's
     # ``parity_qualified`` flag; it is never inferred from hardware presence.
     gpu_parity_qualified: bool = False
+    # ZM-M33 lot 3: the external GPU admission record (requested/selected/
+    # effective/reason/batch/device model/probe). ``None`` on every non-external
+    # bundle; never inferred from hardware presence.
+    external_gpu: dict | None = None
 
 
 def _r55_margin_raw_ceiling(
@@ -9143,6 +9316,172 @@ def _select_external_fallback(
     }
 
 
+def _reprice_external_selection_batch(selection, *, batch: int) -> dict | None:
+    """Re-price ONE external selection at a SMALLER (staging) batch.
+
+    The external batch is a staging parameter, never a science parameter, so a
+    GPU device block may only SHRINK the batch the host admission already
+    accepted. The host peak is re-derived with the SAME
+    :func:`external_stream.estimate_external_working_set` model the selector
+    used, and the operation is refused (``None``) if the re-priced host peak
+    would exceed the already-admitted phase budget. No tile, spool, identity,
+    science or disk-envelope fact is changed.
+    """
+    batch = int(batch)
+    if batch < 1:
+        return None
+    pricing = selection.get("pricing") or {}
+    geometry = pricing.get("geometry") or {}
+    if not geometry:
+        return None
+    repriced = zext.estimate_external_working_set(
+        n_frames=int(geometry["n_frames"]),
+        height=int(geometry["height"]),
+        width=int(geometry["width"]),
+        channels=int(geometry["channels"]),
+        tile_size=int(selection["tile"]),
+        halo_px=int(geometry["halo_px"]),
+        column_batch=int(batch),
+        equalize_rgb=bool(selection["equalize_rgb"]),
+        rejection=str(selection["rejection"]),
+        combine=str(selection["combine"]),
+    )
+    host = repriced["host"]
+    if int(host["peak_bytes"]) > int(selection["phase_budget_bytes"]):
+        return None
+    old_batch = int(selection["column_batch"])
+    selection["column_batch"] = int(batch)
+    selection["requested_column_batch"] = int(host["requested_column_batch"])
+    selection["effective_column_batch"] = int(host["effective_column_batch"])
+    selection["column_batch_clamped"] = bool(host["column_batch_clamped"])
+    selection["executed_rows_per_batch"] = int(host["rows_per_batch"])
+    selection["executed_cols_per_batch"] = int(host["cols_per_batch"])
+    selection["executed_column_batch"] = int(host["effective_column_batch"])
+    selection["pricing"] = repriced
+    selection["host_peak_bytes"] = int(host["peak_bytes"])
+    selection["host_components"] = dict(host)
+    selection["host_fixed_bytes"] = int(host["fixed_peak_bytes"])
+    selection["reduction_workspace_bytes"] = int(
+        repriced["ram"]["reduction_workspace_bytes"]
+    )
+    selection["residual_batch_budget_bytes"] = int(
+        int(selection["phase_budget_bytes"]) - int(host["reduce_fixed_bytes"])
+    )
+    _pb = dict(selection.get("phase_budgets") or {})
+    if _pb:
+        selection["phase_budgets"] = _external_phase_budget_block(
+            budget_domain=str(selection["budget_domain"]),
+            plan_budget_bytes=int(_pb["plan_budget_bytes"]),
+            margin_num=int(_pb["margin_num"]),
+            margin_den=int(_pb["margin_den"]),
+            effective_phase_budget=int(selection["phase_budget_bytes"]),
+            charged_baseline_bytes=int(
+                _pb["process_baseline_charged_bytes"]
+            ),
+            charged_assembly_bytes=int(
+                _pb["assembly_reserve_charged_bytes"]
+            ),
+            assembly_reserve_excluded_bytes=int(
+                _pb["assembly_reserve_excluded_bytes"]
+            ),
+            host_fixed_bytes=int(host["fixed_peak_bytes"]),
+            reduce_fixed_bytes=int(host["reduce_fixed_bytes"]),
+            residual_batch_budget_bytes=int(
+                selection["residual_batch_budget_bytes"]
+            ),
+            host_peak_bytes=int(host["peak_bytes"]),
+            host_components=host,
+        )
+    selection["gpu_batch_transition"] = {
+        "from_batch": int(old_batch),
+        "to_batch": int(batch),
+        "reason": (
+            "the external GPU device block for ALL N contributors bounds the "
+            "staging batch; the batch is a staging parameter, so shrinking "
+            "it never changes the science or the frozen identity"
+        ),
+        "host_peak_bytes": int(host["peak_bytes"]),
+    }
+    return host
+
+
+def _external_gpu_admission(
+    selection,
+    *,
+    requested: bool,
+    probe,
+    n_frames: int,
+    patch_hw: tuple[int, int],
+    channels: int,
+    halo: int,
+    cells_in_flight: int,
+    active_scheduler: bool,
+    frozen_backend: str | None,
+) -> dict:
+    """Decide and RECORD the external GPU admission for ONE selection.
+
+    Uses the pure :mod:`gpu_external` policy: a fresh VRAM observation, a
+    conservative empirical device block model with a declared residual, and a
+    batch that always holds ALL N contributors of every pixel. A refusal NEVER
+    raises: it returns a closed record and the CPU external selection is kept
+    byte-for-byte (the only change on admission is a possible batch SHRINK).
+    """
+    tile = int(selection["tile"])
+    h, w = int(patch_hw[0]), int(patch_hw[1])
+    tiles, max_th, max_tw = zext._tile_geometry(
+        h, w, tile, int(halo)
+    )
+    max_ih = max(int(y1 - y0) for (y0, y1, _x0, _x1, _th, _tw) in tiles)
+    max_iw = zext._max_interior_width(tiles)
+    record = zgex.plan_external_gpu(
+        requested=bool(requested),
+        probe=probe,
+        host_phase_budget_bytes=int(selection["phase_budget_bytes"]),
+        host_batch=int(
+            selection.get("executed_column_batch")
+            or selection["column_batch"]
+        ),
+        n_frames=int(n_frames),
+        interior_hw=(int(max_ih), int(max_iw)),
+        channels=int(channels),
+        tile_size=int(tile),
+        cells_in_flight=int(cells_in_flight),
+        active_scheduler=bool(active_scheduler),
+        frozen_backend=frozen_backend,
+    )
+    record["max_extent_hw"] = [int(max_th), int(max_tw)]
+    record["host"] = dict(record.get("host") or {})
+    record["host"].setdefault("phase_budget_bytes", int(selection["phase_budget_bytes"]))
+    if record.get("admitted"):
+        selected = int(record["batch"]["selected"])
+        if selected != int(selection["column_batch"]):
+            host = _reprice_external_selection_batch(
+                selection, batch=int(selected)
+            )
+            if host is None:
+                record["admitted"] = False
+                record["selected_backend"] = "cpu"
+                record["effective_backend"] = "cpu"
+                record["reason"] = "host_reprice_refused"
+                record["detail"] = (
+                    "the GPU-bounded staging batch could not be re-priced "
+                    "inside the already-admitted host phase budget"
+                )
+            else:
+                record["host"]["peak_bytes"] = int(host["peak_bytes"])
+        else:
+            record["host"]["peak_bytes"] = int(
+                selection.get("host_peak_bytes")
+                or selection["phase_budget_bytes"]
+            )
+    else:
+        record["host"]["peak_bytes"] = int(
+            selection.get("host_peak_bytes")
+            or selection["phase_budget_bytes"]
+        )
+    return record
+
+
 def _working_set_block(
     *, working_set_class, tile, column_batch, budget_bytes,
     raw_available_bytes, layout, tile_trials, gpu_used, gpu_tile,
@@ -9295,6 +9634,10 @@ def _build_execution_bundle(
     cache_build_workers=None,
     gauge_workers=None,
     cache_root=None,
+    output_dir=None,
+    checkpoint_run_id=None,
+    checkpoint_source_cache=None,
+    frame_rows=None,
     emit=None,
     log_line=None,
     layout_substep=None,
@@ -9318,6 +9661,9 @@ def _build_execution_bundle(
     halo_policy=None,
     memory_observations=None,
     gauge_counts_decoupling=False,
+    gpu_requested=False,
+    gpu_probe=None,
+    active_scheduler=False,
 ):
     """Build the COMPLETE executable bundle under the PLAN budget (ZM-ZEGRID-R41-B).
 
@@ -9616,26 +9962,20 @@ def _build_execution_bundle(
         gpu_tile_candidates: tuple[tuple[int, int], ...] = ()
         gpu_tile_trials: list = []
         gpu_pre_execution_fallback = None
+        # ZM-M33 lot 3: the external class has its OWN GPU admission. It never
+        # enters the resident whole-tile GPU rung above; ``_external_gpu_used``
+        # is the truthful bundle-level fact for the external executor.
+        _external_gpu_used = False
+        _external_gpu_record = None
         _cache_root = None if cache_root is None else Path(cache_root)
         if _force_external:
-            # ZM-ACTIVE-EXTERNAL-WIRING: the external working set is CPU-only and
-            # explicit. No GPU rung is considered for a forced external class.
+            # The external working set never enters the RESIDENT whole-tile GPU
+            # rung. Its own bounded block admission is evaluated once the
+            # external selection exists (below); no decline is fabricated here.
             effective_gpu = False
             gpu_tile_size = None
             gpu_device_workspace_bytes = None
             gpu_stream_by_idx = None
-            if bool(gpu_used):
-                # Truthful backend provenance: the product REQUESTED a GPU, but
-                # this execution class is CPU-only. Record the pre-execution
-                # decline so the science config, the per-cell records and the
-                # manifest cannot claim a GPU execution that never happened.
-                gpu_pre_execution_fallback = {
-                    "reason": "external_working_set_cpu_only",
-                    "detail": (
-                        "the external_spool working set executes on CPU; the "
-                        "requested GPU is not used"
-                    ),
-                }
         if effective_gpu:
             max_n = max(
                 (len(m.patch_ids) for (_r, _c, _ce, _p, m) in cell_ctxs if m.patch_ids),
@@ -10040,14 +10380,59 @@ def _build_execution_bundle(
                 )
                 if _ext_block is not None:
                     plan["reservation"] = _ext_block
-                # F4: the external pseudo-plan is CPU-only (spool + exact
-                # column reduction). A GPU was detected but is NOT part of
-                # this admission: clear the GPU execution facts so no downstream
-                # block can claim a device reduction for an external plan.
+                # ZM-M33 lot 3: the external class has its OWN bounded GPU
+                # admission (block N*positions, ALL N contributors). It is NOT
+                # the resident whole-tile rung: the device facts below are
+                # cleared so no legacy GPU block can claim this plan.
                 effective_gpu = False
                 gpu_tile_size = None
                 gpu_device_workspace_bytes = None
                 gpu_stream_by_idx = None
+                _external_gpu_record = _external_gpu_admission(
+                    external_selection,
+                    requested=bool(gpu_requested) and bool(gpu_used),
+                    probe=gpu_probe,
+                    n_frames=int(max_n_frames),
+                    patch_hw=(int(worst_patch_hw[0]), int(worst_patch_hw[1])),
+                    channels=int(channels),
+                    halo=int(_halo),
+                    cells_in_flight=int(
+                        plan.get("cells_in_flight", 1) or 1
+                    ),
+                    active_scheduler=bool(active_scheduler),
+                    frozen_backend=(
+                        None if _frozen_admission is None
+                        else str(_frozen_admission.get("backend"))
+                    ),
+                )
+                _external_gpu_used = bool(_external_gpu_record.get("admitted"))
+                if _external_gpu_used:
+                    plan["gpu_serialized"] = True
+                    plan["gpu_owner"] = zgex.GPU_EXTERNAL_OWNER_MODE
+                    # The batch may have been SHRUNK to fit the device; the
+                    # published host envelope must be the re-priced one.
+                    plan["stack_total_bytes"] = int(
+                        external_selection["host_peak_bytes"]
+                    )
+                    plan["aggregate_bytes"] = int(
+                        external_selection["host_peak_bytes"]
+                    )
+                    plan["chosen_reason"] = (
+                        str(plan.get("chosen_reason") or "")
+                        + "; external GPU admitted (bounded block, K=1, "
+                        + "device block "
+                        + str(_external_gpu_record["batch"]["positions"])
+                        + " positions x N)"
+                    )
+                elif bool(gpu_requested):
+                    # Truthful pre-execution decline BEFORE any frozen
+                    # admission/execution: requested GPU, effective CPU.
+                    gpu_pre_execution_fallback = {
+                        "reason": str(_external_gpu_record.get("reason")),
+                        "detail": str(_external_gpu_record.get("detail")),
+                        "working_set_class": WORKING_SET_EXTERNAL,
+                        "external_gpu": dict(_external_gpu_record),
+                    }
             else:
                 # The RAM class is exhausted and the NEXT (external) class was
                 # priced at this geometry. Its disk/observation refusal must be
@@ -10301,9 +10686,36 @@ def _build_execution_bundle(
         cell_tasks = []
         _external_task_info = None
         _owner_token, _owner_record = _external_owner_identity()
+        _checkpoint_binding = None
+        _checkpoint_reason = None
+        if (
+            chosen_mode == "external"
+            and output_dir is not None
+            and _tile_checkpoints_requested()
+        ):
+            _checkpoint_binding, _checkpoint_reason = _checkpoint_source_binding(
+                descs, canvas, cache=checkpoint_source_cache,
+                frame_rows=frame_rows,
+            )
+            if _checkpoint_binding is None:
+                logging.getLogger("ZeMosaicWorker").warning(
+                    "ZeGrid: durable tile checkpoints DISABLED — %s",
+                    _checkpoint_reason,
+                )
         if chosen_mode == "external":
             _external_task_info = {
                 "class": WORKING_SET_EXTERNAL,
+                # ZM-M33 lot 3: the executor's requested backend is an EXPLICIT
+                # part of the frozen contract (request -> planner/bundle ->
+                # executor). A GPU request that was not admitted is recorded as
+                # cpu here; the executor is never asked to invent one.
+                "backend": (
+                    "gpu" if _external_gpu_used else "cpu"
+                ),
+                "gpu": (
+                    None if _external_gpu_record is None
+                    else dict(_external_gpu_record)
+                ),
                 "tile_size": int(chosen_tile),
                 "column_batch": int(external_selection["column_batch"]),
                 # ZM-M33 rework-1: recorded (not silently normalized) clamp.
@@ -10325,6 +10737,27 @@ def _build_execution_bundle(
                     - int(external_selection["host_peak_bytes"]),
                 ),
                 "spool_root": str(external_selection["spool_root"]),
+                # ZM-M33-TILE-CHECKPOINTS: the parent-owned persistent root (NOT
+                # the temporary cache root, which is pruned) and the frozen run
+                # id when a resume already owns it. The Cell writes only its own
+                # directory under this root; the final durable commit is the only
+                # cleanup authority.
+                "checkpoint_root": (
+                    str(Path(output_dir) / _TILE_CHECKPOINT_DIRNAME)
+                    if output_dir is not None
+                    and _tile_checkpoints_requested()
+                    and _checkpoint_binding is not None
+                    else None
+                ),
+                "checkpoint_run_id": (
+                    None if checkpoint_run_id is None
+                    else str(checkpoint_run_id)
+                ),
+                "checkpoint_source_binding": (
+                    None if _checkpoint_binding is None
+                    else dict(_checkpoint_binding)
+                ),
+                "checkpoint_disabled_reason": _checkpoint_reason,
                 "disk_envelope_bytes": int(
                     external_selection["disk_envelope_bytes"]
                 ),
@@ -10539,6 +10972,12 @@ def _build_execution_bundle(
                 working_set_transition["from_class"]
             )
             working_set_block["transition"] = dict(working_set_transition)
+        # ZM-M33 lot 3: truthful external GPU provenance for the log/manifest.
+        if _external_gpu_record is not None:
+            working_set_block["gpu"] = dict(_external_gpu_record)
+            working_set_block["backend"] = (
+                "gpu" if _external_gpu_used else "cpu"
+            )
         layout["stack_working_set"] = stack_working_set
         working_set_block["owner_token"] = _owner_token
         layout["working_set"] = working_set_block
@@ -10630,7 +11069,7 @@ def _build_execution_bundle(
             gpu_tile_size=(int(gpu_tile_size) if effective_gpu else None),
             gpu_streaming_tile=gpu_streaming_tile,
             gpu_streaming_host_peak_bytes=gpu_streaming_host_peak_bytes,
-            gpu_used=bool(effective_gpu),
+            gpu_used=bool(effective_gpu or _external_gpu_used),
             gpu_pre_execution_fallback=(
                 gpu_pre_execution_fallback or gpu_fallback_reason
             ),
@@ -10677,6 +11116,10 @@ def _build_execution_bundle(
             external_contract=(
                 None if _external_task_info is None
                 else dict(_external_task_info)
+            ),
+            external_gpu=(
+                None if _external_gpu_record is None
+                else dict(_external_gpu_record)
             ),
         )
 
@@ -14969,7 +15412,11 @@ def _r55_active_apply(
         "mode": mode,
         "cells_in_flight": int(units),
         "cache_workers_per_cell": int(workers),
-        "gpu_serialized": False,
+        "gpu_serialized": bool(
+            external_class
+            and isinstance((external_contract or {}).get("gpu"), dict)
+            and bool((external_contract or {})["gpu"].get("admitted"))
+        ),
         "chosen_reason": reason,
         "candidates": [
             {
@@ -15054,6 +15501,11 @@ def _r55_active_apply(
             "budget_bytes": int(bound_budget),
         }
     )
+    _ext_gpu_admitted = bool(
+        external_class
+        and isinstance((external_contract or {}).get("gpu"), dict)
+        and bool((external_contract or {})["gpu"].get("admitted"))
+    )
     return replace(
         bundle,
         layout=layout,
@@ -15062,7 +15514,7 @@ def _r55_active_apply(
         gpu_tile_size=None,
         gpu_streaming_tile=None,
         gpu_streaming_host_peak_bytes=None,
-        gpu_used=False,
+        gpu_used=bool(_ext_gpu_admitted),
         # Preserve the legacy pre-execution fallback provenance. If the product
         # had requested GPU but the bundle already degraded to CPU, the caller's
         # post-gauge block still needs this reason to reconcile science_config
@@ -16770,6 +17222,48 @@ def _r55_durable_cell_coverage(store_state, expected_cell_ids, *, context="assem
     return store
 
 
+def _checkpoint_cleanup_after_commit(store_state, cell_id):
+    """Remove ONE Cell's reduced tile checkpoints AFTER its durable commit.
+
+    Called only from the parent-owned commit helpers, after ``require_commit``
+    proved the final Cell commit durable. A cleanup failure is recorded and the
+    bounded reduced checkpoints are RETAINED (documented manual cleanup); it is
+    never fatal and never triggers a restack.
+    """
+    root = store_state.get("checkpoint_root")
+    if not root:
+        return None
+    try:
+        report = ztcp.cleanup_cell(root, str(cell_id))
+    except Exception as exc:  # noqa: BLE001 - documented retention
+        report = {"removed": False, "reason": f"{type(exc).__name__}: {exc}"}
+    if not report.get("removed"):
+        store_state.setdefault("checkpoint_cleanup_failures", []).append(
+            {"cell_id": str(cell_id), **dict(report)}
+        )
+    return report
+
+
+def _bind_tile_checkpoint_run(bundles, run_id):
+    """Bind the durable run id into already-built external task payloads.
+
+    The store opens AFTER the admission bundles are built, so a fresh durable
+    run's id is not known when ``_external_task_info`` is created. Mutating the
+    mutable external-info dict inside each task tuple (before any dispatch)
+    closes the nullable-run-id loophole: a durable-run checkpoint can never be
+    reused by a store-less attempt (or vice versa).
+    """
+    bound = 0
+    for bundle in bundles:
+        for task in (getattr(bundle, "cell_tasks", None) or ()):
+            if len(task) < 8 or not isinstance(task[7], dict):
+                continue
+            if task[7].get("checkpoint_root"):
+                task[7]["checkpoint_run_id"] = str(run_id)
+                bound += 1
+    return bound
+
+
 def _gpu_durable_commit(store_state, registry, cell_id, receipt, *,
                         plan_generation, backend="gpu"):
     """Durably commit+verify+release ONE accepted GPU unit, or fail loudly.
@@ -16818,6 +17312,7 @@ def _gpu_durable_commit(store_state, registry, cell_id, receipt, *,
         ) from exc
     # Verify the record is DURABLE before returning (cheap local lookup).
     store.require_commit(str(cell_id), attempt_id)
+    _checkpoint_cleanup_after_commit(store_state, cell_id)
     store_state["commits"] = int(store_state.get("commits", 0)) + 1
     released = (handoff.get("release") or {})
     if released.get("released"):
@@ -16910,6 +17405,7 @@ def _cpu_durable_commit(store_state, registry, cell_id, receipt, *,
             }
         )
         raise
+    _checkpoint_cleanup_after_commit(store_state, cell_id)
     store_state["commits"] = int(store_state.get("commits", 0)) + 1
     released = handoff.get("release") or {}
     if released.get("released"):
@@ -18231,6 +18727,26 @@ def _r55_execution_contract_from_bundle(bundle) -> dict:
     """
     gpu_tile = getattr(bundle, "gpu_streaming_tile", None)
     gpu_used = bool(getattr(bundle, "gpu_used", False)) and gpu_tile is not None
+    # ZM-M33 lot 3: an EXTERNAL GPU bundle is GPU-shaped without a resident
+    # ``gpu_streaming_tile``. Its execution tile is the frozen spool tile and
+    # its admission is the external bounded-block one, so it must NOT be
+    # relabelled as CPU by the resident-tile test above.
+    if (
+        str(getattr(bundle, "stack_working_set", "")) == WORKING_SET_EXTERNAL
+        and bool(getattr(bundle, "gpu_used", False))
+    ):
+        _ext = _r55_external_contract(bundle)
+        _ext_gpu = _ext.get("gpu") if isinstance(_ext, dict) else None
+        if isinstance(_ext_gpu, dict) and bool(_ext_gpu.get("admitted")):
+            return {
+                "backend": "gpu",
+                "tile_px": int(_ext["tile_size"]),
+                # This lot does NOT claim the legacy whole-tile numeric parity
+                # qualification for the external block admission: the executor
+                # provides CPU/GPU plane parity, but no ACTIVE parity evidence
+                # was produced for this new path.
+                "parity_qualified": False,
+            }
     if gpu_used:
         return {
             "backend": "gpu",
@@ -18255,6 +18771,23 @@ def _r55_run_store_working_set(bundle, execution_contract) -> dict:
     class. Every non-GPU class comes from the bundle's own dry-plan block.
     """
     if str(execution_contract["backend"]) == "gpu":
+        # ZM-M33 lot 3: an EXTERNAL GPU run keeps the external_spool class. Its
+        # staged tiles live on DISK; only the reduction block is on the device.
+        # Describing it as ram_tile would be false (and would lose the frozen
+        # batch in the durable admission).
+        if (
+            str(getattr(bundle, "stack_working_set", ""))
+            == WORKING_SET_EXTERNAL
+        ):
+            block = getattr(bundle, "working_set_block", None) or {}
+            _ext = getattr(bundle, "external_contract", None) or {}
+            return {
+                "class": WORKING_SET_EXTERNAL,
+                "tile_px": int(_ext.get("tile_size") or block.get("tile_size") or 0),
+                "column_batch": int(
+                    _ext.get("column_batch") or block.get("column_batch") or 0
+                ),
+            }
         return {
             "class": WORKING_SET_RAM_TILE,
             "tile_px": int(execution_contract["tile_px"]),
@@ -18328,6 +18861,99 @@ def _r55_canvas_identity_block(canvas) -> dict:
             }
         ),
     }
+
+
+def _checkpoint_source_binding(descs, canvas, cache=None, frame_rows=None):
+    """Strong content binding for tile checkpoints (rework-1 H1).
+
+    Binds the ACTUAL scientific input content, not only labels: each frame's
+    streamed content sha256 (the existing frozen-identity row), its serialized
+    WCS/transform sha256 (SIP included) and shape, plus the canvas WCS/shape.
+    The per-Cell patch WCS is added by ``_run_cell_external``.
+
+    ``frame_rows`` (rework-3) is the SAME frozen/verified row list already
+    computed for the run identity (and for gauge-import verification). When it
+    is supplied, the corpus is NOT hashed a second time; its length and required
+    fields are validated here so an unverified/short/malformed row list fails
+    closed instead of weakening the content binding. ``None`` keeps direct
+    helper callers working (they hash once here).
+
+    The cache key is the object identity of the frozen descriptor list/canvas;
+    the cache lives for ONE product run only, so a source change between runs
+    can never reuse a stale proof.
+    """
+    key = None if cache is None else (id(descs), id(canvas))
+    if key is not None and key in cache:
+        return cache[key]
+    try:
+        if frame_rows is None:
+            rows = _r55_frame_input_rows(descs)
+        else:
+            rows = [dict(row) for row in frame_rows]
+            if len(rows) != len(descs):
+                raise ValueError(
+                    "shared frame rows do not match the frozen descriptor "
+                    f"count ({len(rows)} != {len(descs)})"
+                )
+            for order, row in enumerate(rows):
+                if int(row["order"]) != int(order):
+                    raise ValueError(
+                        "shared frame row order does not match the frozen "
+                        f"descriptor order at index {order}"
+                    )
+                content = str(row["content_sha256"])
+                if len(content) != 64 or any(
+                    c not in "0123456789abcdef" for c in content
+                ):
+                    raise ValueError(
+                        f"shared frame row {order} has an invalid content "
+                        "sha256 (not 64 lowercase hex characters)"
+                    )
+        frames = []
+        for order, (desc, row) in enumerate(zip(descs, rows)):
+            wcs_header = getattr(desc, "wcs_header", None)
+            if not isinstance(wcs_header, str) or not wcs_header.strip():
+                raise ValueError(
+                    f"frame {order} exposes no serialized WCS/transform; "
+                    "a checkpoint source binding cannot be proven"
+                )
+            shape_hw = getattr(desc, "shape_hw", None)
+            if (
+                not isinstance(shape_hw, (tuple, list))
+                or len(shape_hw) != 2
+                or int(shape_hw[0]) <= 0
+                or int(shape_hw[1]) <= 0
+            ):
+                raise ValueError(
+                    f"frame {order} exposes no valid shape_hw; a checkpoint "
+                    "source binding cannot be proven"
+                )
+            frames.append(
+                {
+                    "order": int(order),
+                    "content_sha256": str(row["content_sha256"]),
+                    "nbytes": int(row["nbytes"]),
+                    "wcs_sha256": hashlib.sha256(
+                        wcs_header.encode("utf-8")
+                    ).hexdigest(),
+                    "shape_hw": [int(shape_hw[0]), int(shape_hw[1])],
+                }
+            )
+        binding = {
+            "schema": ztcp.SOURCE_BINDING_SCHEMA,
+            "frames": frames,
+            "frame_input_rows_sha256": zrs._inputs_aggregate(rows),
+            "canvas": _r55_canvas_identity_block(canvas),
+        }
+        result = (binding, None)
+    except Exception as exc:  # noqa: BLE001 - explicit fail-closed reason
+        result = (
+            None,
+            f"source binding unavailable: {type(exc).__name__}: {exc}",
+        )
+    if key is not None:
+        cache[key] = result
+    return result
 
 
 def _r55_build_run_store_identity(
@@ -19948,12 +20574,49 @@ def _run_single(
                 "(source=measured)",
                 callback=progress_callback,
             )
+    # ZM-M33 rework-3: ONE frame-content hash pass per product run. The SAME
+    # frozen/verified rows feed gauge-import verification, the durable run
+    # identity and the checkpoint source binding. A source change between runs
+    # cannot reuse them (this list lives for ONE _run_single call); a failed
+    # early hash leaves None and each consumer keeps its own fail-closed path.
+    if _frame_input_rows_for_run is None:
+        try:
+            _frame_input_rows_for_run = _r55_frame_input_rows(descs)
+        except Exception:  # noqa: BLE001 - consumers re-attempt/fail closed
+            _frame_input_rows_for_run = None
     _bundle_common = dict(
+        frame_rows=(
+            None if _frame_input_rows_for_run is None
+            else [dict(row) for row in _frame_input_rows_for_run]
+        ),
         cpu_count=os.cpu_count(),
         gpu_used=bool(gpu_used),
+        # ZM-M33 lot 3: the EXTERNAL class has its own bounded GPU admission.
+        # The request flag is the product's canonical GPU preference; the probe
+        # is the fresh observation already taken at run start. ``active``
+        # restricts the integration to the ACTIVE scheduler (the legacy/observe
+        # path is deliberately unchanged).
+        gpu_requested=bool((gpu_ctx or {}).get("requested")),
+        gpu_probe=(
+            {
+                "available": bool((gpu_ctx or {}).get("available")),
+                "device": (gpu_ctx or {}).get("device"),
+                "cupy_version": (gpu_ctx or {}).get("cupy_version"),
+                "vram_total_bytes": (gpu_ctx or {}).get("vram_total_bytes"),
+                "vram_free_bytes": (gpu_ctx or {}).get("vram_free_bytes"),
+                "reason": (gpu_ctx or {}).get("fallback_reason"),
+            }
+            if gpu_ctx else None
+        ),
+        active_scheduler=(scheduler_mode == zsched.MODE_ACTIVE),
         memory_observations=list(_memory_observations),
         vram_budget_bytes=(gpu_ctx or {}).get("vram_budget_bytes"),
         cache_root=cache_root,
+        output_dir=output_dir,
+        checkpoint_run_id=(
+            str(_resume_boot.store.run_id) if _resume_boot is not None else None
+        ),
+        checkpoint_source_cache={},
         halo_px=int(halo_px),
         # ZM-HALO-EXECUTION-DECOUPLING: ONE policy decision per pass, derived
         # from the run-level halo PROVENANCE (never re-read elsewhere). A pass
@@ -20142,6 +20805,37 @@ def _run_single(
                 "gauge/stack: gpu_used=True while the product GPU backend is "
                 "not effective/requested (no silent CPU coercion)."
             )
+        if _r55_gpu_active_requested:
+            # ZM-M33 lot 3: an EXTERNAL bundle NEVER enters the resident
+            # whole-tile GPU attempt. Its device reduction is bounded by the
+            # external block admission already frozen in the bundle; the
+            # external ACTIVE decision below applies it unchanged (K=1).
+            if (
+                str(getattr(_initial_bundle, "stack_working_set", ""))
+                == WORKING_SET_EXTERNAL
+            ):
+                if bool(_initial_bundle.gpu_used):
+                    _emit(
+                        "ZeGrid: external GPU admitted by the bounded block "
+                        "planner — the resident whole-tile GPU rung is NOT "
+                        "used (spool stays on disk, K=1); "
+                        f"device block="
+                        f"{(getattr(_initial_bundle, 'external_gpu', None) or {}).get('batch', {}).get('positions')} "
+                        "positions",
+                        callback=progress_callback,
+                    )
+                else:
+                    _pf_ext = dict(
+                        _initial_bundle.gpu_pre_execution_fallback or {}
+                    )
+                    _emit(
+                        "ZeGrid: external GPU not admitted — "
+                        f"{_pf_ext.get('reason')}: {_pf_ext.get('detail')}. "
+                        "The external CPU path continues on the SAME frozen "
+                        "geometry/science.",
+                        lvl="WARN", callback=progress_callback,
+                    )
+                _r55_gpu_active_requested = False
         if _r55_gpu_active_requested:
             # ZM-ZEGRID-R55-E2: ACTIVE GPU is a qualified, single-owner plan.
             # A non-qualified candidate is REFUSED with a closed reason (never
@@ -20531,7 +21225,34 @@ def _run_single(
                             _r55_active_mapping,
                             _r55_active_adm,
                             _r55_active_trail,
-                        ) = _r55_gpu_attempt(_initial_bundle)
+                        ) = (
+                            (None, None, None, None, None, [])
+                            if str(getattr(
+                                _initial_bundle, "stack_working_set", ""
+                            )) == WORKING_SET_EXTERNAL
+                            else _r55_gpu_attempt(_initial_bundle)
+                        )
+                        if (
+                            str(getattr(
+                                _initial_bundle, "stack_working_set", ""
+                            )) != WORKING_SET_EXTERNAL
+                        ):
+                            _r55_publish_gpu_admission(
+                                fallback_count=int(_STORAGE_FALLBACK_COUNT)
+                            )
+                        else:
+                            _pf_ext = dict(
+                                _initial_bundle.gpu_pre_execution_fallback or {}
+                            )
+                            if not bool(_initial_bundle.gpu_used):
+                                _emit(
+                                    "ZeGrid: external GPU not admitted — "
+                                    f"{_pf_ext.get('reason')}: "
+                                    f"{_pf_ext.get('detail')}. The bounded "
+                                    "external CPU path continues on the SAME "
+                                    "geometry/science.",
+                                    lvl="WARN", callback=progress_callback,
+                                )
                     except (
                         zal.LayoutInfeasible, zpar.ModeInfeasible,
                     ) as _r55_bounded_exc:
@@ -20547,7 +21268,12 @@ def _run_single(
                         # EXISTING typed whole-batch CPU fallback (not a coercion).
                         _r55_record_gpu_cpu_fallback(_r55_bounded_exc)
                     else:
-                        _r55_publish_gpu_admission(fallback_count=1)
+                        if (
+                            str(getattr(
+                                _initial_bundle, "stack_working_set", ""
+                            )) != WORKING_SET_EXTERNAL
+                        ):
+                            _r55_publish_gpu_admission(fallback_count=1)
             except _R55GpuFallback as _r55_gpu_exc:
                 _r55_record_gpu_cpu_fallback(_r55_gpu_exc)
 
@@ -21516,6 +22242,16 @@ def _run_single(
             lvl="WARN", callback=progress_callback,
         )
     gpu_used = bool(_final.gpu_used)
+    # ZM-M33 lot 3: publish the external GPU admission record (requested /
+    # selected / effective / reason / batch / device model / probe) alongside
+    # the legacy GPU facts. ``None`` on every non-external bundle.
+    _ext_gpu_record = getattr(_final, "external_gpu", None)
+    if isinstance(_ext_gpu_record, dict):
+        gpu_ctx["external"] = dict(_ext_gpu_record)
+        _ext_device = dict(_ext_gpu_record.get("device") or {})
+        if _ext_device.get("budget_bytes") is not None:
+            gpu_ctx["vram_budget_bytes"] = int(_ext_device["budget_bytes"])
+            gpu_ctx["vram_budget_source"] = "external_block_admission"
     # Pre-execution bundle fallback: the EFFECTIVE backend just changed. Any
     # GPU prior must be dropped before a single cell is stacked.
     try:
@@ -25929,6 +26665,11 @@ def _run_single(
         "open_traceback": None,
         "degraded_reason": None,
         "commit_errors": [],
+        "checkpoint_root": (
+            str(Path(output_dir) / _TILE_CHECKPOINT_DIRNAME)
+            if _tile_checkpoints_requested() else None
+        ),
+        "checkpoint_cleanup_failures": [],
     }
     global _EXTERNAL_RETAIN_FOR_COMMIT
     _EXTERNAL_RETAIN_FOR_COMMIT = False
@@ -25997,6 +26738,10 @@ def _run_single(
         _store_state.update(
             enabled=True, store=_store, publishing=True, resumed=True
         )
+        _bind_tile_checkpoint_run(
+            [_final, _r55_active_bundle, _initial_bundle], _store.run_id
+        )
+        _bundle_common["checkpoint_run_id"] = str(_store.run_id)
         # ZM-ZEGRID-CLASS-DOWNGRADE-RESUME: persist the ONE approved
         # working-set class downgrade BEFORE any pending Cell runs. The
         # scientific identity is unchanged (the class is not part of it); the
@@ -26511,6 +27256,11 @@ def _run_single(
             _store_state.update(
                 enabled=True, store=_store, publishing=True
             )
+            _bind_tile_checkpoint_run(
+                [_final, _r55_active_bundle, _initial_bundle], _store.run_id
+            )
+            # Any later recovery/fallback bundle must carry the SAME run binding.
+            _bundle_common["checkpoint_run_id"] = str(_store.run_id)
             # M4: freeze the expected cell set and the effective policy BEFORE
             # any cell runs, so a restart resumes the EXACT sparse inventory.
             try:

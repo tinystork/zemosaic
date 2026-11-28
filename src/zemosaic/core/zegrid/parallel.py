@@ -1399,7 +1399,11 @@ def pmap_reserved(
     it is never swallowed, never replays an already consumed task and is
     re-raised UNCHANGED (see :class:`ResultConsumeError`); results that are
     ALREADY finished are still handed to the consumer first, so a computed cell
-    is never lost behind a still-running peer.
+    is never lost behind a still-running peer. ZM-M33-DRAIN-DURABLE: tasks the
+    executor had already STARTED when a peer failed are also drained and
+    consumed exactly once before the ORIGINAL error escapes; after a consumer
+    (durable-commit) failure the policy closes and later results are reported
+    as uncommitted (fail-closed store contract).
     """
     tasks = list(tasks)
     reservations = [int(r) for r in reservations]
@@ -1443,6 +1447,19 @@ def pmap_reserved(
         meta["consume_failures"] = []
         meta["sibling_worker_failures"] = []
         meta["fatal_reported"] = False
+        # ZM-M33-DRAIN-DURABLE: same truthful receipt bookkeeping as ``pmap``.
+        meta["consumed_indices"] = []
+        meta["uncommitted_outputs"] = []
+        meta["pending_never_dispatched"] = []
+        meta["consume_policy"] = "enabled" if consume is not None else "none"
+        meta["drain"] = {
+            "started": False,
+            "seconds": 0.0,
+            "primary": None,
+            "cancelled": [],
+            "consumed": [],
+        }
+        meta["submit_failures"] = []
 
     def _state(event):
         """Best-effort parent state event (SUBMITTED/COMPUTED/FAILED/...)."""
@@ -1592,6 +1609,7 @@ def pmap_reserved(
                             meta["consume_calls"] = int(
                                 meta.get("consume_calls", 0)
                             ) + 1
+                            meta["consumed_indices"].append(int(i))
                     else:
                         out.append(_value)
                 finally:
@@ -1666,8 +1684,195 @@ def pmap_reserved(
     running = {}
     running_sum = 0
     reported = 0
-    collected = 0
+    progress = {"collected": 0}
     last_call = time.monotonic() if heartbeat is not None else None
+    # Explicit, fail-closed consumption policy (same contract as ``pmap``).
+    consume_state = {"enabled": consume is not None, "stop_reason": None}
+
+    def _stop_consuming(reason):
+        if consume_state["enabled"]:
+            consume_state["enabled"] = False
+            consume_state["stop_reason"] = str(reason)
+            if meta is not None:
+                meta["consume_policy"] = f"stopped: {reason}"
+
+    def _record_uncommitted(idx, reason):
+        if meta is not None:
+            meta["uncommitted_outputs"].append(
+                {"index": int(idx), "reason": str(reason)}
+            )
+
+    def _record_secondary(idx, kind, exc):
+        detail = f"{type(exc).__name__}: {exc}"
+        if meta is not None:
+            if kind == "worker":
+                meta["sibling_worker_failures"].append(
+                    {"index": int(idx), "kind": "worker", "error": detail}
+                )
+            else:
+                meta["consume_failures"].append(
+                    {"index": int(idx), "kind": "consume", "error": detail}
+                )
+        if kind == "consume":
+            _stop_consuming(f"consumer failure at cell {cell_ids[idx]} ({detail})")
+
+    def _submit_failed(idx, exc):
+        """Partial ``pool.submit`` failure: same drain/consume lifecycle (F1).
+
+        No new dispatch after the failure, no replay, the ORIGINAL cause is
+        preserved in the raised :class:`ParallelPoolError`, and every already
+        started cell is drained and consumed exactly once (caller thread).
+        """
+        if meta is not None:
+            meta["submit_failures"].append(
+                {"index": int(idx), "error": f"{type(exc).__name__}: {exc}"}
+            )
+        _drain_cells_after_failure(idx, "submit", exc)
+        raise ParallelPoolError(
+            "per-cell dispatch submit failed for cell "
+            f"{cell_ids[idx]} ({type(exc).__name__}: {exc})",
+            index=idx, task=tasks[idx],
+        ) from exc
+
+    def _drain_cells_after_failure(_idx, _kind, _exc):
+        """Drain the STARTED cells of a failing reserved wave, exactly once.
+
+        ZM-M33-DRAIN-DURABLE: the fatal state is surfaced first, ONLY the
+        never-started futures are cancelled (no new dispatch, no replay), then
+        every already-started cell is received and consumed while the original
+        error is pending. A consumer failure closes the policy (fail-closed
+        store contract) and later results are named uncommitted.
+        """
+        nonlocal running_sum, last_call
+        _fatal(
+            _exc,
+            index=_idx,
+            stage={"consume": "consume", "submit": "pool"}.get(
+                _kind, "worker"
+            ),
+        )
+        if meta is not None:
+            meta["drain"]["started"] = True
+            meta["drain"]["primary"] = {
+                "index": int(_idx),
+                "kind": str(_kind),
+                "error": f"{type(_exc).__name__}: {_exc}",
+            }
+            # Tasks that were never handed to the executor are named as such:
+            # they never ran and can never have a durable output.
+            meta["pending_never_dispatched"] = sorted(int(i) for i in pending)
+        if _kind == "consume":
+            _stop_consuming(
+                f"primary consumer failure at cell {cell_ids[_idx]} "
+                f"({type(_exc).__name__}: {_exc})"
+            )
+        started_at = time.perf_counter()
+        try:
+            # 1. Cancel ONLY futures that truly never started.
+            for _fut in sorted(list(running), key=lambda f: int(running[f])):
+                _cell = int(running[_fut])
+                try:
+                    if _fut.done() or not _fut.cancel():
+                        continue
+                except Exception:  # noqa: BLE001 - telemetry only
+                    continue
+                running.pop(_fut, None)
+                running_sum -= reservations[_cell]
+                if meta is not None:
+                    meta["drain"]["cancelled"].append(_cell)
+                _state(
+                    {
+                        "event": "cancelled",
+                        "index": int(_cell),
+                        "cell_id": cell_ids[_cell],
+                    }
+                )
+            # 2. Receive + consume every ALREADY-STARTED cell.
+            while running:
+                timeout = None
+                if heartbeat is not None:
+                    timeout = max(
+                        0.0, interval_s - (time.monotonic() - last_call)
+                    )
+                done, _ = concurrent.futures.wait(
+                    list(running),
+                    timeout=timeout,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for _fut in sorted(done, key=lambda f: int(running[f])):
+                    _cell = int(running[_fut])
+                    running.pop(_fut, None)
+                    running_sum -= reservations[_cell]
+                    _value = None
+                    try:
+                        _value = _fut.result()
+                    except Exception as _sib_exc:  # noqa: BLE001
+                        _state(
+                            {
+                                "event": "failed",
+                                "index": int(_cell),
+                                "cell_id": cell_ids[_cell],
+                                "stage": "worker",
+                            }
+                        )
+                        _record_secondary(_cell, "worker", _sib_exc)
+                        continue
+                    _state(
+                        {
+                            "event": "computed",
+                            "index": int(_cell),
+                            "cell_id": cell_ids[_cell],
+                        }
+                    )
+                    try:
+                        if consume is None:
+                            out[_cell] = _value
+                        elif not consume_state["enabled"]:
+                            _record_uncommitted(
+                                _cell,
+                                consume_state["stop_reason"]
+                                or "consumption policy closed",
+                            )
+                        else:
+                            out[_cell] = consume(_cell, _value)
+                            if meta is not None:
+                                meta["consume_calls"] = int(
+                                    meta.get("consume_calls", 0)
+                                ) + 1
+                                meta["consumed_indices"].append(_cell)
+                                meta["drain"]["consumed"].append(_cell)
+                            progress["collected"] += 1
+                            _report(min(total, progress["collected"]))
+                            _done(_cell)
+                    except Exception as _cons_exc:  # noqa: BLE001 - fatal
+                        _record_secondary(_cell, "consume", _cons_exc)
+                    finally:
+                        _value = None
+                done = None
+                if heartbeat is not None:
+                    now = time.monotonic()
+                    if now - last_call >= interval_s:
+                        try:
+                            heartbeat()
+                            if meta is not None:
+                                meta["heartbeat_calls"] = int(
+                                    meta.get("heartbeat_calls", 0)
+                                ) + 1
+                        except Exception as _hb_exc:  # noqa: BLE001
+                            if meta is not None:
+                                meta["heartbeat_errors"] = int(
+                                    meta.get("heartbeat_errors", 0)
+                                ) + 1
+                                meta["heartbeat_last_error"] = (
+                                    f"{type(_hb_exc).__name__}: {_hb_exc}"
+                                )
+                        last_call = time.monotonic()
+        finally:
+            if meta is not None:
+                meta["drain"]["seconds"] = float(
+                    time.perf_counter() - started_at
+                )
+
     try:
         while pending or running:
             progressed = True
@@ -1681,15 +1886,14 @@ def pmap_reserved(
                         running_sum, reservation, shared, budget
                     ):
                         pending.pop(pos)
-                        _dispatch(idx, running_sum, len(running) + 1)
-                        running_sum += reservation
+                        # Submit FIRST: a failed submission is never reported
+                        # as a dispatched cell (truthful dispatch bookkeeping).
                         try:
                             fut = pool.submit(worker, tasks[idx])
                         except Exception as exc:  # noqa: BLE001
-                            raise ParallelPoolError(
-                                "per-cell dispatch submit failed for cell "
-                                f"{cell_ids[idx]} ({type(exc).__name__}: {exc})"
-                            ) from exc
+                            _submit_failed(idx, exc)
+                        _dispatch(idx, running_sum, len(running) + 1)
+                        running_sum += reservation
                         running[fut] = idx
                         progressed = True
                         break
@@ -1697,11 +1901,14 @@ def pmap_reserved(
                     # Nothing is in flight and the head does not fit: run the
                     # FIRST pending cell ALONE (historical serial K=1).
                     idx = pending.pop(0)
+                    try:
+                        fut = pool.submit(worker, tasks[idx])
+                    except Exception as exc:  # noqa: BLE001
+                        _submit_failed(idx, exc)
                     _dispatch(
                         idx, 0, 1, reason=DISPATCH_REASON_NOTHING_FITS
                     )
                     running_sum = reservations[idx]
-                    fut = pool.submit(worker, tasks[idx])
                     running[fut] = idx
                     progressed = True
                 elif not progressed:
@@ -1766,8 +1973,21 @@ def pmap_reserved(
                         "cell_id": cell_ids[idx],
                     }
                 )
+                delivered = False
                 try:
-                    if consume is not None:
+                    if consume is None:
+                        out[idx] = _value
+                        delivered = True
+                    elif not consume_state["enabled"]:
+                        # ZM-M33-DRAIN-DURABLE rework-1 (F2): a result of the
+                        # SAME completed batch is never committed after a
+                        # durable-commit failure; it is named uncommitted.
+                        _record_uncommitted(
+                            idx,
+                            consume_state["stop_reason"]
+                            or "consumption policy closed",
+                        )
+                    else:
                         # PARENT transaction, in this thread, at RECEIPT time —
                         # never a worker-side or future-done callback.
                         out[idx] = consume(idx, _value)
@@ -1775,21 +1995,30 @@ def pmap_reserved(
                             meta["consume_calls"] = int(
                                 meta.get("consume_calls", 0)
                             ) + 1
-                    else:
-                        out[idx] = _value
+                            meta["consumed_indices"].append(int(idx))
+                        delivered = True
                 except Exception as exc:  # noqa: BLE001 - FATAL, not telemetry
+                    # Close the policy AT the collection point, so no sibling
+                    # of this same batch can be committed after this failure.
+                    _stop_consuming(
+                        f"consumer failure at cell {cell_ids[idx]} "
+                        f"({type(exc).__name__}: {exc})"
+                    )
                     if failure is None:
                         failure = (idx, "consume", exc)
+                    else:
+                        _record_secondary(idx, "consume", exc)
                 finally:
                     # Drop the large payload reference NOW (the future is also
                     # dropped below); only a light receipt may survive.
                     _value = None
                 _done(idx)
                 if consume is not None:
-                    # Results may be committed OUT OF ORDER: count reception,
-                    # never a canonical contiguous prefix.
-                    collected += 1
-                    _report(min(total, collected))
+                    # Results may be committed OUT OF ORDER: count RECEPTIONS
+                    # (only a real receipt), never a contiguous prefix.
+                    if delivered:
+                        progress["collected"] += 1
+                        _report(min(total, progress["collected"]))
                 else:
                     while reported < total and out[reported] is not None:
                         reported += 1
@@ -1813,35 +2042,9 @@ def pmap_reserved(
                         "stage": str(_kind),
                     }
                 )
-                _consume_finished_siblings(
-                    running, tasks, reservations, out, consume, meta, _done
-                )
-                for other in running:
-                    # A future that really never started may be reported
-                    # CANCELLED. A STARTED worker is never relabelled: it is
-                    # drained by shutdown(wait=True) below.
-                    try:
-                        if other.cancel():
-                            _index_cancelled = running.get(other)
-                            _state(
-                                {
-                                    "event": "cancelled",
-                                    "index": (
-                                        None if _index_cancelled is None
-                                        else int(_index_cancelled)
-                                    ),
-                                    "cell_id": (
-                                        None if _index_cancelled is None
-                                        else cell_ids[_index_cancelled]
-                                    ),
-                                }
-                            )
-                    except Exception:  # noqa: BLE001 - telemetry only
-                        pass
-                _fatal(
-                    _exc, index=_idx,
-                    stage="consume" if _kind == "consume" else "worker",
-                )
+                # ZM-M33-DRAIN-DURABLE: fatal first, cancel ONLY pending,
+                # then receive + durably consume every already-started cell.
+                _drain_cells_after_failure(_idx, _kind, _exc)
                 if _kind == "consume":
                     raise ResultConsumeError(_exc, index=_idx) from _exc
                 if _is_broken_pool_error(_exc):
@@ -1859,10 +2062,9 @@ def pmap_reserved(
         _fatal(_fatal_exc, stage="worker")
         raise
     finally:
-        # shutdown(wait=True): pending (never started) tasks are cancelled; tasks
-        # the executor already STARTED are drained. Every ALREADY-FINISHED
-        # success was consumed ABOVE, so no committed-able cell is held behind
-        # the drain.
+        # SINGLE shutdown owner: pending (never started) tasks are cancelled;
+        # tasks the executor already STARTED were drained AND consumed above
+        # (exactly once), so no committable cell is held behind the drain.
         try:
             pool.shutdown(wait=True, cancel_futures=True)
         except Exception:  # noqa: BLE001 - shutdown is best-effort
@@ -1970,6 +2172,12 @@ def _consume_finished_siblings(
     replay: each future is consumed at most once, only when ``done()``, and any
     failure of this best-effort pass is recorded in ``meta`` without masking the
     original fatal error.
+
+    ZM-M33-DRAIN-DURABLE rework-1 (N1): RETAINED FOR THE DIRECT WITNESSES ONLY.
+    It is no longer on the production failure path: ``pmap`` uses
+    ``_drain_started`` and ``pmap_reserved`` uses ``_drain_cells_after_failure``,
+    which also drain the tasks already STARTED (this helper only touches
+    ``done()`` futures) and enforce the fail-closed consumption policy.
     """
     if consume is None:
         return
@@ -2089,11 +2297,14 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
     degrades to the serial loop with a WARN surfaced via BOTH ``log`` and
     ``emit``. A deterministic ``worker(task)`` / ``future.result()`` failure is
     NOT a pool-unavailability event: FIRST_COMPLETED detects it promptly, all
-    still-PENDING futures are cancelled, and tasks the executor already STARTED
-    are drained to quiescence by the single shutdown owner before the exception
-    propagates as :class:`ParallelTaskError` with its index and original cause.
-    The wave is NEVER replayed in serial (see ZM-IO-REJECT-01). A mid-run pool
-    failure propagates as :class:`ParallelPoolError` without replay.
+    still-PENDING futures are cancelled (no new dispatch, no replay), and tasks
+    the executor already STARTED are drained AND durably consumed exactly once
+    (reception consumer, heartbeat/progress cadence preserved) before the
+    ORIGINAL exception propagates as :class:`ParallelTaskError` with its index
+    and original cause. Secondary worker/consumer failures are explicit in
+    ``meta`` and never mask the primary one. The wave is NEVER replayed in
+    serial (see ZM-IO-REJECT-01). A mid-run pool failure propagates as
+    :class:`ParallelPoolError` without replay.
     """
     tasks = list(tasks)
     total = len(tasks)
@@ -2111,6 +2322,23 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         meta["consume_failures"] = []
         meta["sibling_worker_failures"] = []
         meta["fatal_reported"] = False
+        # ZM-M33-DRAIN-DURABLE: truthful receipt bookkeeping. ``drain`` describes
+        # what really happened AFTER the first fatal failure; a result that was
+        # received but deliberately NOT handed to the consumer is named in
+        # ``uncommitted_outputs`` (never silently counted as committed).
+        meta["consumed_indices"] = []
+        meta["uncommitted_outputs"] = []
+        meta["consume_policy"] = "enabled" if consume is not None else "none"
+        meta["drain"] = {
+            "started": False,
+            "seconds": 0.0,
+            "primary": None,
+            "cancelled": [],
+            "consumed": [],
+        }
+        meta["submit_failed_index"] = None
+        meta["never_submitted"] = []
+        meta["submit_failure"] = None
 
     _fatal_state = {"reported": False}
 
@@ -2238,6 +2466,7 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                             meta["consume_calls"] = int(
                                 meta.get("consume_calls", 0)
                             ) + 1
+                            meta["consumed_indices"].append(int(i))
                     else:
                         out.append(_value)
                 finally:
@@ -2299,9 +2528,15 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
         out = [None] * total
         recorded = set()
         reported = 0
-        collected = 0
+        # Reception counter shared by the normal loop and the failure drain.
+        progress = {"collected": 0}
         last_call = None
         futures = []
+        # Explicit, fail-closed consumption policy. Enabled while the store is
+        # healthy; switched OFF for good after a consumer (durable-commit)
+        # failure, because the store contract refuses every later intake anyway
+        # and blindly consuming would only manufacture silent non-commits.
+        consume_state = {"enabled": consume is not None, "stop_reason": None}
 
         def _call_heartbeat(now):
             nonlocal last_call
@@ -2329,13 +2564,48 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                 )
             last_call = now
 
-        def _collect(index, future):
+        def _stop_consuming(reason):
+            """Fail closed: never consume again after a durable-commit failure."""
+            if consume_state["enabled"]:
+                consume_state["enabled"] = False
+                consume_state["stop_reason"] = str(reason)
+                if meta is not None:
+                    meta["consume_policy"] = f"stopped: {reason}"
+
+        def _record_uncommitted(index, reason):
+            """A result was RECEIVED but deliberately not committed."""
+            if meta is not None:
+                meta["uncommitted_outputs"].append(
+                    {"index": int(index), "reason": str(reason)}
+                )
+
+        def _record_secondary(index, outcome):
+            """Record a non-primary worker/consumer failure explicitly."""
+            kind, exc = outcome
+            detail = f"{type(exc).__name__}: {exc}"
+            if meta is not None:
+                if kind == "worker":
+                    meta["sibling_worker_failures"].append(
+                        {"index": int(index), "kind": "worker", "error": detail}
+                    )
+                elif kind == "consume":
+                    meta["consume_failures"].append(
+                        {"index": int(index), "kind": "consume", "error": detail}
+                    )
+            if kind == "consume":
+                _stop_consuming(
+                    f"consumer failure at index {int(index)} ({detail})"
+                )
+
+        def _collect(index, future, *, during_drain=False):
             """Deliver ONE finished future to the parent (consumer when given).
 
-            Returns ``None`` on success or ``("worker"|"consume", exc)``. The
-            index is marked recorded FIRST, so neither the same wait batch nor
-            the drain can ever deliver it twice. Never raises: the caller owns
-            the single fatal-error decision (and the sibling drain).
+            Returns ``None`` on success, ``("worker"|"consume", exc)`` on a
+            failure, or ``("unconsumed", None)`` when the consumption policy
+            is closed (the result is then named in ``uncommitted_outputs``).
+            The index is marked recorded FIRST, so neither the same wait batch
+            nor the drain can ever deliver it twice. Never raises: the caller
+            owns the single fatal-error decision and the sibling drain.
             """
             index = int(index)
             recorded.add(index)
@@ -2360,6 +2630,10 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                         "stage": "worker",
                     }
                 )
+                if during_drain:
+                    # A sibling that fails while we drain is NOT the primary
+                    # failure and is never allowed to mask it.
+                    _record_secondary(index, ("worker", exc))
                 return ("worker", exc)
             # The result really exists in the parent now (still NOT durable).
             _state(
@@ -2370,41 +2644,179 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                 }
             )
             try:
-                out[index] = value if consume is None else consume(index, value)
-                if consume is not None and meta is not None:
+                if consume is None:
+                    out[index] = value
+                    return None
+                if not consume_state["enabled"]:
+                    # Fail-closed drain: never retry a commit on a degraded
+                    # store, never pretend the result was consumed.
+                    _record_uncommitted(
+                        index,
+                        consume_state["stop_reason"]
+                        or "consumption policy closed",
+                    )
+                    return ("unconsumed", None)
+                out[index] = consume(index, value)
+                if meta is not None:
                     meta["consume_calls"] = int(
                         meta.get("consume_calls", 0)
                     ) + 1
+                    meta["consumed_indices"].append(index)
                 return None
             except Exception as exc:  # noqa: BLE001 - consumer failure is FATAL
+                # ZM-M33-DRAIN-DURABLE rework-1 (F2): close the policy HERE, at
+                # the exact collection point, so siblings of the SAME completed
+                # batch are never consumed after a durable-commit failure.
+                _stop_consuming(
+                    f"consumer failure at index {index} "
+                    f"({type(exc).__name__}: {exc})"
+                )
                 return ("consume", exc)
             finally:
                 # Only a light receipt may survive; the payload reference and
                 # its completed future are dropped here.
                 value = None
 
+        def _cancel_pending():
+            """Cancel ONLY futures that truly never started (never a replay)."""
+            cancelled = []
+            for _index, pending_future in enumerate(futures):
+                if pending_future is None or _index in recorded:
+                    continue
+                try:
+                    if pending_future.done():
+                        continue
+                    if pending_future.cancel():
+                        recorded.add(int(_index))
+                        futures[_index] = None
+                        cancelled.append(int(_index))
+                        _state(
+                            {
+                                "event": "cancelled",
+                                "index": int(_index),
+                                "cell_id": _cell_id(_index),
+                            }
+                        )
+                except Exception:  # noqa: BLE001 - telemetry only
+                    pass
+            if meta is not None and cancelled:
+                meta["drain"]["cancelled"].extend(cancelled)
+            return cancelled
+
+        def _drain_started():
+            """Receive + consume the tasks the executor had ALREADY STARTED.
+
+            ZM-M33-DRAIN-DURABLE: runs AFTER the fatal state was surfaced and
+            the truly pending futures were cancelled. Every result is delivered
+            by :func:`_collect` AT MOST ONCE; heartbeat/progress keep their
+            cadence; a secondary worker/consumer failure is recorded without
+            masking the primary one. A consumer failure closes the consumption
+            policy (fail-closed store contract), and the still-received results
+            are named as uncommitted instead of being silently committed.
+            """
+            if meta is not None:
+                meta["drain"]["started"] = True
+            started_at = time.perf_counter()
+            try:
+                while True:
+                    pending_indices = [
+                        i
+                        for i, fut in enumerate(futures)
+                        if fut is not None and i not in recorded
+                    ]
+                    if not pending_indices:
+                        return
+                    timeout = None
+                    if heartbeat is not None:
+                        timeout = max(
+                            0.0, interval_s - (time.monotonic() - last_call)
+                        )
+                    done, _ = concurrent.futures.wait(
+                        [futures[i] for i in pending_indices],
+                        timeout=timeout,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for index in sorted(
+                        i
+                        for i in pending_indices
+                        if futures[i] is not None and futures[i] in done
+                    ):
+                        outcome = _collect(
+                            index, futures[index], during_drain=True
+                        )
+                        if outcome is None:
+                            if consume is not None:
+                                progress["collected"] += 1
+                                _report(min(total, progress["collected"]))
+                                if meta is not None:
+                                    meta["drain"]["consumed"].append(int(index))
+                            continue
+                        _kind, _exc = outcome
+                        if _kind == "consume":
+                            # A secondary durable-commit failure is explicit and
+                            # closes the policy for every later result.
+                            _record_secondary(index, outcome)
+                        # ("unconsumed", None) and a sibling worker failure were
+                        # already recorded by ``_collect``/``_record_secondary``.
+                    # R1: never keep a just-collected Future (and its payload)
+                    # alive across the next wait on a slow peer.
+                    done = None
+                    if heartbeat is not None:
+                        now = time.monotonic()
+                        if now - last_call >= interval_s:
+                            _call_heartbeat(now)
+            finally:
+                if meta is not None:
+                    meta["drain"]["seconds"] = float(
+                        time.perf_counter() - started_at
+                    )
+
+        def _raise_submit_failure(failure, task_list):
+            """Partial ``pool.submit`` failure: same drain/consume lifecycle.
+
+            ZM-M33-DRAIN-DURABLE rework-1 (F1): no replay, no new submission
+            after the failure; the ORIGINAL cause is preserved; every task that
+            WAS submitted is drained and durably consumed exactly once before
+            the :class:`ParallelPoolError` escapes. The failed submission and
+            the never-attempted tasks are bookkept separately and truthfully.
+            """
+            index, exc = failure
+            _state(
+                {
+                    "event": "failed",
+                    "index": int(index),
+                    "cell_id": _cell_id(index),
+                    "stage": "submit",
+                }
+            )
+            _fatal(exc, index=index, stage="pool")
+            if meta is not None:
+                meta["drain"]["primary"] = {
+                    "index": int(index),
+                    "kind": "submit",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                meta["submit_failed_index"] = int(index)
+                meta["never_submitted"] = list(range(int(index), total))
+                meta["submit_failure"] = f"{type(exc).__name__}: {exc}"
+            _cancel_pending()
+            _drain_started()
+            raise ParallelPoolError(
+                f"executor submit failed after {int(index)} submitted task(s) "
+                f"({type(exc).__name__}: {exc})",
+                index=index,
+                task=task_list[index],
+            ) from exc
+
         def _raise_collect_failure(failure, task_list):
             """The ONE fatal-exit path of the collection loop.
 
-            Already-finished siblings are delivered first (a computed cell must
-            never be lost behind the failure), then pending futures are cancelled
-            and the typed error is raised. A consumer failure keeps its ORIGINAL
-            type so a durable-commit failure is never mislabelled.
+            Order (ZM-M33-DRAIN-DURABLE): surface the fatal state BEFORE any
+            wait, cancel ONLY the truly pending futures, then keep receiving
+            and durably consuming the tasks the executor already STARTED before
+            the ORIGINAL error is raised. Already-finished siblings are never
+            lost behind a failure nor behind a still-running peer.
             """
-            _drain_finished()
-            for _pend_index, pending_future in enumerate(futures):
-                if pending_future is not None and not pending_future.done():
-                    try:
-                        if pending_future.cancel():
-                            _state(
-                                {
-                                    "event": "cancelled",
-                                    "index": int(_pend_index),
-                                    "cell_id": _cell_id(_pend_index),
-                                }
-                            )
-                    except Exception:  # noqa: BLE001 - telemetry only
-                        pass
             index, (kind, exc) = failure
             _state(
                 {
@@ -2414,7 +2826,26 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                     "stage": str(kind),
                 }
             )
+            # 1. Prompt, honest failure surfacing (before the drain wait).
             _fatal(exc, index=index, stage=str(kind))
+            if meta is not None:
+                meta["drain"]["primary"] = {
+                    "index": int(index),
+                    "kind": str(kind),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            # 2. A consumer failure means the durable store is degraded: stop
+            #    committing (fail closed) instead of manufacturing non-commits.
+            if kind == "consume":
+                _stop_consuming(
+                    f"primary consumer failure at index {int(index)} "
+                    f"({type(exc).__name__}: {exc})"
+                )
+            # 3. Cancel ONLY tasks that never started; no new dispatch/replay.
+            _cancel_pending()
+            # 4. Drain the already-started tasks (consume successes once).
+            _drain_started()
+            # 5. The ORIGINAL failure is always what escapes.
             if kind == "consume":
                 # Parent transaction failure: the ORIGINAL exception is
                 # preserved (a StoreCommitNotDurable stays one).
@@ -2428,68 +2859,31 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                 ) from exc
             raise ParallelTaskError(index, task_list[index], exc) from exc
 
-        def _drain_finished():
-            """Consume every ALREADY-finished result that was never collected.
-
-            A computed cell must never be lost behind a pending peer nor
-            dropped by a failure path. Only ``done()`` futures are touched (no
-            wait), each at most once, and a drain failure is recorded without
-            masking the first fatal error.
-            """
-            for index, future in enumerate(futures):
-                if index in recorded or future is None:
-                    continue
-                try:
-                    if future.cancelled() or not future.done():
-                        continue
-                except Exception:  # pragma: no cover - defensive
-                    continue
-                outcome = _collect(index, future)
-                if outcome is not None and meta is not None:
-                    _kind, _exc = outcome
-                    if _kind == "worker":
-                        meta.setdefault("sibling_worker_failures", []).append(
-                            {
-                                "index": int(index),
-                                "kind": "worker",
-                                "error": (
-                                    f"{type(_exc).__name__}: {_exc}"
-                                ),
-                            }
-                        )
-                    else:
-                        meta["consume_failures"].append(
-                            {
-                                "index": int(index),
-                                "kind": "consume",
-                                "error": (
-                                    f"{type(_exc).__name__}: {_exc}"
-                                ),
-                            }
-                        )
-
         # Sample once BEFORE submitting (no worker is forked yet), then keep a
         # parent-side cadence while futures run.
         if heartbeat is not None:
             _call_heartbeat(time.monotonic())
-        try:
-            futures = []
-            for _i, _task in enumerate(tasks):
-                futures.append(pool.submit(worker, _task))
-                _state(
-                    {
-                        "event": "submitted",
-                        "index": int(_i),
-                        "cell_id": _cell_id(_i),
-                    }
-                )
-        except Exception as exc:
-            for pending_future in futures:
-                pending_future.cancel()
-            raise ParallelPoolError(
-                f"executor submit failed after {len(futures)} submitted task(s) "
-                f"({type(exc).__name__}: {exc})"
-            ) from exc
+        # ZM-M33-DRAIN-DURABLE rework-1 (F1): a PARTIAL submission failure is a
+        # failure like any other: the already-submitted tasks must be drained
+        # and durably consumed (or explicitly named uncommitted), never lost
+        # behind the raised pool error, and no further task is submitted.
+        futures = [None] * total
+        submit_failure = None
+        for _i, _task in enumerate(tasks):
+            try:
+                futures[_i] = pool.submit(worker, _task)
+            except Exception as exc:  # noqa: BLE001 - partial submission
+                submit_failure = (int(_i), exc)
+                break
+            _state(
+                {
+                    "event": "submitted",
+                    "index": int(_i),
+                    "cell_id": _cell_id(_i),
+                }
+            )
+        if submit_failure is not None:
+            _raise_submit_failure(submit_failure, tasks)
         pending = set(futures)
         while pending:
             if heartbeat is None:
@@ -2512,8 +2906,10 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                 if outcome is not None:
                     if failure is None:
                         failure = (index, outcome)
+                    else:
+                        _record_secondary(index, outcome)
                     continue
-                collected += 1
+                progress["collected"] += 1
             # R1: ``done`` (and the loop local) would keep the just-collected
             # Futures — and their payloads — alive across the next wait on a
             # slow peer. Release them before blocking again.
@@ -2525,8 +2921,8 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                 # R3: count RECEPTIONS. A contiguous-prefix counter would report
                 # nothing while the FIRST task of the batch is still running,
                 # even though later results are already received and committed.
-                if collected:
-                    _report(min(total, collected))
+                if progress["collected"]:
+                    _report(min(total, progress["collected"]))
             else:
                 while reported < total and reported in recorded:
                     reported += 1
@@ -2540,9 +2936,9 @@ def pmap(worker, tasks, workers: int, progress_callback=None, initializer=None, 
                 outcome = _collect(index, future)
                 if outcome is not None:
                     _raise_collect_failure((index, outcome), tasks)
-                collected += 1
+                progress["collected"] += 1
                 if consume is not None:
-                    _report(min(total, collected))
+                    _report(min(total, progress["collected"]))
         if consume is None:
             while reported < total and reported in recorded:
                 reported += 1
